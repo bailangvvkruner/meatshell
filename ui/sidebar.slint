@@ -289,6 +289,7 @@ component StatusBlock inherits Rectangle {
 // Resource title + Processes button + CPU/Memory/Swap rows.
 component StatsBlock inherits VerticalLayout {
     in property <string> resource-title;
+    in property <bool> resource-pinned;
     in property <bool> proc-available;
     in property <float> cpu-percent;
     in property <float> mem-percent;
@@ -296,17 +297,36 @@ component StatsBlock inherits VerticalLayout {
     in property <string> mem-detail;
     in property <string> swap-detail;
     callback show-processes();
+    callback toggle-resource-pin();
     spacing: 6px;
     HorizontalLayout {
         spacing: 6px;
         Text { text: root.resource-title; color: Theme.text-secondary; font-size: Theme.fs-sm;
-               vertical-alignment: center; horizontal-stretch: 1; }
+               vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+        Rectangle {
+            width: 20px; height: 20px;
+            border-radius: Theme.radius-sm;
+            background: pin-ta.has-hover || root.resource-pinned ? Theme.bg-hover : transparent;
+            pin-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.toggle-resource-pin(); }
+            }
+            Text {
+                text: "\u{F10D}"; // push_pin
+                font-family: "Material Icons";
+                color: root.resource-pinned ? Theme.accent : Theme.text-secondary;
+                font-size: 14px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
         if root.proc-available : Rectangle {
-            width: 52px; height: 20px;
+            width: 20px; height: 20px;
             border-radius: Theme.radius-sm;
             background: proc-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
             proc-ta := TouchArea { mouse-cursor: pointer; clicked => { root.show-processes(); } }
-            Text { text: @tr("Processes"); color: Theme.text-secondary; font-size: Theme.fs-xs;
+            Text { text: "\u{E896}"; font-family: "Material Icons";
+                   color: Theme.text-secondary; font-size: 14px;
                    horizontal-alignment: center; vertical-alignment: center; }
         }
     }
@@ -405,6 +425,7 @@ export component Sidebar inherits Rectangle {
     in property <string> conn-host;                  // clean IP/host to copy (#192)
     in property <int> conn-state;                    // 0 gray / 1 green / 2 yellow
     in property <string> resource-title: @tr("Local resources");
+    in property <bool> resource-pinned;
     in property <float> cpu-percent;
     in property <float> mem-percent;
     in property <float> swap-percent;
@@ -426,6 +447,7 @@ export component Sidebar inherits Rectangle {
     in property <string> app-version;
     callback select-net-iface(string);
     callback show-processes();           // open the process monitor popup (#23)
+    callback toggle-resource-pin();      // keep showing the current resource source
     callback copy-host(string);          // copy the connection IP/host to clipboard (#192)
     // Drag-to-dock: the header strip is a grab handle; coordinates are reported
     // in window space so the AppWindow can compute the target edge (#dock).
@@ -489,10 +511,12 @@ export component Sidebar inherits Rectangle {
             }
             Rectangle { height: 1px; background: Theme.border-subtle; }
             StatsBlock {
-                resource-title: root.resource-title; proc-available: root.proc-available;
+                resource-title: root.resource-title; resource-pinned: root.resource-pinned;
+                proc-available: root.proc-available;
                 cpu-percent: root.cpu-percent; mem-percent: root.mem-percent; swap-percent: root.swap-percent;
                 mem-detail: root.mem-detail; swap-detail: root.swap-detail;
                 show-processes() => { root.show-processes(); }
+                toggle-resource-pin() => { root.toggle-resource-pin(); }
             }
             Rectangle { height: 1px; background: Theme.border-subtle; }
             NetBlock {
@@ -542,10 +566,12 @@ export component Sidebar inherits Rectangle {
                     collapse() => { root.toggle-collapse(); }
                 }
                 StatsBlock {
-                    resource-title: root.resource-title; proc-available: root.proc-available;
+                    resource-title: root.resource-title; resource-pinned: root.resource-pinned;
+                    proc-available: root.proc-available;
                     cpu-percent: root.cpu-percent; mem-percent: root.mem-percent; swap-percent: root.swap-percent;
                     mem-detail: root.mem-detail; swap-detail: root.swap-detail;
                     show-processes() => { root.show-processes(); }
+                    toggle-resource-pin() => { root.toggle-resource-pin(); }
                 }
             }
             Rectangle { width: 1px; background: Theme.border-subtle; }

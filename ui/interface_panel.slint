@@ -195,6 +195,9 @@ export component InterfacePanel inherits Rectangle {
     in-out property <bool> download-always-ask;
     in-out property <bool> welcome-as-sidebar;
     in-out property <bool> update-check-enabled;
+    in-out property <bool> debug-api-enabled;
+    in property <string> debug-api-address;
+    in property <string> debug-api-status;
     in-out property <float> wallpaper-overlay;   // frosted-panel opacity 0.30-1.00
     // Active wallpaper id: "" / "builtin:light" / "builtin:dark" / a file path.
     in property <string> current-wallpaper;
@@ -220,6 +223,10 @@ export component InterfacePanel inherits Rectangle {
     callback set-download-always-ask(bool);
     callback set-welcome-as-sidebar(bool);
     callback set-update-check-enabled(bool);   // startup new-version check (#184)
+    callback set-debug-api-enabled(bool);
+    callback copy-debug-api-address();
+    callback copy-debug-api-token();
+    callback regenerate-debug-api-token();
     callback persist-wallpaper-overlay(float);   // save the overlay opacity
     callback set-wallpaper(string);    // none / builtin selection
     callback pick-wallpaper-file();    // open the OS file dialog (Rust)
@@ -283,6 +290,11 @@ export component InterfacePanel inherits Rectangle {
                     icon: "\u{E923}"; label: root.lang-en ? "Update check" : "新版本提示";
                     active: root.ifd-page == "update";
                     clicked => { root.ifd-page = "update"; }
+                }
+                NavItem {
+                    icon: "\u{E868}"; label: root.lang-en ? "Debug API" : "调试接口";
+                    active: root.ifd-page == "debug-api";
+                    clicked => { root.ifd-page = "debug-api"; }
                 }
             }
         }
@@ -814,6 +826,56 @@ export component InterfacePanel inherits Rectangle {
                         on: root.update-check-enabled;
                         toggled(v) => { root.update-check-enabled = v; root.set-update-check-enabled(v); }
                     }
+                }
+            }
+
+            // --- Local AI/debug API -----------------------------------
+            if root.ifd-page == "debug-api" : VerticalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                padding-top: 14px;
+                spacing: 0;
+                alignment: start;
+                SectionHeader { text: root.lang-en ? "DEBUG API" : "调试接口"; height: 24px; }
+                SettingRow {
+                    label: root.lang-en ? "Enable local API" : "启用本机接口";
+                    desc: root.lang-en
+                        ? "Lets an authenticated local AI agent inspect terminal screens and send input."
+                        : "允许通过鉴权的本机 AI Agent 读取终端画面并发送输入。";
+                    Switch {
+                        on: root.debug-api-enabled;
+                        toggled(v) => { root.debug-api-enabled = v; root.set-debug-api-enabled(v); }
+                    }
+                }
+                SettingRow {
+                    label: root.lang-en ? "Address" : "接口地址";
+                    desc: root.debug-api-address;
+                    GhostButton {
+                        text: root.lang-en ? "Copy" : "复制";
+                        clicked => { root.copy-debug-api-address(); }
+                    }
+                }
+                SettingRow {
+                    label: root.lang-en ? "Bearer token" : "Bearer Token";
+                    desc: root.lang-en
+                        ? "Required by every request and encrypted in the application configuration."
+                        : "每个请求都必须携带，并加密保存在应用配置中。";
+                    HorizontalLayout {
+                        spacing: 6px;
+                        GhostButton {
+                            text: root.lang-en ? "Copy token" : "复制 Token";
+                            clicked => { root.copy-debug-api-token(); }
+                        }
+                        GhostButton {
+                            text: root.lang-en ? "Regenerate" : "重新生成";
+                            clicked => { root.regenerate-debug-api-token(); }
+                        }
+                    }
+                }
+                SettingRow {
+                    label: root.lang-en ? "Status" : "状态";
+                    desc: root.debug-api-status;
+                    show-divider: false;
                 }
             }
 

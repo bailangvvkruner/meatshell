@@ -128,23 +128,25 @@ impl SystemSampler {
 }
 
 /// Format a used/total memory pair (both in MiB) for the narrow sidebar.
-/// Below 1 GiB it stays in megabytes (`512/2048M`); at or above, it switches to
-/// gigabytes and drops the decimal for whole or large values to stay compact
-/// (`1.5G/16G`, `120G/256G`).
+/// Each value below 1 GiB stays in megabytes; larger values use gigabytes and
+/// drop the decimal for whole or large values to stay compact
+/// (`700M/2.8G`, `1.5G/16G`, `120G/256G`).
 pub fn format_mem(used_mib: u64, total_mib: u64) -> String {
-    if total_mib < 1024 {
-        return format!("{used_mib}/{total_mib}M");
-    }
-    // MiB → GiB, with a tidy width: integer when round or ≥100, else one decimal.
-    fn gib(mib: u64) -> String {
+    fn value(mib: u64) -> String {
+        if mib < 1024 {
+            return format!("{mib}M");
+        }
+
+        // MiB → GiB, with a tidy width: integer when round or ≥100, else one decimal.
         let g = mib as f64 / 1024.0;
         if g.fract() == 0.0 || g >= 100.0 {
-            (g as u64).to_string()
+            format!("{}G", g as u64)
         } else {
-            format!("{g:.1}")
+            format!("{g:.1}G")
         }
     }
-    format!("{}G/{}G", gib(used_mib), gib(total_mib))
+
+    format!("{}/{}", value(used_mib), value(total_mib))
 }
 
 /// Human-readable network throughput (e.g. `"1.2 MB/s"`).
@@ -160,5 +162,24 @@ pub fn format_bytes_per_sec(bytes: u64) -> String {
         format!("{} {}", bytes, UNITS[idx])
     } else {
         format!("{:.1} {}", value, UNITS[idx])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_mem;
+
+    #[test]
+    fn format_mem_selects_units_for_each_value() {
+        assert_eq!(format_mem(700, 2867), "700M/2.8G");
+        assert_eq!(format_mem(512, 768), "512M/768M");
+        assert_eq!(format_mem(1536, 16384), "1.5G/16G");
+    }
+
+    #[test]
+    fn format_mem_handles_the_one_gib_boundary() {
+        assert_eq!(format_mem(1023, 1024), "1023M/1G");
+        assert_eq!(format_mem(1024, 1024), "1G/1G");
+        assert_eq!(format_mem(0, 0), "0M/0M");
     }
 }

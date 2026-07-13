@@ -237,6 +237,8 @@ export component AppWindow inherits Window {
     in property <string> conn-host;             // clean IP/host for click-to-copy (#192)
     in property <int> conn-state;                       // 0 gray / 1 green / 2 yellow
     in property <string> resource-title: @tr("Local resources");    // @tr("Local resources") | @tr("Server resources")
+    in-out property <bool> resource-pinned: false;
+    in-out property <string> resource-pinned-tab-id: "";
     in property <float> cpu-percent;
     in property <float> mem-percent;
     in property <float> swap-percent;
@@ -431,6 +433,12 @@ export component AppWindow inherits Window {
     callback set-welcome-as-sidebar(bool);         // apply + persist
     in-out property <bool> update-check-enabled: true;   // startup new-version check (#184)
     callback set-update-check-enabled(bool);       // apply + persist
+    in-out property <bool> debug-api-enabled: false;
+    in-out property <string> debug-api-address: "http://127.0.0.1:24817";
+    in-out property <string> debug-api-token: "";
+    in-out property <string> debug-api-status: "";
+    callback set-debug-api-enabled(bool);
+    callback regenerate-debug-api-token();
     // Drag-resizable width of that welcome sidebar (logical px), persisted.
     in-out property <length> welcome-sidebar-width: 240px;
     callback persist-welcome-sidebar-width(float);
@@ -1030,6 +1038,7 @@ export component AppWindow inherits Window {
             conn-host: root.conn-host;
             conn-state: root.conn-state;
             resource-title: root.resource-title;
+            resource-pinned: root.resource-pinned;
             cpu-percent: root.cpu-percent;
             mem-percent: root.mem-percent;
             swap-percent: root.swap-percent;
@@ -1049,6 +1058,16 @@ export component AppWindow inherits Window {
             app-version: root.app-version;
             select-net-iface(i) => { root.select-net-iface(i); }
             show-processes() => { root.open-processes(); }
+            toggle-resource-pin() => {
+                if root.resource-pinned {
+                    root.resource-pinned = false;
+                    root.resource-pinned-tab-id = "";
+                } else {
+                    root.resource-pinned = true;
+                    root.resource-pinned-tab-id = root.active-tab-id;
+                }
+                root.refresh-sidebar();
+            }
             copy-host(h) => { root.copy-text(h); }   // reuse the clipboard helper (#192)
             // Drag the sidebar header to dock it to another edge. Coordinates
             // arrive in window space; convert to dock-area-relative fractions.
@@ -3555,6 +3574,9 @@ export component AppWindow inherits Window {
                     download-always-ask <=> root.download-always-ask;
                     welcome-as-sidebar <=> root.welcome-as-sidebar;
                     update-check-enabled <=> root.update-check-enabled;
+                    debug-api-enabled <=> root.debug-api-enabled;
+                    debug-api-address: root.debug-api-address;
+                    debug-api-status: root.debug-api-status;
                     wallpaper-overlay <=> root.wallpaper-overlay;
                     current-wallpaper: root.current-wallpaper;
                     custom-wallpaper-name: root.custom-wallpaper-name;
@@ -3576,6 +3598,10 @@ export component AppWindow inherits Window {
                     set-download-always-ask(v) => { root.set-download-always-ask(v); }
                     set-welcome-as-sidebar(v) => { root.set-welcome-as-sidebar(v); }
                     set-update-check-enabled(v) => { root.set-update-check-enabled(v); }
+                    set-debug-api-enabled(v) => { root.set-debug-api-enabled(v); }
+                    copy-debug-api-address() => { root.copy-text(root.debug-api-address); }
+                    copy-debug-api-token() => { root.copy-text(root.debug-api-token); }
+                    regenerate-debug-api-token() => { root.regenerate-debug-api-token(); }
                     persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
                 }
             }

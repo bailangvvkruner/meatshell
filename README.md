@@ -95,6 +95,7 @@ open /Applications/meatshell.app
 - [x] 会话密码加密存储（ChaCha20-Poly1305）
 - [x] 已知主机（`known_hosts`）校验 + 首次连接确认
 - [x] 多标签页终端分屏
+- [x] 可开关的本机 AI / 调试接口（Bearer 鉴权，见 [调用说明](docs/debug-api.md)）
 
 ### 计划中
 

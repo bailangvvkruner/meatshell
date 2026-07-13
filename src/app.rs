@@ -129,7 +129,10 @@ use i_slint_backend_winit::WinitWindowAccessor;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::runtime::Runtime;
 
-use crate::config::{AuthMethod, ConfigStore, Secret, Session, SessionKind};
+use crate::config::{ssh_username_or_root, AuthMethod, ConfigStore, Secret, Session, SessionKind};
+use crate::debug_api::{
+    DebugApiController, DebugApiState, TerminalMetadata, DEFAULT_PORT as DEBUG_API_PORT,
+};
 use crate::i18n::t;
 use crate::sftp::{spawn_sftp, SftpHandle};
 use crate::ssh::{
@@ -439,6 +442,11 @@ fn clamp_window_size_to_monitor(
     })?
 }
 
+fn valid_windowed_size(width: f32, height: f32) -> Option<(f32, f32)> {
+    (width.is_finite() && height.is_finite() && width > 200.0 && height > 200.0)
+        .then_some((width, height))
+}
+
 #[cfg(target_os = "linux")]
 fn schedule_slint_pointer_ungrab<T>(weak: slint::Weak<T>)
 where
@@ -544,6 +552,25 @@ pub fn run() -> Result<()> {
     let bufs: TermBuffers = Arc::new(Mutex::new(HashMap::new()));
     let render_gates: RenderGates = Arc::new(Mutex::new(HashMap::new()));
 
+    // Opt-in loopback Debug API. Its screen reader sees only rendered terminal
+    // text; saved sessions and credentials never enter this shared state.
+    let debug_api_state = {
+        let screen_bufs = bufs.clone();
+        DebugApiState::new(move |tab_id, max_lines| {
+            let handle = term_buf(&screen_bufs, tab_id)?;
+            let mut buf = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = buf.render();
+            let start = buf.displayed_text.len().saturating_sub(max_lines);
+            Some(buf.displayed_text[start..].to_vec())
+        })
+    };
+    let debug_api = Rc::new(RefCell::new(DebugApiController::new(
+        runtime.handle().clone(),
+        debug_api_state.clone(),
+    )));
+
     // Last-known terminal pixel dimensions, updated by every terminal-resize
     // callback.  Shared so on_connect_session can pass a sensible initial PTY
     // size to spawn_session before the first resize callback fires.
@@ -561,6 +588,72 @@ pub fn run() -> Result<()> {
     // Show the crate version (from Cargo.toml at compile time) in the sidebar,
     // so the footer never drifts out of sync with the actual build.
     window.set_app_version(env!("CARGO_PKG_VERSION").into());
+
+    // Local AI/debug interface: generate a strong token once, keep the listener
+    // off unless explicitly enabled, and apply setting changes immediately.
+    let debug_token = {
+        let existing = store.borrow().debug_api_token().to_string();
+        if existing.len() >= 24 {
+            existing
+        } else {
+            let token = crate::debug_api::generate_token();
+            let mut config = store.borrow_mut();
+            config.set_debug_api_token(token.clone());
+            if let Err(error) = config.save() {
+                tracing::warn!("failed to save Debug API token: {error:#}");
+            }
+            token
+        }
+    };
+    window.set_debug_api_token(debug_token.clone().into());
+    window.set_debug_api_enabled(store.borrow().debug_api_enabled());
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let controller = debug_api.clone();
+        window.on_set_debug_api_enabled(move |enabled| {
+            let Some(win) = weak.upgrade() else { return };
+            let applied = configure_debug_api(
+                &win,
+                &controller,
+                enabled,
+                win.get_debug_api_token().as_str(),
+            );
+            win.set_debug_api_enabled(applied);
+            {
+                let mut config = store.borrow_mut();
+                config.set_debug_api_enabled(applied);
+                if let Err(error) = config.save() {
+                    tracing::warn!("failed to save Debug API setting: {error:#}");
+                }
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let controller = debug_api.clone();
+        window.on_regenerate_debug_api_token(move || {
+            let Some(win) = weak.upgrade() else { return };
+            let token = crate::debug_api::generate_token();
+            win.set_debug_api_token(token.clone().into());
+            let applied = configure_debug_api(
+                &win,
+                &controller,
+                win.get_debug_api_enabled(),
+                &token,
+            );
+            win.set_debug_api_enabled(applied);
+            {
+                let mut config = store.borrow_mut();
+                config.set_debug_api_token(token.clone());
+                config.set_debug_api_enabled(applied);
+                if let Err(error) = config.save() {
+                    tracing::warn!("failed to save regenerated Debug API token: {error:#}");
+                }
+            }
+        });
+    }
 
     // Set the window icon from the PNG embedded in the binary so the dock
     // shows the correct icon even without a system-installed .desktop entry
@@ -638,6 +731,17 @@ pub fn run() -> Result<()> {
     crate::i18n::set_language(store.borrow().language());
     crate::i18n::apply_to_slint();
     window.set_lang_en(crate::i18n::is_en());
+    let configured_debug_api = store.borrow().debug_api_enabled();
+    let debug_api_active =
+        configure_debug_api(&window, &debug_api, configured_debug_api, &debug_token);
+    window.set_debug_api_enabled(debug_api_active);
+    if debug_api_active != configured_debug_api {
+        let mut config = store.borrow_mut();
+        config.set_debug_api_enabled(debug_api_active);
+        if let Err(error) = config.save() {
+            tracing::warn!("failed to update Debug API startup state: {error:#}");
+        }
+    }
 
     // Apply the saved (or system-detected) theme.
     // "dark" / "light" → use that directly; "system" or unset → ask the OS;
@@ -726,7 +830,7 @@ pub fn run() -> Result<()> {
 
     // Interface setting: collapse the sidebars by default (#78). Seed the
     // checkboxes, apply the collapsed state once at startup, and persist toggles.
-    {
+    let (saved_window_size, restore_window_maximized) = {
         let s = store.borrow();
         let collapse_sidebar = s.collapse_sidebar_default();
         let collapse_sftp = s.collapse_sftp_default();
@@ -762,14 +866,18 @@ pub fn run() -> Result<()> {
             window.set_sftp_collapsed(true);
             window.set_sftp_saved_height(s.sftp_panel_height());
         }
-        // Restore the user's preferred window size, if any (#dock).
+        // Seed the saved logical size before the native window is shown. The
+        // deferred startup callback below clamps it once a monitor is available.
         let (ww, wh) = s.window_size();
-        if ww > 0.0 && wh > 0.0 {
-            let _ = clamp_window_size_to_monitor(&window.window(), Some((ww, wh)));
-        } else {
-            let _ = clamp_window_size_to_monitor(&window.window(), None);
+        let saved_size = valid_windowed_size(ww, wh);
+        if let Some((ww, wh)) = saved_size {
+            window.window().set_size(slint::LogicalSize::new(ww, wh));
         }
-    }
+        (saved_size, s.window_maximized())
+    };
+    // Updated by native resize events only while windowed. This preserves the
+    // restore size when the application exits maximized or minimized.
+    let last_windowed_size = Rc::new(Cell::new(saved_window_size));
     {
         let store = store.clone();
         window.on_set_collapse_sidebar_default(move |v| {
@@ -1263,6 +1371,7 @@ pub fn run() -> Result<()> {
         local_snap.clone(),
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
+        debug_api_state.clone(),
     );
 
     // Recompute the sidebar whenever the active tab changes (fired from Slint's
@@ -1286,6 +1395,7 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let store = store.clone();
         let tabs_model = tabs_model.clone();
+        let debug_api = debug_api.clone();
         window.on_set_language(move |code| {
             crate::i18n::set_language(&code.to_string());
             {
@@ -1306,6 +1416,13 @@ pub fn run() -> Result<()> {
             if let Some(w) = weak.upgrade() {
                 w.set_lang_en(crate::i18n::is_en());
                 w.invoke_refresh_sidebar();
+                let active = configure_debug_api(
+                    &w,
+                    &debug_api,
+                    w.get_debug_api_enabled(),
+                    w.get_debug_api_token().as_str(),
+                );
+                w.set_debug_api_enabled(active);
             }
         });
     }
@@ -1393,7 +1510,8 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // NIC selector: remember the user's choice for the active tab and refresh.
+    // NIC selector: remember the choice for the displayed resource source,
+    // which may be pinned independently of the active terminal tab.
     {
         let weak = window.as_weak();
         let statuses = tab_statuses.clone();
@@ -1401,8 +1519,8 @@ pub fn run() -> Result<()> {
         let net = local_net_hist.clone();
         window.on_select_net_iface(move |iface: SharedString| {
             let Some(w) = weak.upgrade() else { return };
-            let active = w.get_active_tab_id().to_string();
-            if let Some(st) = statuses.lock().unwrap().get_mut(&active) {
+            let source = sidebar_source_tab_id(&w);
+            if let Some(st) = statuses.lock().unwrap().get_mut(&source) {
                 st.selected_iface = iface.to_string();
                 st.net_hist = vec![0.0; NET_HISTORY_LEN]; // reset graph for new NIC
             }
@@ -1608,6 +1726,8 @@ pub fn run() -> Result<()> {
         render_gates.clone(),
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
+        tab_statuses.clone(),
+        debug_api_state.clone(),
     );
     wire_sftp_callbacks(&window, sftp_handles.clone(), sftp_last_cwd.clone());
     wire_key_input(
@@ -1630,6 +1750,7 @@ pub fn run() -> Result<()> {
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
             store: store.clone(),
+            debug_api: debug_api_state.clone(),
         },
     );
 
@@ -1707,6 +1828,7 @@ pub fn run() -> Result<()> {
         let close_handles = handles.clone();
         let ev_store = store.clone();
         let ev_activity = activity.clone();
+        let ev_windowed_size = last_windowed_size.clone();
         let mut last_cursor_logical: Option<(f32, f32)> = None;
         let mut macos_wheel_accum = 0.0_f32;
         // Track the inputs that make up WinActivity; recompute on each change.
@@ -1716,11 +1838,32 @@ pub fn run() -> Result<()> {
         // Apply the Win11 rounded-corner hint once, on the first event (the HWND
         // reliably exists by then, unlike a pre-run timer) (#166).
         let mut chrome_done = false;
-        window.window().on_winit_window_event(move |_w, event| {
+        let mut startup_geometry_done = false;
+        window.window().on_winit_window_event(move |ew, event| {
             if !chrome_done {
                 chrome_done = true;
                 if let Some(win) = weak.upgrade() {
                     apply_window_chrome(win.window());
+                }
+            }
+            // Monitor information is not guaranteed before the event loop
+            // starts. Retry on subsequent native events until it is
+            // available, then clamp the windowed geometry before restoring
+            // maximized state.
+            if !startup_geometry_done {
+                if let Some(win) = weak.upgrade() {
+                    if let Some(size) =
+                        clamp_window_size_to_monitor(&win.window(), ev_windowed_size.get())
+                    {
+                        ev_windowed_size.set(Some(size));
+                        if restore_window_maximized {
+                            ew.set_maximized(true);
+                            win.set_window_maximized(true);
+                        } else {
+                            center_window(&win);
+                        }
+                        startup_geometry_done = true;
+                    }
                 }
             }
             // Recompute window activity, push it to the shared cell, and update
@@ -1806,13 +1949,30 @@ pub fn run() -> Result<()> {
                     minimized = size.width == 0 || size.height == 0;
                     apply_activity(focused, minimized, occluded);
                     // Keep the maximize/restore icon (and resize-edge gating) in
-                    // sync when the OS changes the window state (#119).
+                    // sync when the OS changes the window state (#119). Remember
+                    // only genuine windowed sizes; maximize/minimize events report
+                    // dimensions that must not replace the restore geometry.
                     if let Some(win) = weak.upgrade() {
-                        let maxed = win
-                            .window()
-                            .with_winit_window(|ww| ww.is_maximized())
-                            .unwrap_or(false);
+                        let (maxed, native_minimized, scale) = ew
+                            .with_winit_window(|native| {
+                                (
+                                    native.is_maximized(),
+                                    native.is_minimized().unwrap_or(false),
+                                    native.scale_factor() as f32,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                (ew.is_maximized(), ew.is_minimized(), ew.scale_factor())
+                            });
                         win.set_window_maximized(maxed);
+                        if !maxed && !native_minimized && size.width > 0 && size.height > 0 {
+                            let scale = scale.max(0.01);
+                            let w = size.width as f32 / scale;
+                            let h = size.height as f32 / scale;
+                            if let Some(size) = valid_windowed_size(w, h) {
+                                ev_windowed_size.set(Some(size));
+                            }
+                        }
                     }
                 }
                 WEvent::CloseRequested => {
@@ -1828,7 +1988,7 @@ pub fn run() -> Result<()> {
                     }
                     // No sessions → the window is about to close; persist layout.
                     if let Some(win) = weak.upgrade() {
-                        save_layout(&win, &ev_store);
+                        save_layout(&win, &ev_store, &ev_windowed_size);
                     }
                 }
                 _ => {}
@@ -1840,9 +2000,10 @@ pub fn run() -> Result<()> {
     {
         let weak = window.as_weak();
         let cc_store = store.clone();
+        let cc_windowed_size = last_windowed_size.clone();
         window.on_confirm_close_yes(move || {
             if let Some(w) = weak.upgrade() {
-                save_layout(&w, &cc_store);
+                save_layout(&w, &cc_store, &cc_windowed_size);
             }
             let _ = slint::quit_event_loop();
         });
@@ -1876,11 +2037,12 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let close_handles = handles.clone();
         let wc_store = store.clone();
+        let wc_windowed_size = last_windowed_size.clone();
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 // Mirror the native-X behaviour: confirm if sessions are open.
                 if close_handles.borrow().is_empty() {
-                    save_layout(&w, &wc_store);
+                    save_layout(&w, &wc_store, &wc_windowed_size);
                     let _ = slint::quit_event_loop();
                 } else {
                     w.set_confirm_close_open(true);
@@ -1922,18 +2084,11 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // Center the window on the primary monitor once it's shown (size is only
-    // known after the first frame, so defer via a single-shot timer).
-    {
-        let weak = window.as_weak();
-        slint::Timer::single_shot(std::time::Duration::from_millis(30), move || {
-            if let Some(w) = weak.upgrade() {
-                center_window(&w);
-            }
-        });
-    }
-
-    window.run().context("event loop exited with error")?;
+    let run_result = window.run();
+    // Covers programmatic event-loop exits and backend errors in addition to the
+    // explicit close callbacks above. A second save after a normal close is safe.
+    save_layout(&window, &store, &last_windowed_size);
+    run_result.context("event loop exited with error")?;
     Ok(())
 }
 
@@ -2543,6 +2698,7 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    debug_api: DebugApiState,
 ) {
     // Working set of port forwards (#56) for the session being created/edited.
     // The forward add/delete callbacks mutate it; saving reads it into
@@ -2569,8 +2725,8 @@ fn wire_session_callbacks(
             w.set_dialog_name("".into());
             w.set_dialog_host("".into());
             w.set_dialog_port("22".into());
-            // No default username (#110): leaving it blank makes the connect-time
-            // prompt ask for it, Xshell-style.
+            // Keep the value empty so the UI renders the light "root" placeholder.
+            // Submit normalizes an untouched SSH username to the real root account.
             w.set_dialog_user("".into());
             w.set_dialog_auth("password".into());
             w.set_dialog_password("".into());
@@ -2999,14 +3155,19 @@ fn wire_session_callbacks(
                 draft.private_key_path.to_string().replace('\\', "/")
             };
             let kind = crate::config::SessionKind::from_str(&draft.kind.to_string());
+            let user = if kind == SessionKind::Ssh {
+                ssh_username_or_root(draft.user.as_str()).to_string()
+            } else {
+                draft.user.trim().to_string()
+            };
             // Auto-name: serial → port label; otherwise user@host, or just the
-            // host when no username was given (#110).
+            // host for transports without a username.
             let auto_name = match kind {
                 crate::config::SessionKind::Serial => {
                     format!("{} @{}", draft.serial_port, draft.baud_rate)
                 }
-                _ if draft.user.trim().is_empty() => draft.host.to_string(),
-                _ => format!("{}@{}", draft.user, draft.host),
+                _ if user.is_empty() => draft.host.to_string(),
+                _ => format!("{}@{}", user, draft.host),
             };
             // Telnet defaults to port 23, SSH to 22; serial ignores port.
             let default_port = if kind == crate::config::SessionKind::Telnet {
@@ -3027,7 +3188,7 @@ fn wire_session_callbacks(
                 } else {
                     draft.port as u16
                 },
-                user: draft.user.to_string(),
+                user,
                 auth: AuthMethod::from_str(&draft.auth.to_string()),
                 password,
                 // Store the key path with forward slashes uniformly.
@@ -3225,14 +3386,15 @@ fn wire_session_callbacks(
         let handles = handles.clone();
         let bufs = bufs.clone();
         let render_gates = render_gates.clone();
+        let tab_statuses = tab_statuses.clone();
         let runtime = runtime.clone();
         let last_term_size = last_term_size.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
-        let tab_statuses = tab_statuses.clone();
         let local_snap = local_snap.clone();
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
+        let debug_api = debug_api.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
             let session = match store.borrow().get(&id).cloned() {
@@ -3250,6 +3412,17 @@ fn wire_session_callbacks(
                 }
                 SessionKind::Telnet => format!("telnet {}:{}", session.host, session.port),
             };
+            let api_title = if tab_title.trim().is_empty() {
+                conn_label.clone()
+            } else {
+                tab_title.clone()
+            };
+            debug_api.upsert_terminal(TerminalMetadata::new(
+                tab_id.clone(),
+                api_title,
+                conn_label.clone(),
+                "connecting",
+            ));
             // Serial / Telnet have no SFTP side-channel.
             let has_sftp = session.kind == SessionKind::Ssh;
 
@@ -3379,6 +3552,7 @@ fn wire_session_callbacks(
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
                 store: store.clone(),
+                debug_api: debug_api.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -3437,6 +3611,7 @@ struct ConnectCtx {
     /// Config store, so a session's jump host (#211) can be resolved by id at
     /// connect time on the UI thread.
     store: Rc<RefCell<ConfigStore>>,
+    debug_api: DebugApiState,
 }
 
 /// Resolve a session's configured SSH jump host to the saved session it points
@@ -3482,6 +3657,10 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             initial_rows,
         ),
     };
+    ctx.debug_api
+        .update_terminal(tab_id, |terminal| terminal.state = "connecting".to_string());
+    ctx.debug_api
+        .set_input_sender(tab_id.to_string(), handle.commands.clone());
     ctx.handles.borrow_mut().insert(tab_id.to_string(), handle);
 
     // Separate SFTP connection for the same session (SSH only).
@@ -3510,6 +3689,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let net_pump = ctx.local_net_hist.clone();
         let follow_cd_pump = ctx.sftp_follow_cd.clone();
         let render_gates_pump = ctx.render_gates.clone();
+        let debug_api_pump = ctx.debug_api.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
@@ -3595,7 +3775,23 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 ui_batch.push(SessionEvent::Output(chunk));
                             }
                         }
-                        other => ui_batch.push(other),
+                        other => {
+                            match &other {
+                                SessionEvent::Connected | SessionEvent::ResourceStats { .. } => {
+                                    debug_api_pump.update_terminal(&tab_id_pump, |terminal| {
+                                        terminal.state = "connected".to_string()
+                                    });
+                                }
+                                SessionEvent::Closed(_) => {
+                                    debug_api_pump.update_terminal(&tab_id_pump, |terminal| {
+                                        terminal.state = "disconnected".to_string()
+                                    });
+                                    debug_api_pump.remove_input_sender(&tab_id_pump);
+                                }
+                                _ => {}
+                            }
+                            ui_batch.push(other);
+                        }
                     }
                 }
                 if ui_batch.is_empty() {
@@ -3904,11 +4100,31 @@ fn sync_proc_theme(main: &AppWindow, proc: &ProcWindow) {
 /// Persist the current panel docking layout (both panels' edge + size) and the
 /// window size, so the next launch restores the user's arrangement. Called on
 /// every exit path (#dock).
-fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
-    let scale = win.window().scale_factor().max(0.01);
-    let size = win.window().size();
-    let w = size.width as f32 / scale;
-    let h = size.height as f32 / scale;
+fn save_layout(
+    win: &AppWindow,
+    store: &Rc<RefCell<ConfigStore>>,
+    last_windowed_size: &Cell<Option<(f32, f32)>>,
+) {
+    let (native_maximized, native_minimized) = win
+        .window()
+        .with_winit_window(|native| {
+            (
+                native.is_maximized(),
+                native.is_minimized().unwrap_or(false),
+            )
+        })
+        .unwrap_or_else(|| (win.get_window_maximized(), false));
+
+    if !native_maximized && !native_minimized {
+        let scale = win.window().scale_factor().max(0.01);
+        let size = win.window().size();
+        let w = size.width as f32 / scale;
+        let h = size.height as f32 / scale;
+        if let Some(size) = valid_windowed_size(w, h) {
+            last_windowed_size.set(Some(size));
+        }
+    }
+
     let mut s = store.borrow_mut();
     s.set_sidebar_width(win.get_sidebar_width());
     s.set_sidebar_height(win.get_sidebar_height());
@@ -3920,18 +4136,13 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
     s.set_welcome_sidebar_width(win.get_welcome_sidebar_width());
     s.set_welcome_sidebar_dock(win.get_welcome_sidebar_dock().to_string());
     s.set_welcome_collapsed(win.get_welcome_collapsed());
-    // A maximized size isn't a useful "preferred" size to restore to, so only
-    // remember the windowed size. Ask the native window too, because the Slint
-    // property can lag during startup/shutdown on frameless Windows (#234).
-    let native_maximized = win
-        .window()
-        .with_winit_window(|ww| ww.is_maximized())
-        .unwrap_or_else(|| win.get_window_maximized());
-    if !native_maximized && w > 200.0 && h > 200.0 {
-        let (w, h) = clamp_window_size_to_monitor(&win.window(), Some((w, h))).unwrap_or((w, h));
+    if let Some((w, h)) = last_windowed_size.get() {
         s.set_window_size(w, h);
     }
-    let _ = s.save();
+    s.set_window_maximized(native_maximized);
+    if let Err(err) = s.save() {
+        tracing::warn!("failed to save window layout: {err:#}");
+    }
 }
 
 /// Every quick-command group name (used to start with all groups collapsed, #55):
@@ -4313,6 +4524,37 @@ fn theme_pref_is_dark(store: &ConfigStore) -> bool {
     }
 }
 
+fn configure_debug_api(
+    window: &AppWindow,
+    controller: &Rc<RefCell<DebugApiController>>,
+    enabled: bool,
+    token: &str,
+) -> bool {
+    let default_url = format!("http://127.0.0.1:{DEBUG_API_PORT}");
+    window.set_debug_api_address(default_url.into());
+    if !enabled {
+        controller.borrow_mut().stop();
+        window.set_debug_api_status(t("已关闭", "Disabled").into());
+        return false;
+    }
+
+    match controller.borrow_mut().start(DEBUG_API_PORT, token) {
+        Ok(address) => {
+            let url = format!("http://{address}");
+            window.set_debug_api_address(url.clone().into());
+            window.set_debug_api_status(format!("{}: {url}", t("监听中", "Listening")).into());
+            true
+        }
+        Err(error) => {
+            tracing::warn!("failed to start Debug API: {error:#}");
+            window.set_debug_api_status(
+                format!("{}: {error:#}", t("启动失败", "Failed to start")).into(),
+            );
+            false
+        }
+    }
+}
+
 /// Flip the whole app between light and dark. Setting `Theme.dark` alone only
 /// recolours the Slint chrome — each terminal bakes its ANSI/default colours
 /// from a per-buffer `is_dark` flag at render time, so we must also update every
@@ -4396,6 +4638,18 @@ fn conn_ip(host: &str) -> String {
     host.rsplit('@').next().unwrap_or(host).trim().to_string()
 }
 
+/// Return the tab whose resources drive the sidebar. A pinned source keeps
+/// updating while the user works elsewhere; otherwise resources follow focus.
+fn sidebar_source_tab_id(win: &AppWindow) -> String {
+    if win.get_resource_pinned() {
+        let pinned = win.get_resource_pinned_tab_id().to_string();
+        if !pinned.is_empty() {
+            return pinned;
+        }
+    }
+    win.get_active_tab_id().to_string()
+}
+
 fn refresh_sidebar(
     win: &AppWindow,
     statuses: &TabStatuses,
@@ -4460,11 +4714,24 @@ fn refresh_sidebar(
     set_procs(win, &[]);
 
     let active = win.get_active_tab_id().to_string();
-    let status = if active == "welcome" {
+    let mut source = sidebar_source_tab_id(win);
+    let mut status = if source == "welcome" {
         None
     } else {
-        statuses.lock().unwrap().get(&active).cloned()
+        statuses.lock().unwrap().get(&source).cloned()
     };
+    // Closing a pinned tab returns the sidebar to follow mode instead of
+    // leaving stale values on screen.
+    if win.get_resource_pinned() && source != "welcome" && status.is_none() {
+        win.set_resource_pinned(false);
+        win.set_resource_pinned_tab_id("".into());
+        source = active;
+        status = if source == "welcome" {
+            None
+        } else {
+            statuses.lock().unwrap().get(&source).cloned()
+        };
+    }
 
     match status {
         // A live session tab → remote resources + remote NIC on top.
@@ -4608,7 +4875,7 @@ fn apply_session_event_to_window(
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 1;
             }
-            if win.get_active_tab_id().as_str() == tab_id {
+            if sidebar_source_tab_id(win) == tab_id {
                 refresh_sidebar(win, statuses, local, local_net_hist);
             }
         }
@@ -4638,7 +4905,7 @@ fn apply_session_event_to_window(
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 2;
             }
-            if win.get_active_tab_id().as_str() == tab_id {
+            if sidebar_source_tab_id(win) == tab_id {
                 refresh_sidebar(win, statuses, local, local_net_hist);
             }
         }
@@ -4669,7 +4936,7 @@ fn apply_session_event_to_window(
                 let (_, rx, tx) = selected_iface(st);
                 push_ring(&mut st.net_hist, (rx + tx) as f32);
             }
-            if win.get_active_tab_id().as_str() == tab_id {
+            if sidebar_source_tab_id(win) == tab_id {
                 refresh_sidebar(win, statuses, local, local_net_hist);
             }
         }
@@ -5497,6 +5764,8 @@ fn wire_tab_callbacks(
     render_gates: RenderGates,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
+    tab_statuses: TabStatuses,
+    debug_api: DebugApiState,
 ) {
     // Select a tab inside a pane: make it that pane's active tab and focus the
     // pane. refresh_panes propagates active-tab-id (→ sidebar refresh).
@@ -5586,6 +5855,8 @@ fn wire_tab_callbacks(
         let handles = handles.clone();
         let bufs = bufs.clone();
         let render_gates = render_gates.clone();
+        let tab_statuses = tab_statuses.clone();
+        let debug_api = debug_api.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
         let panes_model = panes_model.clone();
@@ -5604,6 +5875,8 @@ fn wire_tab_callbacks(
             sftp_last_cwd.lock().unwrap().remove(&id);
             bufs.lock().unwrap().remove(&id);
             render_gates.lock().unwrap().remove(&id);
+            tab_statuses.lock().unwrap().remove(&id);
+            debug_api.remove_terminal(&id);
 
             // Remove from tabs + terminals models.
             let mut idx = None;
@@ -9362,6 +9635,15 @@ fn parent_path(path: &str) -> String {
 #[cfg(test)]
 mod key_tests {
     use super::*;
+
+    #[test]
+    fn windowed_size_rejects_minimized_or_invalid_geometry() {
+        assert_eq!(valid_windowed_size(0.0, 0.0), None);
+        assert_eq!(valid_windowed_size(1360.0, 0.0), None);
+        assert_eq!(valid_windowed_size(200.0, 840.0), None);
+        assert_eq!(valid_windowed_size(f32::NAN, 840.0), None);
+        assert_eq!(valid_windowed_size(1360.0, 840.0), Some((1360.0, 840.0)));
+    }
 
     #[test]
     fn bare_alt_is_not_forwarded() {

@@ -5,6 +5,7 @@
 
 mod app;
 mod config;
+mod debug_api;
 mod errlog;
 mod forward;
 mod i18n;

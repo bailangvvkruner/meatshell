@@ -175,6 +175,27 @@ async fn run_telnet(
                         }
                         let _ = wr.flush().await;
                     }
+                    Some(SessionCommand::DebugInput { bytes, ack }) => {
+                        tracing::debug!("telnet debug input len={} bytes", bytes.len());
+                        let mut out = Vec::with_capacity(bytes.len());
+                        for b in bytes {
+                            out.push(b);
+                            if b == IAC { out.push(IAC); }
+                        }
+                        let result = async {
+                            wr.write_all(&out).await?;
+                            wr.flush().await
+                        }
+                        .await
+                        .map_err(|error| error.to_string());
+                        let failed = result.is_err();
+                        let _ = ack.send(result);
+                        if failed {
+                            let _ = events.send(SessionEvent::Closed(
+                                t("写入失败", "write failed").into()));
+                            break;
+                        }
+                    }
                     Some(SessionCommand::Resize(cols, rows)) => {
                         let _ = wr.write_all(&naws_subneg(cols, rows)).await;
                         let _ = wr.flush().await;

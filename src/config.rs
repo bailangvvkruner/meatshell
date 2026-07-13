@@ -542,6 +542,30 @@ impl Session {
     }
 }
 
+/// Return the effective SSH username. Empty or whitespace-only input uses the
+/// conventional administrator account while explicit usernames are trimmed.
+pub(crate) fn ssh_username_or_root(username: &str) -> &str {
+    let username = username.trim();
+    if username.is_empty() {
+        "root"
+    } else {
+        username
+    }
+}
+
+fn normalize_ssh_session_username(session: &mut Session) -> bool {
+    if session.kind != SessionKind::Ssh {
+        return false;
+    }
+    let username = ssh_username_or_root(&session.user).to_string();
+    if username == session.user {
+        false
+    } else {
+        session.user = username;
+        true
+    }
+}
+
 /// A saved quick command (#55): a named snippet the user clicks to send to the
 /// active terminal.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -644,6 +668,9 @@ pub struct ConfigFile {
     pub window_width: f32,
     #[serde(default)]
     pub window_height: f32,
+    /// Whether the main window was maximized on clean shutdown.
+    #[serde(default)]
+    pub window_maximized: bool,
     /// Collapse the bottom SFTP panel on startup (#78).
     #[serde(default)]
     pub collapse_sftp_default: bool,
@@ -691,6 +718,12 @@ pub struct ConfigFile {
     /// it on stops the GitHub releases query and the banner.
     #[serde(default)]
     pub update_check_disabled: bool,
+    /// Authenticated loopback API for local AI/debug tooling. Off by default.
+    #[serde(default)]
+    pub debug_api_enabled: bool,
+    /// Bearer token for the debug API, encrypted at rest like other secrets.
+    #[serde(default)]
+    pub debug_api_token: Secret,
     /// One-time default-layout migration marker (#new-user-defaults). 0 = config
     /// predates the migration. `migrate_defaults` bumps it to `DEFAULTS_REV` after
     /// pushing the new look (default wallpaper / welcome-as-sidebar / right-docked
@@ -848,6 +881,7 @@ impl ConfigStore {
                     // Decrypt any encrypted passwords; leave legacy plaintext
                     // values untouched (they will be encrypted on next save).
                     for session in &mut cfg.sessions {
+                        migrated |= normalize_ssh_session_username(session);
                         if let Some(plain) = Self::try_decrypt(&key, session.password.as_str()) {
                             session.password = Secret::new(plain);
                         }
@@ -860,12 +894,15 @@ impl ConfigStore {
                     if let Some(plain) = Self::try_decrypt(&key, cfg.webdav_password.as_str()) {
                         cfg.webdav_password = Secret::new(plain);
                     }
+                    if let Some(plain) = Self::try_decrypt(&key, cfg.debug_api_token.as_str()) {
+                        cfg.debug_api_token = Secret::new(plain);
+                    }
                     // Clean up any duplicate history accumulated before #113,
                     // keeping the last (most recent) occurrence of each command.
                     dedup_keep_last(&mut cfg.command_history);
                     // One-time push of the new default layout to existing users
                     // (only for items they never changed). (#new-user-defaults)
-                    migrated = migrate_defaults(&mut cfg);
+                    migrated |= migrate_defaults(&mut cfg);
                     cfg
                 }
                 Err(err) => {
@@ -911,7 +948,8 @@ impl ConfigStore {
         &mut self.cache.sessions
     }
 
-    pub fn upsert(&mut self, session: Session) {
+    pub fn upsert(&mut self, mut session: Session) {
+        normalize_ssh_session_username(&mut session);
         if let Some(existing) = self.cache.sessions.iter_mut().find(|s| s.id == session.id) {
             *existing = session;
         } else {
@@ -1204,6 +1242,18 @@ impl ConfigStore {
     pub fn set_update_check_enabled(&mut self, enabled: bool) {
         self.cache.update_check_disabled = !enabled;
     }
+    pub fn debug_api_enabled(&self) -> bool {
+        self.cache.debug_api_enabled
+    }
+    pub fn set_debug_api_enabled(&mut self, enabled: bool) {
+        self.cache.debug_api_enabled = enabled;
+    }
+    pub fn debug_api_token(&self) -> &str {
+        self.cache.debug_api_token.as_str()
+    }
+    pub fn set_debug_api_token(&mut self, token: String) {
+        self.cache.debug_api_token = Secret::new(token);
+    }
     pub fn wallpaper_overlay(&self) -> f32 {
         let a = self.cache.wallpaper_overlay;
         // Floor lowered 0.40 -> 0.30 so more see-through panels are reachable.
@@ -1266,6 +1316,12 @@ impl ConfigStore {
     pub fn set_window_size(&mut self, w: f32, h: f32) {
         self.cache.window_width = w;
         self.cache.window_height = h;
+    }
+    pub fn window_maximized(&self) -> bool {
+        self.cache.window_maximized
+    }
+    pub fn set_window_maximized(&mut self, maximized: bool) {
+        self.cache.window_maximized = maximized;
     }
 
     /// Collapse the SFTP panel on startup (default false) (#78).
@@ -1420,6 +1476,12 @@ impl ConfigStore {
         {
             let enc = Self::encrypt(&self.key, disk.webdav_password.as_str())?;
             disk.webdav_password = Secret::new(enc);
+        }
+        if !disk.debug_api_token.is_empty()
+            && !disk.debug_api_token.as_str().starts_with(Self::ENC_PREFIX)
+        {
+            let enc = Self::encrypt(&self.key, disk.debug_api_token.as_str())?;
+            disk.debug_api_token = Secret::new(enc);
         }
         let raw = serde_json::to_string_pretty(&disk)?;
         // Write to a sibling temp file then rename — cheap atomicity.
@@ -1578,8 +1640,14 @@ impl ConfigStore {
             {
                 s.private_key_inline = Secret::new(plain);
             }
+            normalize_ssh_session_username(&mut s);
             let dup = self.cache.sessions.iter().any(|x| {
-                x.host == s.host && x.user == s.user && x.port == s.port && x.kind == s.kind
+                let same_user = if s.kind == SessionKind::Ssh {
+                    ssh_username_or_root(&x.user) == s.user.as_str()
+                } else {
+                    x.user == s.user
+                };
+                x.host == s.host && same_user && x.port == s.port && x.kind == s.kind
             });
             if dup {
                 skipped += 1;
@@ -1606,6 +1674,54 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_username_defaults_to_root_only_when_blank() {
+        assert_eq!(ssh_username_or_root(""), "root");
+        assert_eq!(ssh_username_or_root("   "), "root");
+        assert_eq!(ssh_username_or_root(" deploy "), "deploy");
+
+        let mut ssh = Session {
+            user: "   ".into(),
+            ..Session::new_empty()
+        };
+        assert!(normalize_ssh_session_username(&mut ssh));
+        assert_eq!(ssh.user, "root");
+        assert!(!normalize_ssh_session_username(&mut ssh));
+
+        let mut telnet = Session {
+            kind: SessionKind::Telnet,
+            user: String::new(),
+            ..Session::new_empty()
+        };
+        assert!(!normalize_ssh_session_username(&mut telnet));
+        assert!(telnet.user.is_empty());
+    }
+
+    #[test]
+    fn blank_ssh_username_is_normalized_on_write_and_import() {
+        let mut store = temp_store();
+        let existing = Session {
+            host: "server-a".into(),
+            user: String::new(),
+            ..Session::new_empty()
+        };
+        store.upsert(existing);
+        assert_eq!(store.sessions()[0].user, "root");
+
+        let duplicate = Session {
+            host: "server-a".into(),
+            user: "   ".into(),
+            ..Session::new_empty()
+        };
+        let raw = serde_json::to_string(&ExportFile {
+            meatshell_export: 1,
+            sessions: vec![duplicate],
+        })
+        .unwrap();
+        assert_eq!(store.import_json(&raw).unwrap(), (0, 1));
+        assert_eq!(store.sessions().len(), 1);
+    }
 
     fn temp_store() -> ConfigStore {
         let path = std::env::temp_dir().join(format!("ms-test-{}.json", Uuid::new_v4()));
@@ -1674,6 +1790,50 @@ mod tests {
         assert_eq!(std::fs::read(backup.join("secret.key")).unwrap(), [7u8; 32]);
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn window_state_json_is_backward_compatible() {
+        let old: ConfigFile =
+            serde_json::from_str(r#"{"window_width":1200,"window_height":720}"#).unwrap();
+        assert_eq!((old.window_width, old.window_height), (1200.0, 720.0));
+        assert!(!old.window_maximized);
+
+        let mut current = ConfigFile::default();
+        current.window_width = 1360.0;
+        current.window_height = 840.0;
+        current.window_maximized = true;
+        let round_trip: ConfigFile =
+            serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(
+            (round_trip.window_width, round_trip.window_height),
+            (1360.0, 840.0)
+        );
+        assert!(round_trip.window_maximized);
+    }
+
+    #[test]
+    fn debug_api_defaults_off_and_encrypts_its_token() {
+        let old: ConfigFile = serde_json::from_str("{}").unwrap();
+        assert!(!old.debug_api_enabled);
+        assert!(old.debug_api_token.is_empty());
+
+        let store = temp_store();
+        let path = store.path.clone();
+        let mut store = store;
+        store.set_debug_api_enabled(true);
+        store.set_debug_api_token("debug-token-plaintext".to_string());
+        store.save().unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("debug-token-plaintext"));
+        let disk: ConfigFile = serde_json::from_str(&raw).unwrap();
+        assert!(disk.debug_api_enabled);
+        assert!(disk
+            .debug_api_token
+            .as_str()
+            .starts_with(ConfigStore::ENC_PREFIX));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -192,6 +192,30 @@ async fn run_serial(
                     break;
                 }
             }
+            SessionCommand::DebugInput { bytes, ack } => {
+                tracing::debug!("serial debug input len={} bytes", bytes.len());
+                let w = writer.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut guard = w.lock().unwrap();
+                    guard.write_all(&bytes).and_then(|_| guard.flush())
+                })
+                .await;
+                let result = match result {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let failed = result.is_err();
+                let reason = result.as_ref().err().cloned();
+                let _ = ack.send(result);
+                if failed {
+                    let _ = events.send(SessionEvent::Closed(format!(
+                        "{}: {}",
+                        t("串口写入失败", "serial write failed"),
+                        reason.unwrap_or_default()
+                    )));
+                    break;
+                }
+            }
             // A serial line has no window size; nothing to propagate.
             SessionCommand::Resize(_, _) => {}
             SessionCommand::AddTunnel { .. } | SessionCommand::StopTunnel(_) => {}

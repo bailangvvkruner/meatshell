@@ -1,0 +1,48 @@
+# Debug API
+
+meatshell can expose an authenticated HTTP API for local AI agents and debug
+tools. It is disabled by default and always binds to `127.0.0.1:24817`.
+
+Enable it from **Settings > Debug API**, then copy the Bearer token. Every
+request requires:
+
+```text
+Authorization: Bearer <token>
+```
+
+## Endpoints
+
+- `GET /v1/health`
+- `GET /v1/terminals`
+- `GET /v1/terminals/{id}/screen?max_lines=200`
+- `POST /v1/terminals/{id}/input`
+
+The input request body is JSON:
+
+```json
+{
+  "text": "pwd",
+  "submit": true
+}
+```
+
+`submit: true` sends one terminal Enter (`CR`). Requests are size-limited,
+screen responses are capped, and at most four inputs may wait for a terminal at
+once (`429` when busy). The API never returns saved passwords, private keys, or
+WebDAV credentials.
+
+## PowerShell Example
+
+```powershell
+$headers = @{ Authorization = "Bearer <token>" }
+$terminals = Invoke-RestMethod http://127.0.0.1:24817/v1/terminals -Headers $headers
+$id = $terminals.terminals[0].id
+
+Invoke-RestMethod "http://127.0.0.1:24817/v1/terminals/$id/screen?max_lines=100" -Headers $headers
+Invoke-RestMethod "http://127.0.0.1:24817/v1/terminals/$id/input" `
+  -Method Post -Headers $headers -ContentType "application/json" `
+  -Body '{"text":"pwd","submit":true}'
+```
+
+Only an AI client with local tool or HTTP access can call this interface; a
+standalone model cannot initiate a connection to the computer by itself.

@@ -17,7 +17,7 @@ use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::config::{AuthMethod, PortForward, Session};
+use crate::config::{ssh_username_or_root, AuthMethod, PortForward, Session};
 use crate::i18n::t;
 
 // ---------------------------------------------------------------------------
@@ -251,6 +251,12 @@ fn url_decode(s: &str) -> String {
 pub enum SessionCommand {
     /// Send raw bytes directly to the PTY (individual keystrokes, no modification).
     RawInput(Vec<u8>),
+    /// Debug API input with an acknowledgement after the transport consumes it.
+    /// The API uses this to bound outstanding model-generated input.
+    DebugInput {
+        bytes: Vec<u8>,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Notify the remote PTY of a terminal resize.
     Resize(u32, u32),
     /// Start a runtime-only SSH tunnel for this connected session (#206).
@@ -1178,6 +1184,20 @@ async fn run_session(
                             break;
                         }
                     }
+                    Some(SessionCommand::DebugInput { bytes, ack }) => {
+                        tracing::debug!("ssh debug input len={} bytes", bytes.len());
+                        match channel.data(&bytes[..]).await {
+                            Ok(()) => {
+                                let _ = ack.send(Ok(()));
+                            }
+                            Err(err) => {
+                                let reason = format!("{}: {err}", t("写入失败", "write failed"));
+                                let _ = ack.send(Err(reason.clone()));
+                                let _ = events.send(SessionEvent::Closed(reason));
+                                break;
+                            }
+                        }
+                    }
                     Some(SessionCommand::Resize(cols, rows)) => {
                         let _ = channel.window_change(cols, rows, 0, 0).await;
                     }
@@ -1829,20 +1849,20 @@ pub(crate) async fn verify_host_key(
     }
 }
 
-/// Resolve a session's username/password, prompting the UI for whatever is
-/// missing (#110). Returns the effective `(user, password)`, or `None` if the
-/// user cancelled. Both the shell and SFTP connections call this; the UI
+/// Resolve a session's username/password, defaulting a blank username to root
+/// and prompting the UI for a missing password. Returns the effective
+/// `(user, password)`, or `None` if the user cancelled. Both the shell and SFTP
+/// connections call this; the UI
 /// de-duplicates by session id so a single dialog serves both. A dropped reply
 /// channel (no UI) falls through with the stored values so auth fails normally.
 pub(crate) async fn resolve_credentials(
     session: &Session,
     events: &UnboundedSender<SessionEvent>,
 ) -> Option<(String, String)> {
-    let mut user = session.user.trim().to_string();
+    let user = ssh_username_or_root(&session.user).to_string();
     let mut password = session.password.as_str().to_string();
-    let need_user = user.is_empty();
     let need_password = matches!(session.auth, AuthMethod::Password) && password.is_empty();
-    if !(need_user || need_password) {
+    if !need_password {
         return Some((user, password));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1850,7 +1870,7 @@ pub(crate) async fn resolve_credentials(
         session_id: session.id.clone(),
         host: session.host.clone(),
         user: user.clone(),
-        need_user,
+        need_user: false,
         need_password,
         responder: CredentialResponder::new(tx),
     });
@@ -1858,10 +1878,7 @@ pub(crate) async fn resolve_credentials(
         return Some((user, password));
     }
     match rx.await {
-        Ok(Some((u, p, _remember))) => {
-            if need_user {
-                user = u.trim().to_string();
-            }
+        Ok(Some((_user, p, _remember))) => {
             if need_password {
                 password = p;
             }

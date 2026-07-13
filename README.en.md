@@ -100,6 +100,7 @@ open /Applications/meatshell.app
 - [x] Session passwords encrypted at rest (ChaCha20-Poly1305)
 - [x] Known-hosts (`known_hosts`) verification + first-connect confirmation
 - [x] Split panes for tabbed terminals
+- [x] Opt-in local AI / Debug API with Bearer authentication ([API guide](docs/debug-api.md))
 
 ### Planned
 
