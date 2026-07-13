@@ -9826,6 +9826,31 @@ mod selection_tests {
     }
 
     #[test]
+    fn bytewise_utf8_btop_frame_stays_on_its_hvp_position() {
+        let mut buf = make_buf(3, 8, &[], &[], 0);
+        let mut decoder = crate::ssh::Utf8StreamDecoder::default();
+        let frame = format!(
+            "\x1b[?1049h\x1b[1;1f{}\x1b[1;1f{}",
+            "─".repeat(8),
+            "─".repeat(8)
+        );
+        for byte in frame.as_bytes() {
+            let decoded = decoder.decode(&[*byte]);
+            if !decoded.is_empty() {
+                buf.ingest(decoded.as_bytes());
+            }
+        }
+        assert_eq!(decoder.finish(), "");
+
+        let screen = buf.parser.screen();
+        assert!(screen.alternate_screen());
+        assert_eq!(screen.errors(), 0);
+        assert_eq!(build_row(screen, 0, 8).0, "─".repeat(8));
+        assert!(build_row(screen, 1, 8).0.trim().is_empty());
+        assert_eq!(screen.cursor_position().0, 0);
+    }
+
+    #[test]
     fn vis_to_abs_maps_live_and_scrolled_consistently() {
         // history H0..H2 (3 lines), live LIVE0/LIVE1 → combined len 5.
         let live = make_buf(5, 20, &["H0", "H1", "H2"], &["LIVE0", "LIVE1"], 0);

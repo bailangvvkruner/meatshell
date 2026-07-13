@@ -372,6 +372,59 @@ pub struct ProcInfo {
     pub command: String,
 }
 
+/// Incrementally decode a UTF-8 terminal stream without treating an SSH packet
+/// boundary as an encoding error. A valid UTF-8 scalar can leave at most three
+/// incomplete bytes at the end of one packet; confirmed-invalid sequences are
+/// replaced immediately so malformed remote output cannot stall the stream.
+#[derive(Default)]
+pub(crate) struct Utf8StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    pub(crate) fn decode(&mut self, input: &[u8]) -> String {
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(input);
+        let mut rest = bytes.as_slice();
+        let mut output = String::new();
+
+        while !rest.is_empty() {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    output.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let valid_len = error.valid_up_to();
+                    if valid_len > 0 {
+                        // `valid_up_to` guarantees this prefix is valid UTF-8.
+                        output.push_str(std::str::from_utf8(&rest[..valid_len]).unwrap());
+                    }
+                    match error.error_len() {
+                        Some(invalid_len) => {
+                            output.push('\u{fffd}');
+                            rest = &rest[valid_len + invalid_len..];
+                        }
+                        None => {
+                            self.pending.extend_from_slice(&rest[valid_len..]);
+                            debug_assert!(self.pending.len() <= 3);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Flush an incomplete final scalar when the SSH stream ends.
+    pub(crate) fn finish(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&pending).into_owned()
+    }
+}
+
 /// One SSH tunnel row shown in the runtime tunnel panel (#206).
 #[derive(Debug, Clone)]
 pub struct RuntimeTunnelInfo {
@@ -1162,6 +1215,11 @@ async fn run_session(
     // Buffers output while `suppress_echo` so the (long) echoed setup line can be
     // stripped even when it splits across reads (#98).
     let mut echo_buf = String::new();
+    // SSH ChannelMsg boundaries are arbitrary and frequently split btop's
+    // multibyte box-drawing glyphs. Preserve incomplete UTF-8 tails separately
+    // for stdout and stderr instead of expanding them into replacement chars.
+    let mut stdout_decoder = Utf8StreamDecoder::default();
+    let mut stderr_decoder = Utf8StreamDecoder::default();
     // After a ZMODEM transfer finishes we briefly ignore ZMODEM detection so the
     // sender's lingering close frames can't spawn a spurious second receive (#76).
     let mut zmodem_done_at: Option<std::time::Instant> = None;
@@ -1413,13 +1471,14 @@ async fn run_session(
                                     // run them through the normal output path so
                                     // the prompt shows and the cwd updates.
                                     if !leftover.is_empty() {
-                                        let text =
-                                            String::from_utf8_lossy(&leftover).into_owned();
+                                        let text = stdout_decoder.decode(&leftover);
                                         if let Some(cwd) = extract_osc7_path(&text) {
                                             let _ =
                                                 events.send(SessionEvent::CwdChanged(cwd));
                                         }
-                                        let _ = events.send(SessionEvent::Output(text));
+                                        if !text.is_empty() {
+                                            let _ = events.send(SessionEvent::Output(text));
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1434,7 +1493,7 @@ async fn run_session(
                             continue;
                         }
 
-                        let chunk = String::from_utf8_lossy(&data).into_owned();
+                        let chunk = stdout_decoder.decode(&data);
 
                         // Inject PROMPT_COMMAND after the first real shell output,
                         // unless shell integration is disabled for this session
@@ -1517,16 +1576,27 @@ async fn run_session(
                             }
                         }
 
-                        let _ = events.send(SessionEvent::Output(text));
+                        if !text.is_empty() {
+                            let _ = events.send(SessionEvent::Output(text));
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
-                        let text = String::from_utf8_lossy(&data).into_owned();
-                        let _ = events.send(SessionEvent::Output(text));
+                        let text = stderr_decoder.decode(&data);
+                        if !text.is_empty() {
+                            let _ = events.send(SessionEvent::Output(text));
+                        }
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         let _ = events.send(SessionEvent::Status(
                             format!("{} (code {exit_status})", t("远程进程退出", "remote process exited")),
                         ));
+                    }
+                    Some(ChannelMsg::Eof) => {
+                        for tail in [stdout_decoder.finish(), stderr_decoder.finish()] {
+                            if !tail.is_empty() {
+                                let _ = events.send(SessionEvent::Output(tail));
+                            }
+                        }
                     }
                     Some(ChannelMsg::Close) | None => {
                         break;
@@ -1733,6 +1803,15 @@ async fn run_session(
                     }
                 }
             }
+        }
+    }
+
+    // Local close/cancellation can leave a final UTF-8 scalar incomplete even
+    // when the server never sent an explicit EOF. Emit one replacement per
+    // affected stream rather than silently dropping those bytes.
+    for tail in [stdout_decoder.finish(), stderr_decoder.finish()] {
+        if !tail.is_empty() {
+            let _ = events.send(SessionEvent::Output(tail));
         }
     }
 
@@ -2373,6 +2452,50 @@ impl Handler for ClientHandler {
 fn _assert_handle_send() {
     fn takes<T: Send>() {}
     takes::<Handle<ClientHandler>>();
+}
+
+#[cfg(test)]
+mod utf8_stream_decoder_tests {
+    use super::Utf8StreamDecoder;
+
+    #[test]
+    fn preserves_ascii_and_multibyte_text_split_at_every_byte() {
+        let expected = "ASCII: btop 中文 ─│┌┐ 😀 done";
+        let mut decoder = Utf8StreamDecoder::default();
+        let mut actual = String::new();
+        for byte in expected.as_bytes() {
+            actual.push_str(&decoder.decode(&[*byte]));
+            assert!(decoder.pending.len() <= 3);
+        }
+        actual.push_str(&decoder.finish());
+        assert_eq!(actual, expected);
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn decodes_multiple_characters_and_ascii_in_one_chunk() {
+        let mut decoder = Utf8StreamDecoder::default();
+        assert_eq!(decoder.decode("前缀".as_bytes()), "前缀");
+        assert_eq!(decoder.decode(b" + ascii + "), " + ascii + ");
+        assert_eq!(decoder.decode("后缀".as_bytes()), "后缀");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn replaces_confirmed_invalid_sequences_but_keeps_incomplete_tails() {
+        let mut decoder = Utf8StreamDecoder::default();
+        assert_eq!(decoder.decode(b"ok\xff!"), "ok\u{fffd}!");
+
+        // E2 could begin a valid three-byte scalar, so wait for another packet.
+        assert_eq!(decoder.decode(&[0xe2]), "");
+        // ASCII proves the pending E2 was invalid rather than incomplete.
+        assert_eq!(decoder.decode(b"A"), "\u{fffd}A");
+
+        // An EOF flush turns a still-incomplete scalar into one replacement.
+        assert_eq!(decoder.decode(&[0xf0, 0x9f, 0x92]), "");
+        assert_eq!(decoder.finish(), "\u{fffd}");
+        assert!(decoder.pending.is_empty());
+    }
 }
 
 #[cfg(test)]
