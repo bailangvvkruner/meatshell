@@ -19,7 +19,7 @@ jobs:
     env:
       AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
     # Only run once the AUR SSH key is configured.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.release != null }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.release != null && !github.event.release.prerelease) }}
     steps:
       - uses: actions/checkout@v4
 

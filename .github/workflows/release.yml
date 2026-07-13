@@ -1,15 +1,19 @@
 name: Release
 
-# Build native binaries for Windows / Linux / macOS.
-#  - Push a tag like `v0.2.3`  -> builds all platforms and attaches the archives
-#    to a GitHub Release.
-#  - Run manually (workflow_dispatch) -> builds all platforms and uploads them as
-#    downloadable workflow artifacts (no release created).
+# Build the Windows x64 release. Other platforms are temporarily disabled.
+#  - Push to main -> updates the rolling `nightly` pre-release.
+#  - Push a tag like `v0.2.3` -> creates/updates the matching formal release.
+#  - Run manually (workflow_dispatch) -> uploads a downloadable workflow artifact.
 
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write   # needed to create / update the GitHub Release
@@ -59,22 +63,8 @@ jobs:
             target: x86_64-pc-windows-msvc
             name: windows-x86_64
             bin: meatshell.exe
-          - os: ubuntu-22.04            # build on the oldest supported runner for
-            target: x86_64-unknown-linux-gnu   # broader glibc compatibility
-            name: linux-x86_64
-            bin: meatshell
-          - os: ubuntu-22.04-arm       # free native arm64 runner (public repos)
-            target: aarch64-unknown-linux-gnu  # builds the Linux ARM64 .tar.gz (#82)
-            name: linux-aarch64
-            bin: meatshell
-          - os: macos-14               # Apple Silicon
-            target: aarch64-apple-darwin
-            name: macos-aarch64
-            bin: meatshell
-          - os: macos-14               # Apple Silicon runner — cross-compiles the
-            target: x86_64-apple-darwin # x86_64 Mac binary. (Dedicated Intel
-            name: macos-x86_64          # macos-13 runners queue for ages / time out.)
-            bin: meatshell
+          # Temporarily disabled: Linux x64, Linux ARM64, macOS ARM64 and macOS x64.
+          # Restore their matrix entries from git history when needed.
 
     steps:
       - uses: actions/checkout@v4
@@ -144,7 +134,11 @@ jobs:
         shell: bash
         run: |
           set -eu
-          VERSION="${GITHUB_REF_NAME:-dev}"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            VERSION="nightly"
+          else
+            VERSION="${GITHUB_REF_NAME:-dev}"
+          fi
           STAGE="meatshell-${VERSION}-${{ matrix.name }}"
 
           if [ "${{ runner.os }}" = "macOS" ]; then
@@ -217,7 +211,12 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          $VERSION = "$env:GITHUB_REF_NAME"; if (-not $VERSION) { $VERSION = "dev" }
+          if ($env:GITHUB_REF -eq "refs/heads/main") {
+            $VERSION = "nightly"
+          } else {
+            $VERSION = "$env:GITHUB_REF_NAME"
+            if (-not $VERSION) { $VERSION = "dev" }
+          }
           # WiX 3 toolset (candle/light) that cargo-wix drives.
           choco install wixtoolset -y --no-progress
           $candle = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*\bin\candle.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -246,6 +245,35 @@ jobs:
           name: windows-x86_64-msi
           path: ${{ env.MSI }}
 
+      - name: Move rolling nightly tag
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -eu
+          git tag --force nightly "$GITHUB_SHA"
+          git push origin refs/tags/nightly --force
+
+      - name: Publish rolling Windows x64 nightly release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Windows x64 nightly
+          prerelease: true
+          make_latest: false
+          files: ${{ env.ASSET }}
+          fail_on_unmatched_files: true
+
+      - name: Attach MSI to nightly release
+        if: github.ref == 'refs/heads/main' && env.MSI != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          prerelease: true
+          make_latest: false
+          files: ${{ env.MSI }}
+          fail_on_unmatched_files: false
+
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -269,6 +297,8 @@ jobs:
 
   build-linux-aarch64-glibc228:
     name: linux-aarch64-glibc228
+    # Temporarily disabled. Set ENABLE_NON_WINDOWS_RELEASES=true to restore it.
+    if: ${{ vars.ENABLE_NON_WINDOWS_RELEASES == 'true' }}
     needs: check-version
     runs-on: ubuntu-22.04-arm
     container: debian:10
@@ -358,6 +388,8 @@ jobs:
 
   build-linux-x86_64-glibc228:
     name: linux-x86_64-glibc228
+    # Temporarily disabled. Set ENABLE_NON_WINDOWS_RELEASES=true to restore it.
+    if: ${{ vars.ENABLE_NON_WINDOWS_RELEASES == 'true' }}
     needs: check-version
     runs-on: ubuntu-22.04
     container: debian:10
