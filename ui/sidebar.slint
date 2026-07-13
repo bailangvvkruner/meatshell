@@ -321,12 +321,11 @@ component StatsBlock inherits VerticalLayout {
             }
         }
         if root.proc-available : Rectangle {
-            width: 20px; height: 20px;
+            width: 52px; height: 20px;
             border-radius: Theme.radius-sm;
             background: proc-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
             proc-ta := TouchArea { mouse-cursor: pointer; clicked => { root.show-processes(); } }
-            Text { text: "\u{E896}"; font-family: "Material Icons";
-                   color: Theme.text-secondary; font-size: 14px;
+            Text { text: @tr("Processes"); color: Theme.text-secondary; font-size: Theme.fs-xs;
                    horizontal-alignment: center; vertical-alignment: center; }
         }
     }
