@@ -360,14 +360,15 @@ impl std::fmt::Debug for MfaResponder {
     }
 }
 
-/// One process row sampled from the remote `ps` (#23). CPU/mem are percentages
-/// as reported by `ps` (pcpu/pmem); `command` is the (width-truncated) args.
+/// One process row sampled from the remote process collector (#23). CPU/mem are
+/// percentages when that collector reports them; minimal BusyBox `ps` builds
+/// leave them unavailable. `command` is the width-truncated command line.
 #[derive(Debug, Clone)]
 pub struct ProcInfo {
     pub pid: u32,
     pub user: String,
-    pub cpu: f32,
-    pub mem: f32,
+    pub cpu: Option<f32>,
+    pub mem: Option<f32>,
     pub command: String,
 }
 
@@ -901,8 +902,58 @@ pub(crate) const COMPAT_CIPHER: &[russh::cipher::Name] = &[
     russh::cipher::TRIPLE_DES_CBC, // legacy fallback
 ];
 
-const RESOURCE_MONITOR_COMMAND: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while IFS= read -r __ms_tick; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __MSTICK__; done\n";
+const RESOURCE_MONITOR_COMMAND: &[u8] = concat!(
+    "PATH=/usr/bin:/bin:/usr/sbin:/sbin; LC_ALL=C; export PATH LC_ALL; ",
+    "if ps -eo pid,user,pcpu,pmem,args --sort=-pcpu >/dev/null 2>&1; then __ms_ps=gnu; ",
+    "elif top -bn1 >/dev/null 2>&1; then __ms_ps=top; ",
+    "elif ps ww >/dev/null 2>&1; then __ms_ps=basic_wide; ",
+    "elif ps >/dev/null 2>&1; then __ms_ps=basic; else __ms_ps=none; fi; ",
+    "while IFS= read -r __ms_tick; do ",
+    "awk '/^cpu /{print}' /proc/stat; ",
+    "awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; ",
+    "cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ",
+    "case \"$__ms_ps\" in ",
+    "gnu) echo __PS_GNU__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200;; ",
+    "top) echo __PS_TOP__; top -bn1 2>/dev/null | head -n 48 | cut -c -200;; ",
+    "basic_wide) echo __PS_BASIC__; ps ww 2>/dev/null | head -n 41 | cut -c -200;; ",
+    "basic) echo __PS_BASIC__; ps 2>/dev/null | head -n 41 | cut -c -200;; ",
+    "*) echo __PS_NONE__;; esac; echo __MSTICK__; done\n",
+)
+.as_bytes();
 const RESOURCE_MONITOR_TRIGGER: &[u8] = b"\n";
+const RESOURCE_MONITOR_END_MARKER: &[u8] = b"__MSTICK__";
+
+/// Locate a monitor terminator only when it occupies a complete line. Process
+/// arguments are untrusted remote text and may legitimately contain the marker
+/// string, so a substring search can split a sample in the middle of a row.
+/// Returns `(block_end, next_sample_start)` as byte offsets.
+fn find_resource_monitor_sample_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut line_start = 0;
+    for (index, byte) in buffer.iter().enumerate() {
+        if *byte == b'\n' {
+            let line_end = if index > line_start && buffer[index - 1] == b'\r' {
+                index - 1
+            } else {
+                index
+            };
+            if &buffer[line_start..line_end] == RESOURCE_MONITOR_END_MARKER {
+                return Some((line_start, index + 1));
+            }
+            line_start = index + 1;
+        }
+    }
+    None
+}
+
+/// Remove and return one complete sample from a raw SSH byte buffer. Decoding
+/// happens after this boundary is found so a multibyte UTF-8 command split
+/// across ChannelMsg::Data packets is not replaced by two U+FFFD characters.
+fn take_resource_monitor_sample(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let (block_end, next_sample_start) = find_resource_monitor_sample_end(buffer)?;
+    let mut framed: Vec<u8> = buffer.drain(..next_sample_start).collect();
+    framed.truncate(block_end);
+    Some(framed)
+}
 
 fn normalize_remote_resource_refresh_secs(seconds: u32) -> u32 {
     seconds.clamp(1, 60)
@@ -1168,10 +1219,11 @@ async fn run_session(
     // tool because their locations differ across distributions. Monitoring is
     // best-effort, so even if this shell
     // is unusual and the reset finds nothing, only the sidebar stats are lost.
-    // The `ps` section feeds the process monitor (#23): top-40 by CPU, columns
-    // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
-    // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
-    // yields nothing (2>/dev/null), degrading to an empty process list.
+    // The process collector is selected once before the trigger loop: GNU ps is
+    // preferred, BusyBox top covers Alpine/OpenWrt with live CPU data, and a
+    // plain ps fallback still supplies pid/user/command on minimal builds. Each
+    // line is clipped to 200 chars so a giant command line can't bloat the
+    // stream. LC_ALL=C keeps headers and decimal separators parser-stable.
     let mut monitor_seconds =
         normalize_remote_resource_refresh_secs(*remote_resource_refresh.borrow_and_update());
     // Skip the resource monitor entirely when shell integration is off (a
@@ -1187,7 +1239,7 @@ async fn run_session(
     monitor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut monitor_sample_pending = false;
     let mut monitor_sample_deadline: Option<tokio::time::Instant> = None;
-    let mut mon_buf = String::new();
+    let mut mon_buf: Vec<u8> = Vec::new();
     let mut prev_cpu: Option<(u64, u64)> = None; // (total jiffies, idle jiffies)
     let mut prev_net: std::collections::HashMap<String, (u64, u64)> =
         std::collections::HashMap::new(); // iface -> (rx_bytes, tx_bytes)
@@ -1589,16 +1641,12 @@ async fn run_session(
             } => {
                 match mon {
                     Some(ChannelMsg::Data { data }) => {
-                        mon_buf.push_str(&String::from_utf8_lossy(&data));
+                        mon_buf.extend_from_slice(&data);
                         // Process every complete sample terminated by the marker.
-                        while let Some(idx) = mon_buf.find("__MSTICK__") {
-                            let block = mon_buf[..idx].to_string();
-                            let rest = mon_buf[idx + "__MSTICK__".len()..]
-                                .trim_start_matches(['\r', '\n'])
-                                .to_string();
-                            mon_buf = rest;
+                        while let Some(block_bytes) = take_resource_monitor_sample(&mut mon_buf) {
+                            let block = String::from_utf8_lossy(&block_bytes);
                             if let Some(stats) = parse_monitor_block(
-                                &block,
+                                block.as_ref(),
                                 &mut prev_cpu,
                                 &mut prev_net,
                                 &mut prev_net_at,
@@ -1713,6 +1761,83 @@ async fn run_session(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ProcessSampleFormat {
+    GnuPs,
+    Top,
+    BasicPs,
+    None,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessColumns {
+    pid: usize,
+    user: usize,
+    cpu: Option<usize>,
+    mem: Option<usize>,
+    command: usize,
+}
+
+/// Read process-table columns from the emitted header instead of assuming a
+/// fixed BusyBox layout. Alpine enables the per-process `CPU` column while the
+/// default OpenWrt build does not, shifting `%CPU` and `COMMAND` by one field.
+fn parse_process_columns(line: &str, format: ProcessSampleFormat) -> Option<ProcessColumns> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let find = |names: &[&str]| fields.iter().position(|field| names.contains(field));
+    let pid = find(&["PID"])?;
+    let user = find(&["USER", "UID"])?;
+    let command = find(&["COMMAND", "CMD"])?;
+    let (cpu, mem) = match format {
+        ProcessSampleFormat::Top => (find(&["%CPU", "CPU%"]), find(&["%VSZ", "%MEM", "MEM%"])),
+        ProcessSampleFormat::BasicPs => (None, None),
+        ProcessSampleFormat::GnuPs | ProcessSampleFormat::None => return None,
+    };
+    Some(ProcessColumns {
+        pid,
+        user,
+        cpu,
+        mem,
+        command,
+    })
+}
+
+fn parse_process_percent(value: &str) -> Option<f32> {
+    value
+        .trim_end_matches('%')
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(|value| value.max(0.0))
+}
+
+/// Normalize a header-driven `top`/basic-BusyBox-`ps` row to the same
+/// pid/user/cpu/mem/command representation used by GNU ps. Minimal BusyBox ps
+/// keeps CPU and memory unavailable while still producing a useful process row.
+fn parse_columnar_process_line(line: &str, columns: ProcessColumns) -> Option<ProcInfo> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let pid: u32 = fields.get(columns.pid)?.parse().ok()?;
+    let user = fields.get(columns.user)?.to_string();
+    let cpu = columns
+        .cpu
+        .and_then(|index| fields.get(index))
+        .and_then(|value| parse_process_percent(value));
+    let mem = columns
+        .mem
+        .and_then(|index| fields.get(index))
+        .and_then(|value| parse_process_percent(value));
+    let command = fields.get(columns.command..)?.join(" ");
+    if command.is_empty() {
+        return None;
+    }
+    Some(ProcInfo {
+        pid,
+        user,
+        cpu,
+        mem,
+        command,
+    })
+}
+
 /// Parse one monitor sample (a block of `/proc/stat` cpu line + `/proc/meminfo`
 /// fields) into a [`SessionEvent::ResourceStats`].
 ///
@@ -1744,6 +1869,8 @@ fn parse_monitor_block(
     let mut seen_fs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     // Processes from `ps` (#23): top-by-CPU rows.
     let mut procs: Vec<ProcInfo> = Vec::new();
+    let mut process_format = ProcessSampleFormat::GnuPs;
+    let mut process_columns: Option<ProcessColumns> = None;
     // The sample is split into sections by `echo` markers; everything before the
     // first marker is the cpu/mem/net block.
     enum Section {
@@ -1757,6 +1884,7 @@ fn parse_monitor_block(
     // so a hostile server can't flood the parser and sidebar with fabricated rows
     // (#27). No real machine has anywhere near this many.
     const MAX_MON_ENTRIES: usize = 64;
+    const MAX_MON_PROCESSES: usize = 40;
 
     for line in block.lines() {
         if line == "__DF__" {
@@ -1782,9 +1910,51 @@ fn parse_monitor_block(
                 continue;
             }
             Section::Ps => {
-                if procs.len() < MAX_MON_ENTRIES {
-                    if let Some(p) = parse_ps_line(line) {
-                        procs.push(p);
+                match line {
+                    "__PS_GNU__" => {
+                        process_format = ProcessSampleFormat::GnuPs;
+                        process_columns = None;
+                        continue;
+                    }
+                    "__PS_TOP__" => {
+                        process_format = ProcessSampleFormat::Top;
+                        process_columns = None;
+                        continue;
+                    }
+                    "__PS_BASIC__" => {
+                        process_format = ProcessSampleFormat::BasicPs;
+                        process_columns = None;
+                        continue;
+                    }
+                    "__PS_NONE__" => {
+                        process_format = ProcessSampleFormat::None;
+                        process_columns = None;
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                if process_columns.is_none()
+                    && matches!(
+                        process_format,
+                        ProcessSampleFormat::Top | ProcessSampleFormat::BasicPs
+                    )
+                {
+                    if let Some(columns) = parse_process_columns(line, process_format) {
+                        process_columns = Some(columns);
+                        continue;
+                    }
+                }
+
+                if procs.len() < MAX_MON_PROCESSES {
+                    let process = match process_format {
+                        ProcessSampleFormat::GnuPs => parse_ps_line(line),
+                        ProcessSampleFormat::Top | ProcessSampleFormat::BasicPs => process_columns
+                            .and_then(|columns| parse_columnar_process_line(line, columns)),
+                        ProcessSampleFormat::None => None,
+                    };
+                    if let Some(process) = process {
+                        procs.push(process);
                     }
                 }
                 continue;
@@ -1884,8 +2054,8 @@ fn parse_ps_line(line: &str) -> Option<ProcInfo> {
     let mut it = line.split_whitespace();
     let pid: u32 = it.next()?.parse().ok()?;
     let user = it.next()?.to_string();
-    let cpu: f32 = it.next()?.parse().ok()?;
-    let mem: f32 = it.next()?.parse().ok()?;
+    let cpu = parse_process_percent(it.next()?)?;
+    let mem = parse_process_percent(it.next()?)?;
     let command = it.collect::<Vec<_>>().join(" ");
     if command.is_empty() {
         return None;
@@ -1893,8 +2063,8 @@ fn parse_ps_line(line: &str) -> Option<ProcInfo> {
     Some(ProcInfo {
         pid,
         user,
-        cpu,
-        mem,
+        cpu: Some(cpu),
+        mem: Some(mem),
         command,
     })
 }
@@ -2240,9 +2410,11 @@ mod osc_command_tests {
 #[cfg(test)]
 mod monitor_hardening_tests {
     use super::{
-        mark_resource_monitor_sample_complete, normalize_remote_resource_refresh_secs,
-        parse_df_line, parse_monitor_block, resource_monitor_retry_delay,
-        resource_monitor_sample_timeout, schedule_resource_monitor_retry, RESOURCE_MONITOR_COMMAND,
+        find_resource_monitor_sample_end, mark_resource_monitor_sample_complete,
+        normalize_remote_resource_refresh_secs, parse_df_line, parse_monitor_block,
+        resource_monitor_retry_delay, resource_monitor_sample_timeout,
+        schedule_resource_monitor_retry, take_resource_monitor_sample, ProcInfo, SessionEvent,
+        RESOURCE_MONITOR_COMMAND,
     };
     use std::collections::HashMap;
     use std::time::Instant;
@@ -2257,8 +2429,153 @@ mod monitor_hardening_tests {
     #[test]
     fn monitor_command_waits_for_client_sampling_triggers() {
         let command = std::str::from_utf8(RESOURCE_MONITOR_COMMAND).unwrap();
-        assert!(command.contains("while IFS= read -r __ms_tick"));
+        let loop_start = command.find("while IFS= read -r __ms_tick").unwrap();
+        assert!(command.find("LC_ALL=C").unwrap() < loop_start);
+        assert!(command.find("ps -eo pid,user,pcpu,pmem,args").unwrap() < loop_start);
+        assert!(command.find("top -bn1").unwrap() < loop_start);
+        assert!(command.find("ps ww").unwrap() < loop_start);
+        assert!(command.contains("__PS_GNU__"));
+        assert!(command.contains("__PS_TOP__"));
+        assert!(command.contains("__PS_BASIC__"));
         assert!(!command.contains("sleep "));
+    }
+
+    fn parsed_processes(process_section: &str) -> Vec<ProcInfo> {
+        let block = format!(
+            "MemTotal: 102400 kB\nMemAvailable: 51200 kB\n__DF__\n__PS__\n{process_section}"
+        );
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        match parse_monitor_block(&block, &mut prev, &mut prev_net, &mut at) {
+            Some(SessionEvent::ResourceStats { procs, .. }) => procs,
+            other => panic!("unexpected monitor result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_gnu_ps_fixture_with_spaced_command() {
+        let procs = parsed_processes(
+            "__PS_GNU__\n  PID USER     %CPU %MEM COMMAND\n  421 root     12.5  3.2 /usr/bin/python worker.py --queue high priority\n",
+        );
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].pid, 421);
+        assert_eq!(procs[0].user, "root");
+        assert_eq!(procs[0].cpu, Some(12.5));
+        assert_eq!(procs[0].mem, Some(3.2));
+        assert_eq!(
+            procs[0].command,
+            "/usr/bin/python worker.py --queue high priority"
+        );
+    }
+
+    #[test]
+    fn parses_alpine_busybox_top_fixture_with_cpu_column_and_percent_signs() {
+        let procs = parsed_processes(
+            "__PS_TOP__\nMem: 120000K used, 8000K free\nCPU: 10% usr 5% sys\n  PID  PPID USER     STAT   VSZ %VSZ CPU %CPU COMMAND\n   73     1 app      S     120m 4.2%   1 27.5% /usr/bin/python worker.py --name alpine job\n",
+        );
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].pid, 73);
+        assert_eq!(procs[0].user, "app");
+        assert_eq!(procs[0].cpu, Some(27.5));
+        assert_eq!(procs[0].mem, Some(4.2));
+        assert_eq!(
+            procs[0].command,
+            "/usr/bin/python worker.py --name alpine job"
+        );
+    }
+
+    #[test]
+    fn parses_openwrt_busybox_top_fixture_without_cpu_column() {
+        let procs = parsed_processes(
+            "__PS_TOP__\nMem: 48000K used, 16000K free\n  PID  PPID USER     STAT   VSZ %VSZ %CPU COMMAND\n  321     1 network  S     8120  7%  13% /usr/sbin/uhttpd -f -h /www local files\n",
+        );
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].pid, 321);
+        assert_eq!(procs[0].user, "network");
+        assert_eq!(procs[0].cpu, Some(13.0));
+        assert_eq!(procs[0].mem, Some(7.0));
+        assert_eq!(procs[0].command, "/usr/sbin/uhttpd -f -h /www local files");
+    }
+
+    #[test]
+    fn parses_basic_busybox_ps_fixture_with_missing_metrics_unavailable() {
+        let procs = parsed_processes(
+            "__PS_BASIC__\n  PID USER       VSZ STAT COMMAND\n    1 root      1548 S    /sbin/procd --foreground mode\n",
+        );
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].pid, 1);
+        assert_eq!(procs[0].user, "root");
+        assert_eq!(procs[0].cpu, None);
+        assert_eq!(procs[0].mem, None);
+        assert_eq!(procs[0].command, "/sbin/procd --foreground mode");
+    }
+
+    #[test]
+    fn monitor_marker_must_be_a_complete_standalone_line() {
+        let embedded = "__PS_GNU__\n9 root 0 0 echo __MSTICK__ inside command\n";
+        assert!(find_resource_monitor_sample_end(embedded.as_bytes()).is_none());
+
+        let split_marker = format!("{embedded}__MSTICK__");
+        assert!(find_resource_monitor_sample_end(split_marker.as_bytes()).is_none());
+
+        let complete = format!("{split_marker}\r\nnext sample");
+        let (block_end, next_start) =
+            find_resource_monitor_sample_end(complete.as_bytes()).expect("standalone marker");
+        assert_eq!(&complete.as_bytes()[..block_end], embedded.as_bytes());
+        assert_eq!(&complete.as_bytes()[next_start..], b"next sample");
+    }
+
+    #[test]
+    fn process_command_that_looks_like_a_header_does_not_replace_columns() {
+        let procs = parsed_processes(
+            "__PS_TOP__\n  PID PPID USER STAT VSZ %VSZ %CPU COMMAND\n  11 1 root S 1000 1% 2% /bin/echo PID USER COMMAND\n  12 1 root S 1000 1% 3% /usr/bin/next process\n",
+        );
+        assert_eq!(procs.len(), 2);
+        assert_eq!(procs[0].pid, 11);
+        assert_eq!(procs[0].command, "/bin/echo PID USER COMMAND");
+        assert_eq!(procs[1].pid, 12);
+        assert_eq!(procs[1].cpu, Some(3.0));
+    }
+
+    #[test]
+    fn monitor_sample_preserves_utf8_split_at_every_byte() {
+        let expected = "MemTotal: 1024 kB\n__PS__\n__PS_GNU__\n9 root 1 2 中文命令 --参数 值\n";
+        let wire = format!("{expected}__MSTICK__\n").into_bytes();
+        let mut buffer = Vec::new();
+        let mut framed = None;
+        for byte in wire {
+            buffer.push(byte);
+            if let Some(sample) = take_resource_monitor_sample(&mut buffer) {
+                assert!(framed.is_none(), "one wire sample framed more than once");
+                framed = Some(sample);
+            }
+        }
+        let framed = framed.expect("sample completed after marker newline");
+        assert_eq!(String::from_utf8(framed).unwrap(), expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn monitor_framer_extracts_two_samples_from_one_packet() {
+        let first = b"MemTotal: 1 kB\n__PS__\nfirst\n";
+        let second = b"MemTotal: 2 kB\n__PS__\nsecond\n";
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(first);
+        buffer.extend_from_slice(b"__MSTICK__\n");
+        buffer.extend_from_slice(second);
+        buffer.extend_from_slice(b"__MSTICK__\r\n");
+
+        assert_eq!(
+            take_resource_monitor_sample(&mut buffer).as_deref(),
+            Some(&first[..])
+        );
+        assert_eq!(
+            take_resource_monitor_sample(&mut buffer).as_deref(),
+            Some(&second[..])
+        );
+        assert!(take_resource_monitor_sample(&mut buffer).is_none());
+        assert!(buffer.is_empty());
     }
 
     #[test]

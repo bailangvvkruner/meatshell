@@ -666,64 +666,9 @@ pub fn run() -> Result<()> {
     #[cfg(target_os = "macos")]
     window.set_custom_titlebar(false);
 
-    // --- Detachable process monitor window (#23) -----------------------------
-    // The process table is its own top-level OS window so it can be dragged
-    // outside the main window (or onto a second monitor). Both windows render
-    // the *same* VecModel, so the table stays live wherever it's parked; closing
-    // it just hides it, so reopening is instant.
+    // Keep one concrete model so the in-app process table can update in place.
     let proc_rows_model: Rc<VecModel<ProcRow>> = Rc::new(VecModel::default());
     window.set_proc_list(ModelRc::from(proc_rows_model.clone()));
-    let proc_win = ProcWindow::new().context("failed to build process window")?;
-    proc_win.set_custom_titlebar(cfg!(not(target_os = "macos")));
-    proc_win.set_proc_list(ModelRc::from(proc_rows_model.clone()));
-    {
-        // ✕ hides the window (data keeps flowing into the shared model).
-        let weak = proc_win.as_weak();
-        proc_win.on_close(move || {
-            if let Some(w) = weak.upgrade() {
-                let _ = w.hide();
-            }
-        });
-    }
-    {
-        // Frameless titlebar drag, via winit on the process window's own handle.
-        let weak = proc_win.as_weak();
-        proc_win.on_win_drag(move || {
-            if let Some(w) = weak.upgrade() {
-                w.window().with_winit_window(|ww| {
-                    let _ = ww.drag_window();
-                });
-                schedule_slint_pointer_ungrab(weak.clone());
-            }
-        });
-    }
-    {
-        // Bottom-right resize grip.
-        use i_slint_backend_winit::winit::window::ResizeDirection;
-        let weak = proc_win.as_weak();
-        proc_win.on_win_resize_se(move || {
-            if let Some(w) = weak.upgrade() {
-                w.window().with_winit_window(|ww| {
-                    let _ = ww.drag_resize_window(ResizeDirection::SouthEast);
-                });
-                schedule_slint_pointer_ungrab(weak.clone());
-            }
-        });
-    }
-    {
-        // The sidebar "Processes" button shows / focuses the window.
-        let win_weak = window.as_weak();
-        let proc_weak = proc_win.as_weak();
-        window.on_open_processes(move || {
-            let (Some(main), Some(pw)) = (win_weak.upgrade(), proc_weak.upgrade()) else {
-                return;
-            };
-            pw.set_host(main.get_connection_state());
-            sync_proc_theme(&main, &pw);
-            let _ = pw.show();
-            pw.window().with_winit_window(|ww| ww.focus_window());
-        });
-    }
 
     // Apply the saved UI language.  The Rust-side flag drives `i18n::t(...)`;
     // `apply_to_slint` selects the bundled `.po` for the static `@tr(...)` text
@@ -1116,15 +1061,10 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let store = store.clone();
         let bufs_wp = bufs.clone();
-        let proc_weak = proc_win.as_weak();
         window.on_set_wallpaper(move |id: SharedString| {
             let id = id.to_string();
             if let Some(w) = weak.upgrade() {
                 apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id);
-                // Keep an already-open process window in sync with the change.
-                if let Some(p) = proc_weak.upgrade() {
-                    sync_proc_theme(&w, &p);
-                }
             }
             let mut s = store.borrow_mut();
             s.set_wallpaper(id);
@@ -1135,7 +1075,6 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let store = store.clone();
         let bufs_wp = bufs.clone();
-        let proc_weak = proc_win.as_weak();
         window.on_pick_wallpaper_file(move || {
             let picked = rfd::FileDialog::new()
                 .set_title("选择壁纸 / Choose wallpaper")
@@ -1145,9 +1084,6 @@ pub fn run() -> Result<()> {
                 let id = path.to_string_lossy().to_string();
                 if let Some(w) = weak.upgrade() {
                     apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id);
-                    if let Some(p) = proc_weak.upgrade() {
-                        sync_proc_theme(&w, &p);
-                    }
                 }
                 let mut s = store.borrow_mut();
                 s.set_wallpaper(id);
@@ -1441,17 +1377,11 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let store = store.clone();
         let bufs_theme = bufs.clone();
-        let proc_weak = proc_win.as_weak();
         window.on_toggle_theme(move || {
             let Some(w) = weak.upgrade() else { return };
             let next_dark = !w.get_dark_mode();
             // Flip theme + every terminal buffer + re-render (shared with wallpaper).
             apply_dark_mode(&w, &bufs_theme, next_dark);
-            // Mirror the flip onto the detached process window (its Theme global
-            // is a separate instance) so an open process window follows.
-            if let Some(p) = proc_weak.upgrade() {
-                sync_proc_theme(&w, &p);
-            }
             let pref = if next_dark { "dark" } else { "light" };
             let mut s = store.borrow_mut();
             s.set_theme_pref(pref.to_string());
@@ -4134,35 +4064,51 @@ fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
-/// Build the process-monitor model for the popup (#23). `cpu`/`mem` are
-/// pre-formatted to one decimal; `cpu_frac` (0..1) drives the row's load bar.
+/// Build the process-monitor model for the popup (#23). Available `cpu`/`mem`
+/// values are formatted to one decimal; minimal BusyBox ps rows show `-`.
 fn proc_rows(procs: &[ProcInfo]) -> Vec<ProcRow> {
     procs
         .iter()
         .map(|p| ProcRow {
             pid: p.pid.to_string().into(),
             user: p.user.clone().into(),
-            cpu: format!("{:.1}", p.cpu).into(),
-            mem: format!("{:.1}", p.mem).into(),
+            cpu: p
+                .cpu
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "-".to_string())
+                .into(),
+            mem: p
+                .mem
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "-".to_string())
+                .into(),
             command: p.command.clone().into(),
-            cpu_frac: (p.cpu / 100.0).clamp(0.0, 1.0),
+            cpu_frac: p
+                .cpu
+                .map(|value| (value / 100.0).clamp(0.0, 1.0))
+                .unwrap_or(0.0),
         })
         .collect()
 }
 
-/// Mirror the main window's theme/scale/UI-font onto the detached process
-/// window. Theme is a per-window Slint global, so a detached window keeps its
-/// compile-time (dark) defaults until we copy these across (#23).
-fn sync_proc_theme(main: &AppWindow, proc: &ProcWindow) {
-    proc.set_dark_mode(main.get_dark_mode());
-    proc.set_ui_scale(main.get_ui_scale());
-    proc.set_ui_font_family(main.get_ui_font_family());
-    // Mirror the immersive wallpaper so the detached window shares the frosted
-    // backdrop instead of a flat panel.
-    proc.set_wallpaper_img(main.get_wallpaper_img());
-    proc.set_wallpaper_active(main.get_wallpaper_active());
-    proc.set_wp_accent(main.get_wp_accent());
-    proc.set_wp_tint(main.get_wp_tint());
+#[cfg(test)]
+mod process_row_tests {
+    use super::{proc_rows, ProcInfo};
+
+    #[test]
+    fn unavailable_process_metrics_render_as_dashes_without_a_load_bar() {
+        let rows = proc_rows(&[ProcInfo {
+            pid: 1,
+            user: "root".into(),
+            cpu: None,
+            mem: None,
+            command: "/sbin/procd".into(),
+        }]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cpu.as_str(), "-");
+        assert_eq!(rows[0].mem.as_str(), "-");
+        assert_eq!(rows[0].cpu_frac, 0.0);
+    }
 }
 
 /// Persist the current panel docking layout (both panels' edge + size) and the
@@ -4764,11 +4710,9 @@ fn refresh_sidebar(
         win.set_swap_detail("".into());
     };
 
-    // Process monitor (#23) lives in a shared model (the AppWindow and the
-    // detachable ProcWindow point at the same VecModel), so mutate it in place
-    // instead of replacing it — replacing would break the sharing. Only a live
-    // remote session has process data; default to empty and let the connected
-    // branch below fill it in.
+    // Mutate the process model in place so an open popup updates immediately.
+    // Only a live remote session has process data; default to empty and let the
+    // connected branch below fill it in.
     let set_procs = |win: &AppWindow, procs: &[ProcInfo]| {
         if let Some(vm) = win
             .get_proc_list()
