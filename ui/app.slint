@@ -428,6 +428,10 @@ export component AppWindow inherits Window {
     // Collapse-by-default settings + shared SFTP collapse state (#78).
     in-out property <bool> collapse-sidebar-default: false;
     callback set-collapse-sidebar-default(bool);   // apply + persist
+    in-out property <int> local-resource-refresh-secs: 1;
+    in-out property <int> remote-resource-refresh-secs: 2;
+    callback set-local-resource-refresh-secs(int);
+    callback set-remote-resource-refresh-secs(int);
     // Render the welcome/session list as a left sidebar instead of a tab (v0.5).
     in-out property <bool> welcome-as-sidebar: false;
     callback set-welcome-as-sidebar(bool);         // apply + persist
@@ -3563,6 +3567,8 @@ export component AppWindow inherits Window {
                     sftp-follow-cd <=> root.sftp-follow-cd;
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
                     collapse-sftp-default <=> root.collapse-sftp-default;
+                    local-resource-refresh-secs <=> root.local-resource-refresh-secs;
+                    remote-resource-refresh-secs <=> root.remote-resource-refresh-secs;
                     sync-upload-enabled <=> root.sync-upload-enabled;
                     webdav-enabled <=> root.webdav-enabled;
                     webdav-url <=> root.webdav-url;
@@ -3589,6 +3595,8 @@ export component AppWindow inherits Window {
                     set-sftp-follow-cd(v) => { root.set-sftp-follow-cd(v); }
                     set-collapse-sidebar-default(v) => { root.set-collapse-sidebar-default(v); }
                     set-collapse-sftp-default(v) => { root.set-collapse-sftp-default(v); }
+                    set-local-resource-refresh-secs(v) => { root.set-local-resource-refresh-secs(v); }
+                    set-remote-resource-refresh-secs(v) => { root.set-remote-resource-refresh-secs(v); }
                     set-sync-upload-enabled(v) => { root.set-sync-upload-enabled(v); }
                     save-webdav-settings(enabled, url, username, password, remote-path, accept-invalid-certs) => {
                         root.save-webdav-settings(enabled, url, username, password, remote-path, accept-invalid-certs);

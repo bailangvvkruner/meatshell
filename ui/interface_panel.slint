@@ -184,6 +184,8 @@ export component InterfacePanel inherits Rectangle {
     in-out property <bool> sftp-follow-cd;
     in-out property <bool> collapse-sidebar-default;
     in-out property <bool> collapse-sftp-default;
+    in-out property <int> local-resource-refresh-secs: 1;
+    in-out property <int> remote-resource-refresh-secs: 2;
     in-out property <bool> sync-upload-enabled;
     in-out property <bool> webdav-enabled;
     in-out property <string> webdav-url;
@@ -216,6 +218,8 @@ export component InterfacePanel inherits Rectangle {
     callback set-sftp-follow-cd(bool);
     callback set-collapse-sidebar-default(bool);
     callback set-collapse-sftp-default(bool);
+    callback set-local-resource-refresh-secs(int);
+    callback set-remote-resource-refresh-secs(int);
     callback set-sync-upload-enabled(bool);
     callback save-webdav-settings(bool, string, string, string, string, bool);
     callback webdav-upload();
@@ -650,10 +654,38 @@ export component InterfacePanel inherits Rectangle {
                     desc: root.lang-en
                         ? "Takes effect on next launch; handy on low-spec jump hosts."
                         : "下次启动生效;低配跳板机上可减少常驻面板开销。";
-                    show-divider: false;
                     Switch {
                         on: root.collapse-sftp-default;
                         toggled(v) => { root.collapse-sftp-default = v; root.set-collapse-sftp-default(v); }
+                    }
+                }
+                Rectangle { height: 14px; }
+                SectionHeader { text: root.lang-en ? "RESOURCE REFRESH" : "资源刷新"; height: 24px; }
+                SettingRow {
+                    label: root.lang-en ? "Local resources" : "本机资源";
+                    desc: root.lang-en ? "Applies immediately while the window is active."
+                                       : "窗口在前台时立即按新间隔刷新。";
+                    Stepper {
+                        value: root.local-resource-refresh-secs;
+                        minimum: 1; maximum: 30; step: 1; unit: "s";
+                        changed(v) => {
+                            root.local-resource-refresh-secs = v;
+                            root.set-local-resource-refresh-secs(v);
+                        }
+                    }
+                }
+                SettingRow {
+                    label: root.lang-en ? "Remote resources" : "远程资源";
+                    desc: root.lang-en ? "Applies to connected SSH sessions without reconnecting."
+                                       : "已连接的 SSH 会话无需重连即可生效。";
+                    show-divider: false;
+                    Stepper {
+                        value: root.remote-resource-refresh-secs;
+                        minimum: 1; maximum: 60; step: 1; unit: "s";
+                        changed(v) => {
+                            root.remote-resource-refresh-secs = v;
+                            root.set-remote-resource-refresh-secs(v);
+                        }
                     }
                 }
             }

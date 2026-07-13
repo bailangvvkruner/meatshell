@@ -641,6 +641,12 @@ pub struct ConfigFile {
     /// Collapse the left resource sidebar on startup (#78).
     #[serde(default)]
     pub collapse_sidebar_default: bool,
+    /// Local resource sampling interval in seconds. 0 = default (1 second).
+    #[serde(default)]
+    pub local_resource_refresh_secs: u32,
+    /// Remote SSH resource sampling interval in seconds. 0 = default (2 seconds).
+    #[serde(default)]
+    pub remote_resource_refresh_secs: u32,
     /// Last resource-sidebar collapsed state. None means fall back to
     /// `collapse_sidebar_default` for older configs.
     #[serde(default)]
@@ -1032,6 +1038,28 @@ impl ConfigStore {
 
     pub fn set_ui_scale(&mut self, percent: u32) {
         self.cache.ui_scale = percent.clamp(80, 200);
+    }
+
+    pub fn local_resource_refresh_secs(&self) -> u32 {
+        match self.cache.local_resource_refresh_secs {
+            0 => 1,
+            seconds => seconds.clamp(1, 30),
+        }
+    }
+
+    pub fn set_local_resource_refresh_secs(&mut self, seconds: u32) {
+        self.cache.local_resource_refresh_secs = seconds.clamp(1, 30);
+    }
+
+    pub fn remote_resource_refresh_secs(&self) -> u32 {
+        match self.cache.remote_resource_refresh_secs {
+            0 => 2,
+            seconds => seconds.clamp(1, 60),
+        }
+    }
+
+    pub fn set_remote_resource_refresh_secs(&mut self, seconds: u32) {
+        self.cache.remote_resource_refresh_secs = seconds.clamp(1, 60);
     }
 
     /// Immersive wallpaper id ("" = none).
@@ -1721,6 +1749,27 @@ mod tests {
         .unwrap();
         assert_eq!(store.import_json(&raw).unwrap(), (0, 1));
         assert_eq!(store.sessions().len(), 1);
+    }
+
+    #[test]
+    fn resource_refresh_intervals_default_and_clamp() {
+        let mut store = temp_store();
+        assert_eq!(store.local_resource_refresh_secs(), 1);
+        assert_eq!(store.remote_resource_refresh_secs(), 2);
+
+        store.set_local_resource_refresh_secs(0);
+        store.set_remote_resource_refresh_secs(0);
+        assert_eq!(store.local_resource_refresh_secs(), 1);
+        assert_eq!(store.remote_resource_refresh_secs(), 1);
+
+        store.set_local_resource_refresh_secs(100);
+        store.set_remote_resource_refresh_secs(100);
+        assert_eq!(store.local_resource_refresh_secs(), 30);
+        assert_eq!(store.remote_resource_refresh_secs(), 60);
+
+        let legacy: ConfigFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.local_resource_refresh_secs, 0);
+        assert_eq!(legacy.remote_resource_refresh_secs, 0);
     }
 
     fn temp_store() -> ConfigStore {

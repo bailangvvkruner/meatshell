@@ -15,6 +15,7 @@ use russh::keys::{decode_secret_key, load_secret_key, PrivateKey};
 use russh::{Channel, ChannelId, ChannelMsg, Disconnect};
 use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::{ssh_username_or_root, AuthMethod, PortForward, Session};
@@ -537,6 +538,7 @@ pub fn spawn_session(
     jump: Option<Session>,
     initial_cols: u32,
     initial_rows: u32,
+    remote_resource_refresh: watch::Receiver<u32>,
 ) -> (SessionHandle, UnboundedReceiver<SessionEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<SessionEvent>();
@@ -550,6 +552,7 @@ pub fn spawn_session(
             evt_tx_for_task.clone(),
             initial_cols,
             initial_rows,
+            remote_resource_refresh,
         )
         .await
         {
@@ -898,6 +901,89 @@ pub(crate) const COMPAT_CIPHER: &[russh::cipher::Name] = &[
     russh::cipher::TRIPLE_DES_CBC, // legacy fallback
 ];
 
+const RESOURCE_MONITOR_COMMAND: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while IFS= read -r __ms_tick; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __MSTICK__; done\n";
+const RESOURCE_MONITOR_TRIGGER: &[u8] = b"\n";
+
+fn normalize_remote_resource_refresh_secs(seconds: u32) -> u32 {
+    seconds.clamp(1, 60)
+}
+
+fn resource_monitor_retry_delay(attempt: u32) -> std::time::Duration {
+    const DELAYS: [u64; 5] = [1, 2, 5, 10, 30];
+    std::time::Duration::from_secs(DELAYS[(attempt as usize).min(DELAYS.len() - 1)])
+}
+
+fn resource_monitor_sample_timeout(seconds: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((u64::from(seconds) * 2).max(10))
+}
+
+fn schedule_resource_monitor_retry(retry_at: &mut Option<tokio::time::Instant>, attempt: &mut u32) {
+    *retry_at = Some(tokio::time::Instant::now() + resource_monitor_retry_delay(*attempt));
+    *attempt = attempt.saturating_add(1);
+}
+
+fn mark_resource_monitor_sample_complete(
+    pending: &mut bool,
+    deadline: &mut Option<tokio::time::Instant>,
+    retry_attempt: &mut u32,
+) {
+    *pending = false;
+    *deadline = None;
+    *retry_attempt = 0;
+}
+
+async fn open_resource_monitor(handle: &Handle<ClientHandler>) -> Option<Channel<Msg>> {
+    let mut channel = match handle.channel_open_session().await {
+        Ok(channel) => channel,
+        Err(error) => {
+            tracing::warn!("monitor channel open failed: {error}");
+            return None;
+        }
+    };
+    if let Err(error) = channel.exec(true, RESOURCE_MONITOR_COMMAND).await {
+        tracing::warn!("monitor exec request failed: {error}");
+        let _ = channel.close().await;
+        return None;
+    }
+
+    let confirmation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(()),
+                Some(ChannelMsg::Failure) => return Err("server rejected the exec request"),
+                Some(ChannelMsg::Eof)
+                | Some(ChannelMsg::Close)
+                | Some(ChannelMsg::ExitStatus { .. })
+                | Some(ChannelMsg::ExitSignal { .. })
+                | None => return Err("channel closed before exec confirmation"),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    match confirmation {
+        Ok(Ok(())) => Some(channel),
+        Ok(Err(reason)) => {
+            tracing::warn!("monitor exec failed: {reason}");
+            let _ = channel.close().await;
+            None
+        }
+        Err(_) => {
+            tracing::warn!("monitor exec confirmation timed out");
+            let _ = channel.close().await;
+            None
+        }
+    }
+}
+
+async fn close_resource_monitor(channel: &mut Option<Channel<Msg>>) {
+    if let Some(channel) = channel.take() {
+        if let Err(error) = channel.close().await {
+            tracing::warn!("monitor channel close failed: {error}");
+        }
+    }
+}
+
 async fn run_session(
     session: Session,
     jump: Option<Session>,
@@ -905,6 +991,7 @@ async fn run_session(
     events: UnboundedSender<SessionEvent>,
     initial_cols: u32,
     initial_rows: u32,
+    mut remote_resource_refresh: watch::Receiver<u32>,
 ) -> Result<()> {
     let _ = events.send(SessionEvent::Status(format!(
         "{} {}@{}:{} ...",
@@ -916,7 +1003,7 @@ async fn run_session(
 
     let config = Arc::new(client::Config {
         // Keep idle connections alive (#160). The terminal usually has the
-        // resource-monitor channel streaming every 2 s, but with shell
+        // resource-monitor channel streaming regularly, but with shell
         // integration disabled (#140) it can go idle and be dropped by
         // NAT / firewall / server timeouts. A 30 s keepalive prevents that;
         // keepalive_max (default 3) closes a genuinely dead connection.
@@ -1068,42 +1155,38 @@ async fn run_session(
     const PROMPT_PREFIX: &str = "test -z \"$FISH_VERSION\"";
 
     // --- Remote resource monitor (separate exec channel) ----------------
-    // A tiny remote loop streams /proc/stat + /proc/meminfo every 2s; we parse
-    // it into CPU% / mem / swap for the sidebar.  Best-effort: if the channel
-    // or exec fails (e.g. a non-Linux host without /proc), monitoring is
-    // silently skipped and the interactive shell is unaffected.
+    // A tiny remote loop waits for client-side sampling triggers, then streams
+    // /proc/stat + /proc/meminfo. Keeping the interval timer client-side lets
+    // connected sessions apply a new setting immediately without replacing
+    // their monitor exec channel. Best-effort: if the channel or exec fails
+    // (e.g. a non-Linux host without /proc), monitoring is silently skipped and
+    // the interactive shell is unaffected.
     // Reset PATH to the standard system directories first (#27): the monitor
-    // runs over an exec channel, so a server with a hijacked PATH (or a
-    // BASH_ENV pointing at a malicious file) could otherwise shadow awk/cat/df/
-    // sleep with arbitrary binaries. A fixed PATH covering /usr/bin and /bin is
-    // more portable than hardcoding one absolute path per tool (their location
-    // differs across distros). Monitoring is best-effort, so even if this shell
+    // runs over an exec channel, so a server with a hijacked PATH could otherwise
+    // shadow awk/cat/df/ps with arbitrary binaries. A fixed PATH covering
+    // /usr/bin and /bin is more portable than hardcoding one absolute path per
+    // tool because their locations differ across distributions. Monitoring is
+    // best-effort, so even if this shell
     // is unusual and the reset finds nothing, only the sidebar stats are lost.
     // The `ps` section feeds the process monitor (#23): top-40 by CPU, columns
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __MSTICK__; sleep 2; done\n";
+    let mut monitor_seconds =
+        normalize_remote_resource_refresh_secs(*remote_resource_refresh.borrow_and_update());
     // Skip the resource monitor entirely when shell integration is off (a
     // non-POSIX / Windows server) — the /proc-based loop only spews errors there
     // (#140).
-    let mut mon_channel = if session.disable_shell_integration {
-        None
-    } else {
-        match handle.channel_open_session().await {
-            Ok(ch) => match ch.exec(true, MON_CMD).await {
-                Ok(()) => Some(ch),
-                Err(e) => {
-                    tracing::warn!("monitor exec failed: {e}");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("monitor channel open failed: {e}");
-                None
-            }
-        }
-    };
+    let mut mon_channel: Option<Channel<Msg>> = None;
+    let mut monitor_settings_open = true;
+    let mut monitor_opening: Option<JoinHandle<Option<Channel<Msg>>>> = None;
+    let mut monitor_retry_at: Option<tokio::time::Instant> = None;
+    let mut monitor_retry_attempt = 0u32;
+    let mut monitor_tick =
+        tokio::time::interval(std::time::Duration::from_secs(monitor_seconds as u64));
+    monitor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut monitor_sample_pending = false;
+    let mut monitor_sample_deadline: Option<tokio::time::Instant> = None;
     let mut mon_buf = String::new();
     let mut prev_cpu: Option<(u64, u64)> = None; // (total jiffies, idle jiffies)
     let mut prev_net: std::collections::HashMap<String, (u64, u64)> =
@@ -1154,6 +1237,12 @@ async fn run_session(
         }
     }
     let handle = Arc::new(handle);
+    if !session.disable_shell_integration {
+        let monitor_handle = handle.clone();
+        monitor_opening = Some(tokio::spawn(async move {
+            open_resource_monitor(monitor_handle.as_ref()).await
+        }));
+    }
     // Local (-L) and dynamic (-D) listen client-side; their tasks are aborted
     // on session exit.
     for (idx, f) in session.forwards.iter().enumerate() {
@@ -1393,6 +1482,102 @@ async fn run_session(
                     _ => {}
                 }
             }
+            opened = async {
+                match monitor_opening.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if monitor_opening.is_some() => {
+                monitor_opening = None;
+                match opened {
+                    Ok(Some(channel)) => {
+                        mon_channel = Some(channel);
+                        monitor_retry_at = None;
+                        monitor_sample_pending = false;
+                        monitor_sample_deadline = None;
+                        mon_buf.clear();
+                        prev_cpu = None;
+                        prev_net.clear();
+                        prev_net_at = std::time::Instant::now();
+                        monitor_tick = tokio::time::interval(std::time::Duration::from_secs(
+                            monitor_seconds as u64,
+                        ));
+                        monitor_tick.set_missed_tick_behavior(
+                            tokio::time::MissedTickBehavior::Skip,
+                        );
+                    }
+                    Ok(None) => schedule_resource_monitor_retry(
+                        &mut monitor_retry_at,
+                        &mut monitor_retry_attempt,
+                    ),
+                    Err(error) => {
+                        tracing::warn!("monitor open task failed: {error}");
+                        schedule_resource_monitor_retry(
+                            &mut monitor_retry_at,
+                            &mut monitor_retry_attempt,
+                        );
+                    }
+                }
+            }
+            _ = async {
+                match monitor_retry_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if monitor_retry_at.is_some()
+                && monitor_opening.is_none()
+                && mon_channel.is_none() =>
+            {
+                monitor_retry_at = None;
+                let monitor_handle = handle.clone();
+                monitor_opening = Some(tokio::spawn(async move {
+                    open_resource_monitor(monitor_handle.as_ref()).await
+                }));
+            }
+            _ = async {
+                match monitor_sample_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if monitor_sample_pending && mon_channel.is_some() => {
+                tracing::warn!("monitor sample timed out");
+                close_resource_monitor(&mut mon_channel).await;
+                monitor_sample_pending = false;
+                monitor_sample_deadline = None;
+                mon_buf.clear();
+                schedule_resource_monitor_retry(
+                    &mut monitor_retry_at,
+                    &mut monitor_retry_attempt,
+                );
+            }
+            _ = monitor_tick.tick(), if mon_channel.is_some() => {
+                if !monitor_sample_pending {
+                    let result = match mon_channel.as_ref() {
+                        Some(channel) => channel.data(RESOURCE_MONITOR_TRIGGER).await,
+                        None => Ok(()),
+                    };
+                    match result {
+                        Ok(()) => {
+                            monitor_sample_pending = true;
+                            monitor_sample_deadline = Some(
+                                tokio::time::Instant::now()
+                                    + resource_monitor_sample_timeout(monitor_seconds),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!("monitor sample trigger failed: {error}");
+                            close_resource_monitor(&mut mon_channel).await;
+                            monitor_sample_pending = false;
+                            monitor_sample_deadline = None;
+                            mon_buf.clear();
+                            schedule_resource_monitor_retry(
+                                &mut monitor_retry_at,
+                                &mut monitor_retry_attempt,
+                            );
+                        }
+                    }
+                }
+            }
             // Remote resource monitor channel.  The `async { ... }` lets us poll
             // an Option<Channel>: once the monitor channel closes we replace it
             // with `pending()` so this arm simply never fires again.
@@ -1420,6 +1605,11 @@ async fn run_session(
                             ) {
                                 let _ = events.send(stats);
                             }
+                            mark_resource_monitor_sample_complete(
+                                &mut monitor_sample_pending,
+                                &mut monitor_sample_deadline,
+                                &mut monitor_retry_attempt,
+                            );
                         }
                         // Bound the leftover (incomplete) tail: a server that
                         // streams data but never emits the __MSTICK__ marker must
@@ -1427,17 +1617,81 @@ async fn run_session(
                         // A real sample is a few KiB; 1 MiB is a generous ceiling.
                         const MON_BUF_CAP: usize = 1 << 20;
                         if mon_buf.len() > MON_BUF_CAP {
+                            tracing::warn!("monitor sample exceeded the buffer limit");
+                            close_resource_monitor(&mut mon_channel).await;
+                            monitor_sample_pending = false;
+                            monitor_sample_deadline = None;
                             mon_buf.clear();
+                            schedule_resource_monitor_retry(
+                                &mut monitor_retry_at,
+                                &mut monitor_retry_attempt,
+                            );
                         }
+                    }
+                    Some(ChannelMsg::Failure)
+                    | Some(ChannelMsg::Eof)
+                    | Some(ChannelMsg::ExitStatus { .. })
+                    | Some(ChannelMsg::ExitSignal { .. }) => {
+                        tracing::warn!("monitor process stopped");
+                        close_resource_monitor(&mut mon_channel).await;
+                        monitor_sample_pending = false;
+                        monitor_sample_deadline = None;
+                        mon_buf.clear();
+                        schedule_resource_monitor_retry(
+                            &mut monitor_retry_at,
+                            &mut monitor_retry_attempt,
+                        );
                     }
                     Some(ChannelMsg::Close) | None => {
                         mon_channel = None;
+                        monitor_sample_pending = false;
+                        monitor_sample_deadline = None;
+                        mon_buf.clear();
+                        schedule_resource_monitor_retry(
+                            &mut monitor_retry_at,
+                            &mut monitor_retry_attempt,
+                        );
                     }
                     _ => {}
                 }
             }
+            changed = remote_resource_refresh.changed(), if monitor_settings_open => {
+                match changed {
+                    Err(_) => monitor_settings_open = false,
+                    Ok(()) => {
+                        let requested = normalize_remote_resource_refresh_secs(
+                            *remote_resource_refresh.borrow_and_update(),
+                        );
+                        if requested != monitor_seconds {
+                            monitor_seconds = requested;
+                            monitor_retry_attempt = 0;
+                            monitor_tick = tokio::time::interval(std::time::Duration::from_secs(
+                                monitor_seconds as u64,
+                            ));
+                            monitor_tick.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Skip,
+                            );
+                        }
+                        if mon_channel.is_none()
+                            && monitor_opening.is_none()
+                            && !session.disable_shell_integration
+                        {
+                            monitor_retry_at = None;
+                            let monitor_handle = handle.clone();
+                            monitor_opening = Some(tokio::spawn(async move {
+                                open_resource_monitor(monitor_handle.as_ref()).await
+                            }));
+                        }
+                    }
+                }
+            }
         }
     }
+
+    if let Some(task) = monitor_opening.take() {
+        task.abort();
+    }
+    close_resource_monitor(&mut mon_channel).await;
 
     // Tear down any port-forward listeners (#56); -R forwards die with the
     // session's disconnect below.
@@ -1985,9 +2239,57 @@ mod osc_command_tests {
 
 #[cfg(test)]
 mod monitor_hardening_tests {
-    use super::{parse_df_line, parse_monitor_block};
+    use super::{
+        mark_resource_monitor_sample_complete, normalize_remote_resource_refresh_secs,
+        parse_df_line, parse_monitor_block, resource_monitor_retry_delay,
+        resource_monitor_sample_timeout, schedule_resource_monitor_retry, RESOURCE_MONITOR_COMMAND,
+    };
     use std::collections::HashMap;
     use std::time::Instant;
+
+    #[test]
+    fn monitor_interval_clamps_to_supported_range() {
+        assert_eq!(normalize_remote_resource_refresh_secs(0), 1);
+        assert_eq!(normalize_remote_resource_refresh_secs(7), 7);
+        assert_eq!(normalize_remote_resource_refresh_secs(999), 60);
+    }
+
+    #[test]
+    fn monitor_command_waits_for_client_sampling_triggers() {
+        let command = std::str::from_utf8(RESOURCE_MONITOR_COMMAND).unwrap();
+        assert!(command.contains("while IFS= read -r __ms_tick"));
+        assert!(!command.contains("sleep "));
+    }
+
+    #[test]
+    fn monitor_retry_and_sample_timeouts_are_bounded() {
+        let seconds = |duration: std::time::Duration| duration.as_secs();
+        assert_eq!(seconds(resource_monitor_retry_delay(0)), 1);
+        assert_eq!(seconds(resource_monitor_retry_delay(1)), 2);
+        assert_eq!(seconds(resource_monitor_retry_delay(2)), 5);
+        assert_eq!(seconds(resource_monitor_retry_delay(3)), 10);
+        assert_eq!(seconds(resource_monitor_retry_delay(99)), 30);
+        assert_eq!(seconds(resource_monitor_sample_timeout(1)), 10);
+        assert_eq!(seconds(resource_monitor_sample_timeout(5)), 10);
+        assert_eq!(seconds(resource_monitor_sample_timeout(6)), 12);
+        assert_eq!(seconds(resource_monitor_sample_timeout(60)), 120);
+    }
+
+    #[test]
+    fn monitor_backoff_resets_after_a_complete_sample() {
+        let mut retry_at = None;
+        let mut retry_attempt = 0;
+        schedule_resource_monitor_retry(&mut retry_at, &mut retry_attempt);
+        schedule_resource_monitor_retry(&mut retry_at, &mut retry_attempt);
+        assert_eq!(retry_attempt, 2);
+
+        let mut pending = true;
+        let mut deadline = Some(tokio::time::Instant::now());
+        mark_resource_monitor_sample_complete(&mut pending, &mut deadline, &mut retry_attempt);
+        assert!(!pending);
+        assert!(deadline.is_none());
+        assert_eq!(retry_attempt, 0);
+    }
 
     #[test]
     fn df_line_saturates_instead_of_overflowing() {

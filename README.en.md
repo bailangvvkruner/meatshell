@@ -1,3 +1,18 @@
+> [!IMPORTANT]
+> ## Changes in this fork
+>
+> This fork is based on upstream [`jeff141/meatshell` v0.6.1](https://github.com/jeff141/meatshell/releases/tag/v0.6.1) and adds these behavior changes:
+>
+> - Restores the last windowed size and maximized state, clamping invalid geometry to the current display.
+> - Lets the resource sidebar stay pinned to the local machine or a selected SSH session.
+> - Adds live settings for local (1-30 seconds) and remote SSH (1-60 seconds) resource refresh intervals; connected SSH sessions do not need to reconnect.
+> - Selects `M` or `G` for each memory value independently, for example `700M/2.8G`.
+> - Shows a light `root` placeholder for blank SSH usernames and uses `root` when saving or connecting.
+> - Adds an opt-in, loopback-only local AI/debug API with Bearer authentication. Its token is encrypted at rest and saved credentials are never exposed; see the [Debug API documentation](docs/debug-api.md).
+> - Temporarily builds Windows x64 only. Every push to `main` updates the rolling `nightly` Release; Linux and macOS builds remain disabled.
+>
+> Future upstream changes do not automatically include these patches, so they must be retained or adapted when merging upstream.
+
 # meatshell
 
 [简体中文](./README.md) | **English**
@@ -22,13 +37,15 @@ the tens-of-MB range of a native binary.
 
 ## Download & install
 
-Every `v*` tag triggers a GitHub Actions build that produces native binaries for
-**Windows / Linux / macOS**, published on the
-[Releases](https://github.com/jeff141/meatshell/releases) page.
+This fork currently builds **Windows x64 only**. Every push to `main` updates the
+[Windows x64 nightly](https://github.com/bailangvvkruner/meatshell/releases/tag/nightly),
+while a `v*` tag publishes the corresponding formal release. Linux and macOS
+builds are currently disabled.
 
 ### Windows
 
-Download `meatshell-*-windows-x86_64.zip`, unzip, and run `meatshell.exe`.
+Download `meatshell-*-windows-x86_64.zip`, unzip, and run `meatshell.exe`. If the
+same Release also provides an `.msi`, you can use that installer instead.
 
 ### Linux
 

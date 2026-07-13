@@ -816,6 +816,12 @@ pub fn run() -> Result<()> {
         });
     }
 
+    let initial_local_resource_refresh = store.borrow().local_resource_refresh_secs();
+    let initial_remote_resource_refresh = store.borrow().remote_resource_refresh_secs();
+    window.set_local_resource_refresh_secs(initial_local_resource_refresh as i32);
+    window.set_remote_resource_refresh_secs(initial_remote_resource_refresh as i32);
+    let (remote_resource_refresh, _) = tokio::sync::watch::channel(initial_remote_resource_refresh);
+
     // Interface setting: always ask where to save on download (#87). Read live
     // by the download handler from the window property, so just set + persist.
     window.set_download_always_ask(store.borrow().download_always_ask());
@@ -1371,6 +1377,7 @@ pub fn run() -> Result<()> {
         local_snap.clone(),
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
+        remote_resource_refresh.clone(),
         debug_api_state.clone(),
     );
 
@@ -1749,6 +1756,7 @@ pub fn run() -> Result<()> {
             local_net_hist: local_net_hist.clone(),
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
+            remote_resource_refresh: remote_resource_refresh.clone(),
             store: store.clone(),
             debug_api: debug_api_state.clone(),
         },
@@ -1768,7 +1776,7 @@ pub fn run() -> Result<()> {
     }
     let activity = Rc::new(std::cell::Cell::new(WinActivity::Active));
 
-    // --- System sampler (1 Hz) ------------------------------------------
+    // --- Configurable local system sampler -------------------------------
     let sampler = Rc::new(Mutex::new(SystemSampler::new()));
     let weak = window.as_weak();
     let tick_sampler = sampler.clone();
@@ -1776,19 +1784,20 @@ pub fn run() -> Result<()> {
     let tick_local = local_snap.clone();
     let tick_net = local_net_hist.clone();
     let tick_activity = activity.clone();
-    let mut bg_tick = 0u32;
-    let timer = slint::Timer::default();
+    let mut last_sample_at = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(5))
+        .unwrap_or_else(std::time::Instant::now);
+    let timer: &'static slint::Timer = Box::leak(Box::new(slint::Timer::default()));
     timer.start(
         slint::TimerMode::Repeated,
-        SystemSampler::recommended_interval(),
+        std::time::Duration::from_secs(initial_local_resource_refresh as u64),
         move || {
             // Skip the (non-trivial) sysinfo refresh + sidebar repaint when no one
             // is looking, and back off to ~5 s when the window is in the background.
             match tick_activity.get() {
                 WinActivity::Hidden => return,
                 WinActivity::Background => {
-                    bg_tick = bg_tick.wrapping_add(1);
-                    if bg_tick % 5 != 0 {
+                    if last_sample_at.elapsed() < std::time::Duration::from_secs(5) {
                         return;
                     }
                 }
@@ -1798,6 +1807,7 @@ pub fn run() -> Result<()> {
                 let mut s = tick_sampler.lock().expect("sampler poisoned");
                 s.sample()
             };
+            last_sample_at = std::time::Instant::now();
             // Append the raw local throughput to the bottom-graph ring buffer
             // (normalisation happens at display time so the graph auto-scales).
             push_ring(&mut tick_net.lock().unwrap(), snap.net_bytes_per_sec as f32);
@@ -1812,10 +1822,63 @@ pub fn run() -> Result<()> {
             }
         },
     );
-    // Keep the timer alive for the entire event loop by parking it on a
-    // leaked Box. Slint timers drop themselves on Drop, and we don't want
-    // that here.
-    Box::leak(Box::new(timer));
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_local_resource_refresh_secs(move |seconds| {
+            let (old, applied, save_result) = {
+                let mut config = store.borrow_mut();
+                let old = config.local_resource_refresh_secs();
+                config.set_local_resource_refresh_secs(seconds.max(1) as u32);
+                let applied = config.local_resource_refresh_secs();
+                let result = config.save();
+                if result.is_err() {
+                    config.set_local_resource_refresh_secs(old);
+                }
+                (old, applied, result)
+            };
+            if let Err(error) = save_result {
+                tracing::warn!("failed to save local resource refresh interval: {error:#}");
+                if let Some(win) = weak.upgrade() {
+                    win.set_local_resource_refresh_secs(old as i32);
+                }
+                return;
+            }
+            timer.set_interval(std::time::Duration::from_secs(applied as u64));
+            if let Some(win) = weak.upgrade() {
+                win.set_local_resource_refresh_secs(applied as i32);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let remote_resource_refresh = remote_resource_refresh.clone();
+        window.on_set_remote_resource_refresh_secs(move |seconds| {
+            let (old, applied, save_result) = {
+                let mut config = store.borrow_mut();
+                let old = config.remote_resource_refresh_secs();
+                config.set_remote_resource_refresh_secs(seconds.max(1) as u32);
+                let applied = config.remote_resource_refresh_secs();
+                let result = config.save();
+                if result.is_err() {
+                    config.set_remote_resource_refresh_secs(old);
+                }
+                (old, applied, result)
+            };
+            if let Err(error) = save_result {
+                tracing::warn!("failed to save remote resource refresh interval: {error:#}");
+                if let Some(win) = weak.upgrade() {
+                    win.set_remote_resource_refresh_secs(old as i32);
+                }
+                return;
+            }
+            remote_resource_refresh.send_replace(applied);
+            if let Some(win) = weak.upgrade() {
+                win.set_remote_resource_refresh_secs(applied as i32);
+            }
+        });
+    }
 
     // OS file drag-and-drop → upload to the active session's SFTP directory,
     // but only when the file is dropped over the file-list area.
@@ -2698,6 +2761,7 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    remote_resource_refresh: tokio::sync::watch::Sender<u32>,
     debug_api: DebugApiState,
 ) {
     // Working set of port forwards (#56) for the session being created/edited.
@@ -3394,6 +3458,7 @@ fn wire_session_callbacks(
         let local_snap = local_snap.clone();
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
+        let remote_resource_refresh = remote_resource_refresh.clone();
         let debug_api = debug_api.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
@@ -3551,6 +3616,7 @@ fn wire_session_callbacks(
                 local_net_hist: local_net_hist.clone(),
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
+                remote_resource_refresh: remote_resource_refresh.clone(),
                 store: store.clone(),
                 debug_api: debug_api.clone(),
             };
@@ -3608,6 +3674,7 @@ struct ConnectCtx {
     last_term_size: Arc<Mutex<(u32, u32)>>,
     /// Interface setting: SFTP panel follows the terminal's cd (OSC 7).
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    remote_resource_refresh: tokio::sync::watch::Sender<u32>,
     /// Config store, so a session's jump host (#211) can be resolved by id at
     /// connect time on the UI thread.
     store: Rc<RefCell<ConfigStore>>,
@@ -3643,6 +3710,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             jump.clone(),
             initial_cols,
             initial_rows,
+            ctx.remote_resource_refresh.subscribe(),
         ),
         SessionKind::Serial => crate::serial::spawn_serial_session(
             ctx.runtime.handle(),
