@@ -16,6 +16,8 @@ on:
 jobs:
   aur:
     runs-on: ubuntu-latest
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
     # Only run once the AUR SSH key is configured.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.release != null }}
     steps:
@@ -40,14 +42,14 @@ jobs:
 
       - name: Publish meatshell-bin to the AUR
         # Skips cleanly until the AUR SSH key secret is configured.
-        if: ${{ secrets.AUR_SSH_PRIVATE_KEY != '' }}
+        if: ${{ env.AUR_SSH_PRIVATE_KEY != '' }}
         uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
         with:
           pkgname: meatshell-bin
           pkgbuild: packaging/aur/PKGBUILD
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
-          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          ssh_private_key: ${{ env.AUR_SSH_PRIVATE_KEY }}
           commit_message: "Update to ${{ env.VER }}"
           updpkgsums: true
           ssh_keyscan_types: rsa,ed25519
