@@ -9,7 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Per-terminal state: vt100 parser drives all rendering for both normal
@@ -87,18 +87,131 @@ type TermBuffers = Arc<Mutex<HashMap<String, TermBufferHandle>>>;
 /// Coalesces render requests so a firehose of output schedules at most one UI
 /// flush at a time per tab, throttled to ~30 fps (#209).
 struct TabRenderGate {
-    scheduled: AtomicBool,
-    pending: AtomicBool,
+    state: AtomicU8,
     last_render: Mutex<std::time::Instant>,
 }
+
+const RENDER_SCHEDULED: u8 = 0b01;
+const RENDER_PENDING: u8 = 0b10;
 
 impl TabRenderGate {
     fn new() -> Self {
         Self {
-            scheduled: AtomicBool::new(false),
-            pending: AtomicBool::new(false),
+            state: AtomicU8::new(0),
             last_render: Mutex::new(std::time::Instant::now() - RENDER_MIN_INTERVAL),
         }
+    }
+
+    /// Mark fresh output and claim responsibility for scheduling a flush when
+    /// there is not already one queued or rendering.
+    fn mark_requested(&self) -> bool {
+        let previous = self
+            .state
+            .fetch_or(RENDER_SCHEDULED | RENDER_PENDING, Ordering::AcqRel);
+        previous & RENDER_SCHEDULED == 0
+    }
+
+    /// The upcoming render includes every request received before this point.
+    fn begin_flush(&self) {
+        self.state.fetch_and(!RENDER_PENDING, Ordering::AcqRel);
+    }
+
+    /// Finish atomically: either claim exactly one follow-up for output that
+    /// arrived during the render, or return the gate to idle. A requester racing
+    /// with this transition will observe one of those two owners.
+    fn finish_flush(&self) -> bool {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let follow_up = current & RENDER_PENDING != 0;
+            let next = if follow_up {
+                current & !RENDER_PENDING
+            } else {
+                current & !RENDER_SCHEDULED
+            };
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return follow_up,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod render_gate_tests {
+    use super::*;
+
+    fn state(gate: &TabRenderGate) -> u8 {
+        gate.state.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn initial_request_needs_exactly_one_flush() {
+        let gate = TabRenderGate::new();
+        assert!(gate.mark_requested());
+        assert_eq!(state(&gate), RENDER_SCHEDULED | RENDER_PENDING);
+
+        gate.begin_flush();
+        assert_eq!(state(&gate), RENDER_SCHEDULED);
+        assert!(!gate.finish_flush());
+        assert_eq!(state(&gate), 0);
+    }
+
+    #[test]
+    fn requests_before_render_are_coalesced_into_current_flush() {
+        let gate = TabRenderGate::new();
+        assert!(gate.mark_requested());
+        assert!(!gate.mark_requested());
+        assert!(!gate.mark_requested());
+
+        gate.begin_flush();
+        assert!(!gate.finish_flush());
+        assert_eq!(state(&gate), 0);
+    }
+
+    #[test]
+    fn request_during_render_claims_one_follow_up() {
+        let gate = TabRenderGate::new();
+        assert!(gate.mark_requested());
+        gate.begin_flush();
+
+        assert!(!gate.mark_requested());
+        assert!(gate.finish_flush());
+        assert_eq!(state(&gate), RENDER_SCHEDULED);
+
+        gate.begin_flush();
+        assert!(!gate.finish_flush());
+        assert_eq!(state(&gate), 0);
+    }
+
+    #[test]
+    fn requests_join_an_already_claimed_follow_up() {
+        let gate = TabRenderGate::new();
+        assert!(gate.mark_requested());
+        gate.begin_flush();
+        assert!(!gate.mark_requested());
+        assert!(gate.finish_flush());
+
+        assert!(!gate.mark_requested());
+        assert_eq!(state(&gate), RENDER_SCHEDULED | RENDER_PENDING);
+        gate.begin_flush();
+        assert!(!gate.finish_flush());
+        assert_eq!(state(&gate), 0);
+    }
+
+    #[test]
+    fn request_after_idle_claims_the_next_flush() {
+        let gate = TabRenderGate::new();
+        assert!(gate.mark_requested());
+        gate.begin_flush();
+        assert!(!gate.finish_flush());
+
+        assert!(gate.mark_requested());
+        assert_eq!(state(&gate), RENDER_SCHEDULED | RENDER_PENDING);
     }
 }
 
@@ -214,8 +327,7 @@ fn request_tab_render(
         m.get(tab_id).cloned()
     };
     let Some(gate) = gate else { return };
-    gate.pending.store(true, Ordering::Release);
-    if gate.scheduled.swap(true, Ordering::AcqRel) {
+    if !gate.mark_requested() {
         return;
     }
 
@@ -277,19 +389,19 @@ fn do_tab_render_flush(
         m.get(tab_id).cloned()
     };
     let Some(gate) = gate else { return };
-    gate.scheduled.store(false, Ordering::Release);
+    gate.begin_flush();
 
     if let Some(win) = weak.upgrade() {
         if visible_tab_ids(&win).contains(tab_id) {
             rebuild_tab_display(&win, bufs, tab_id);
-            *gate.last_render.lock().unwrap() = std::time::Instant::now();
         }
     }
+    // Hidden tabs skip the expensive model rebuild, but still advance the gate
+    // clock so sustained background output cannot recurse without throttling.
+    *gate.last_render.lock().unwrap() = std::time::Instant::now();
 
-    if gate.pending.swap(false, Ordering::AcqRel) {
-        if !gate.scheduled.swap(true, Ordering::AcqRel) {
-            run_coalesced_tab_render(weak, tab_id, bufs, gates);
-        }
+    if gate.finish_flush() {
+        run_coalesced_tab_render(weak, tab_id, bufs, gates);
     }
 }
 
@@ -3459,6 +3571,7 @@ fn wire_session_callbacks(
                 id: tab_id.clone().into(),
                 status: t("连接中...", "Connecting...").into(),
                 spans: ModelRc::from(std::rc::Rc::new(VecModel::<TermSpan>::default())),
+                render_revision: 0,
                 cursor_row: 0,
                 cursor_col: 0,
                 rows_used: 0,
@@ -4494,6 +4607,61 @@ fn apply_terminal_resize(
 /// Recompute spans + cursor + find/selection highlights for one tab from its
 /// current vt100 screen (respecting scrollback) and push them to the model.
 /// Used by scroll + selection callbacks (Output has its own equivalent inline).
+fn term_span_eq(a: &TermSpan, b: &TermSpan) -> bool {
+    a.text == b.text
+        && a.fg == b.fg
+        && a.bg == b.bg
+        && a.bold == b.bold
+        && a.row == b.row
+        && a.col == b.col
+        && a.cells == b.cells
+        && a.cjk == b.cjk
+}
+
+fn term_match_eq(a: &TermMatch, b: &TermMatch) -> bool {
+    a.row == b.row && a.col == b.col && a.len == b.len
+}
+
+/// Keep the same Slint model so repeaters retain their components, notifying
+/// only changed rows and any added/removed tail.
+fn sync_vec_model_rows<T: Clone + 'static>(
+    model: &ModelRc<T>,
+    rows: &[T],
+    rows_equal: fn(&T, &T) -> bool,
+) -> bool {
+    let model = model
+        .as_any()
+        .downcast_ref::<VecModel<T>>()
+        .expect("terminal display model must be a VecModel");
+    let old_len = model.row_count();
+    let new_len = rows.len();
+    let common = old_len.min(new_len);
+    let mut changed = false;
+
+    for (index, next) in rows.iter().take(common).enumerate() {
+        let differs = model
+            .row_data(index)
+            .map(|current| !rows_equal(&current, next))
+            .unwrap_or(true);
+        if differs {
+            model.set_row_data(index, next.clone());
+            changed = true;
+        }
+    }
+
+    if new_len < old_len {
+        for index in (new_len..old_len).rev() {
+            model.remove(index);
+        }
+        changed = true;
+    } else if new_len > old_len {
+        model.extend_from_slice(&rows[old_len..]);
+        changed = true;
+    }
+
+    changed
+}
+
 fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     let data = with_term_buf(bufs, tab_id, |buf| {
         let cols = buf.parser.screen().size().1;
@@ -4505,23 +4673,144 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     let Some((b, matches, sel)) = data else {
         return;
     };
-    let spans = ModelRc::from(Rc::new(VecModel::from(b.spans)));
-    let fm = ModelRc::from(Rc::new(VecModel::from(matches)));
-    let sm = ModelRc::from(Rc::new(VecModel::from(sel)));
     let (cr, cc, ru, alt) = (b.cursor_row, b.cursor_col, b.rows_used, b.is_alt);
     let (smax, soff) = (b.scroll_max, b.scroll_offset);
-    set_terminal_row(win, tab_id, move |row| {
-        row.spans = spans.clone();
-        row.cursor_row = cr;
-        row.cursor_col = cc;
-        row.rows_used = ru;
-        row.is_alt_screen = alt;
-        row.find_matches = fm.clone();
-        row.selection = sm.clone();
-        row.scroll_max = smax;
-        row.scroll_offset = soff;
+    let mut changed = false;
+    set_terminal_row(win, tab_id, |row| {
+        changed |= sync_vec_model_rows(&row.spans, &b.spans, term_span_eq);
+        changed |= sync_vec_model_rows(&row.find_matches, &matches, term_match_eq);
+        changed |= sync_vec_model_rows(&row.selection, &sel, term_match_eq);
+
+        // The spans model stays pointer-stable for repeater reuse, so explicitly
+        // preserve the old `changed spans` viewport pinning signal.
+        row.render_revision = row.render_revision.wrapping_add(1);
+        changed = true;
+
+        let scalar_changed = row.cursor_row != cr
+            || row.cursor_col != cc
+            || row.rows_used != ru
+            || row.is_alt_screen != alt
+            || row.scroll_max != smax
+            || row.scroll_offset != soff;
+        if scalar_changed {
+            row.cursor_row = cr;
+            row.cursor_col = cc;
+            row.rows_used = ru;
+            row.is_alt_screen = alt;
+            row.scroll_max = smax;
+            row.scroll_offset = soff;
+            changed = true;
+        }
     });
-    win.window().request_redraw();
+    if changed {
+        win.window().request_redraw();
+    }
+}
+
+#[cfg(test)]
+mod terminal_model_tests {
+    use super::*;
+
+    fn span(text: &str) -> TermSpan {
+        TermSpan {
+            text: text.into(),
+            fg: slint::Color::from_rgb_u8(220, 220, 220),
+            bg: slint::Color::from_argb_u8(0, 0, 0, 0),
+            bold: false,
+            row: 1,
+            col: 2,
+            cells: 3,
+            cjk: false,
+        }
+    }
+
+    fn model_matches(model: &VecModel<TermSpan>, expected: &[TermSpan]) -> bool {
+        model.row_count() == expected.len()
+            && expected.iter().enumerate().all(|(index, item)| {
+                model
+                    .row_data(index)
+                    .map(|actual| term_span_eq(&actual, item))
+                    .unwrap_or(false)
+            })
+    }
+
+    #[test]
+    fn terminal_span_sync_reuses_model_and_diffs_rows_and_tail() {
+        let initial = vec![span("one"), span("two")];
+        let concrete = Rc::new(VecModel::from(initial.clone()));
+        let model = ModelRc::from(concrete.clone());
+        let downcast = model.as_any().downcast_ref::<VecModel<TermSpan>>().unwrap();
+        assert!(std::ptr::eq(downcast, concrete.as_ref()));
+
+        assert!(!sync_vec_model_rows(&model, &initial, term_span_eq));
+        assert!(model_matches(&concrete, &initial));
+
+        let mut changed = initial.clone();
+        changed[1].text = "updated".into();
+        assert!(sync_vec_model_rows(&model, &changed, term_span_eq));
+        assert!(model_matches(&concrete, &changed));
+
+        let mut grown = changed.clone();
+        grown.push(span("three"));
+        assert!(sync_vec_model_rows(&model, &grown, term_span_eq));
+        assert!(model_matches(&concrete, &grown));
+
+        let shrunk = vec![grown[0].clone()];
+        assert!(sync_vec_model_rows(&model, &shrunk, term_span_eq));
+        assert!(model_matches(&concrete, &shrunk));
+        assert!(std::ptr::eq(
+            model.as_any().downcast_ref::<VecModel<TermSpan>>().unwrap(),
+            concrete.as_ref()
+        ));
+    }
+
+    #[test]
+    fn terminal_span_comparison_covers_every_rendered_field() {
+        let original = span("same");
+
+        let mut changed = original.clone();
+        changed.text = "different".into();
+        assert!(!term_span_eq(&original, &changed));
+        changed = original.clone();
+        changed.fg = slint::Color::from_rgb_u8(1, 2, 3);
+        assert!(!term_span_eq(&original, &changed));
+        changed = original.clone();
+        changed.bg = slint::Color::from_rgb_u8(4, 5, 6);
+        assert!(!term_span_eq(&original, &changed));
+        changed = original.clone();
+        changed.bold = true;
+        assert!(!term_span_eq(&original, &changed));
+        changed = original.clone();
+        changed.row += 1;
+        assert!(!term_span_eq(&original, &changed));
+        changed = original.clone();
+        changed.col += 1;
+        assert!(!term_span_eq(&original, &changed));
+        changed = original.clone();
+        changed.cells += 1;
+        assert!(!term_span_eq(&original, &changed));
+        changed = original.clone();
+        changed.cjk = true;
+        assert!(!term_span_eq(&original, &changed));
+    }
+
+    #[test]
+    fn terminal_match_comparison_covers_grid_rectangle() {
+        let original = TermMatch {
+            row: 1,
+            col: 2,
+            len: 3,
+        };
+        let mut changed = original.clone();
+        changed.row += 1;
+        assert!(!term_match_eq(&original, &changed));
+        changed = original.clone();
+        changed.col += 1;
+        assert!(!term_match_eq(&original, &changed));
+        changed = original.clone();
+        changed.len += 1;
+        assert!(!term_match_eq(&original, &changed));
+    }
 }
 
 /// Resolve the user's saved theme preference to a dark/light bool (mirrors the
@@ -7684,9 +7973,10 @@ fn wire_key_input(
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
-                    row.spans = ModelRc::from(Rc::new(VecModel::<TermSpan>::default()));
-                    row.find_matches = ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
-                    row.selection = ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
+                    sync_vec_model_rows(&row.spans, &[], term_span_eq);
+                    sync_vec_model_rows(&row.find_matches, &[], term_match_eq);
+                    sync_vec_model_rows(&row.selection, &[], term_match_eq);
+                    row.render_revision = row.render_revision.wrapping_add(1);
                     row.cursor_row = 0;
                     row.cursor_col = 0;
                     row.rows_used = 0;
@@ -7723,9 +8013,8 @@ fn wire_key_input(
                     rebuild_tab_display(&win, &bufs_find, &tid);
                     return;
                 }
-                let model = ModelRc::from(Rc::new(VecModel::from(matches)));
                 set_terminal_row(&win, &tid, |row| {
-                    row.find_matches = model.clone();
+                    sync_vec_model_rows(&row.find_matches, &matches, term_match_eq);
                 });
             }
         });
@@ -8254,7 +8543,7 @@ fn webdav_get_json(
 
 /// Mutate the `TerminalState` whose id matches `tab_id` in the live model.
 /// Must run on the Slint event loop thread.
-fn set_terminal_row(win: &AppWindow, tab_id: &str, mutator: impl Fn(&mut TerminalState)) {
+fn set_terminal_row(win: &AppWindow, tab_id: &str, mut mutator: impl FnMut(&mut TerminalState)) {
     let terminals = win.get_terminals();
     let Some(model) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() else {
         return;
@@ -8262,8 +8551,11 @@ fn set_terminal_row(win: &AppWindow, tab_id: &str, mutator: impl Fn(&mut Termina
     for i in 0..model.row_count() {
         if let Some(mut row) = model.row_data(i) {
             if row.id.as_str() == tab_id {
+                let previous = row.clone();
                 mutator(&mut row);
-                model.set_row_data(i, row);
+                if row != previous {
+                    model.set_row_data(i, row);
+                }
                 break;
             }
         }

@@ -56,6 +56,7 @@ export struct TerminalState {
     id: string,
     status: string,
     spans: [TermSpan],     // coloured runs of the visible terminal screen
+    render-revision: int,  // advances when a terminal frame is applied
     cursor-row: int,       // cursor cell on the grid
     cursor-col: int,
     rows-used: int,        // content rows, for viewport sizing
@@ -1302,6 +1303,7 @@ export component AppWindow inherits Window {
                     tab-id: term.id;
                     status-line: term.status;
                     spans: term.spans;
+                    render-revision: term.render-revision;
                     cursor-row: term.cursor-row;
                     cursor-col: term.cursor-col;
                     rows-used: term.rows-used;

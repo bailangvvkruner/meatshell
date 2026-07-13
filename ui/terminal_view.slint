@@ -92,6 +92,7 @@ export component TerminalView inherits Rectangle {
     in property <string> tab-id;
     in property <string> status-line: @tr("Not connected");
     in property <[TermSpan]> spans;     // coloured runs of the visible screen
+    in property <int> render-revision;  // changes while the spans model stays stable
     in property <int> cursor-row;       // cursor cell (grid coords)
     in property <int> cursor-col;
     in property <int> rows-used;        // content rows, for viewport sizing
@@ -282,7 +283,7 @@ export component TerminalView inherits Rectangle {
 
     init => { if (root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
 
-    changed spans => {
+    changed render-revision => {
         // Bash: keep the latest output pinned to the bottom.
         // Alt-screen (nano/vim/htop/btop): the program owns a fixed full screen,
         // so the viewport must stay top-aligned (viewport-y = 0).  Scrolling to
