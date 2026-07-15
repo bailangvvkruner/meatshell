@@ -619,7 +619,6 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
@@ -694,7 +693,10 @@ mod tests {
             address,
             "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
-        assert!(unauthenticated.starts_with("HTTP/1.1 401"));
+        assert!(
+            unauthenticated.starts_with("HTTP/1.1 401"),
+            "unexpected unauthenticated response: {unauthenticated:?}"
+        );
 
         let health = request(
             address,

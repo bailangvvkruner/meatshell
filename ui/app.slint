@@ -23,7 +23,12 @@ import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton, ToolStrip } from "widgets.slint";
 import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
+import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
+
 import { InterfacePanel } from "interface_panel.slint";
+// Re-export so `slint::include_modules!` generates the detached system information window.
+export { SystemInfoWindow }
+
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
 export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd }
@@ -75,6 +80,7 @@ export struct TerminalState {
     sftp-selected-count: int,   // checked entries in the SFTP panel (#100)
     sftp-sort-key: string,      // ""|"name"|"size"|"modified" (#248)
     sftp-sort-dir: int,         // 0 default / 1 asc / -1 desc (#248)
+    sftp-available: bool,       // false for local/serial/telnet sessions
     tunnels: [TunnelInfo],      // runtime SSH tunnels (#206)
     sftp-collapsed: bool,       // SFTP panel minimised — per session (#v0.5)
     sftp-panel-height: length,  // SFTP panel extent (bottom dock) — per session
@@ -337,6 +343,18 @@ export component AppWindow inherits Window {
     in-out property <bool> proc-open: false; // in-app process monitor popup (#23)
     in property <bool> proc-available;       // a live remote session is active
     in property <[ProcRow]> proc-list;       // top remote processes by CPU
+    callback open-system-info();
+    in property <[SysMetricRow]> sys-metrics;
+    in property <[SysNetRow]> sys-net-rows;
+    in property <[DiskInfo]> sys-disks;
+    in property <[SysInfoRow]> sys-overview-rows;
+    in property <[SysInfoRow]> sys-cpu-info-rows;
+    in property <[SysInfoRow]> sys-gpu-info-rows;
+    in property <[SysInfoRow]> sys-cpu-usage-rows;
+    in property <[SysInfoRow]> sys-memory-rows;
+    in property <[SysInfoRow]> sys-swap-rows;
+    in property <[SysInfoRow]> sys-network-rows;
+    in property <[SysInfoRow]> sys-filesystem-rows;
     // Command bar (#55): quick commands + history, fed from Rust.
     in property <[QuickCmd]> quick-commands;
     in property <[string]> command-history;          // oldest first (newest last, #113)
@@ -378,6 +396,7 @@ export component AppWindow inherits Window {
     changed dark-mode => { Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light; }
     in-out property <string> term-font-family <=> Theme.term-font-family;
     in-out property <length> term-font-size <=> Theme.term-font-size;
+    in-out property <bool> term-font-bold <=> Theme.term-font-bold;
     in-out property <float> ui-scale <=> Theme.ui-scale;   // global UI zoom (#100)
     in-out property <float> panel-font <=> Theme.panel-font;  // settings-panel font scale
     callback set-panel-font(int);                          // apply + persist (percent)
@@ -415,6 +434,7 @@ export component AppWindow inherits Window {
     property <length> ifd-grab-y;
     callback set-term-font(string);                // apply + persist font family
     callback set-term-font-size(int);              // apply + persist font size (px)
+    callback set-term-font-bold(bool);             // apply + persist bold terminal text
     callback set-ui-scale(int);                    // apply + persist UI scale (percent) (#100)
     // Immersive wallpaper (set by Rust). The active id + custom file basename
     // feed the Interface → Wallpaper picker.
@@ -631,6 +651,13 @@ export component AppWindow inherits Window {
     in-out property <bool> batch-import-open: false;  // text batch-import dialog (#150)
     in-out property <string> batch-import-text;       // the textarea content
     callback batch-import-confirm(string /* pasted text */);
+    // Multi-line terminal paste safety prompt (#262).
+    in-out property <bool> paste-confirm-open: false;
+    in-out property <string> paste-confirm-tab;
+    in-out property <string> paste-confirm-text;
+    in-out property <string> paste-confirm-preview;
+    callback paste-confirmed(string /* tab-id */);
+    callback paste-confirm-cancelled();
     callback connect-session(string /* session-id */);
     callback edit-session(string /* session-id */);
     callback duplicate-session(string /* session-id */);
@@ -751,7 +778,7 @@ export component AppWindow inherits Window {
     callback terminal-wheel(string, int, int, int);
     callback terminal-scroll-to(string /* tab-id */, int /* offset */); // scrollbar drag (#103)
     // Drag-selection lifecycle (grid row/col coordinates).
-    callback term-select-start(string /* tab-id */, int /* row */, int /* col */);
+    callback term-select-start(string /* tab-id */, int /* row */, int /* col */, bool /* ctrl */, bool /* shift */);
     callback term-select-update(string /* tab-id */, int /* row */, int /* col */);
     callback term-select-end(string /* tab-id */);
     callback term-select-autoscroll(string /* tab-id */, int /* dir */);
@@ -1064,6 +1091,7 @@ export component AppWindow inherits Window {
             proc-available: root.proc-available;
             app-version: root.app-version;
             select-net-iface(i) => { root.select-net-iface(i); }
+            show-system-info() => { root.open-system-info(); }
             show-processes() => { root.proc-open = true; }
             toggle-resource-pin() => {
                 if root.resource-pinned {
@@ -1075,6 +1103,7 @@ export component AppWindow inherits Window {
                 }
                 root.refresh-sidebar();
             }
+
             copy-host(h) => { root.copy-text(h); }   // reuse the clipboard helper (#192)
             // Drag the sidebar header to dock it to another edge. Coordinates
             // arrive in window space; convert to dock-area-relative fractions.
@@ -1330,6 +1359,7 @@ export component AppWindow inherits Window {
                     sftp-selected-count: term.sftp-selected-count;
                     sftp-sort-key: term.sftp-sort-key;
                     sftp-sort-dir: term.sftp-sort-dir;
+                    sftp-available: term.sftp-available;
                     tunnels: term.tunnels;
                     quick-commands: root.quick-commands;
                     command-history: root.command-history;
@@ -1423,7 +1453,7 @@ export component AppWindow inherits Window {
                     terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
                     terminal-wheel(d, c, r) => { root.terminal-wheel(term.id, d, c, r); }
                     terminal-scroll-to(o) => { root.terminal-scroll-to(term.id, o); }
-                    select-start(r, c) => { root.term-select-start(term.id, r, c); }
+                    select-start(r, c, ctrl, shift) => { root.term-select-start(term.id, r, c, ctrl, shift); }
                     select-update(r, c) => { root.term-select-update(term.id, r, c); }
                     select-end() => { root.term-select-end(term.id); }
                     select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
@@ -3363,6 +3393,30 @@ export component AppWindow inherits Window {
         cancel => { root.confirm-delete-batch = false; root.confirm-delete-open = false; }
     }
 
+    // Multi-line paste can execute several shell commands at once. Keep the
+    // prompt explicit and require a button click; clicking the backdrop never
+    // accepts the paste (#262).
+    ConfirmDialog {
+        width: parent.width;
+        height: parent.height;
+        is-open <=> root.paste-confirm-open;
+        dismiss-on-backdrop: false;
+        title: root.lang-en ? "Confirm multi-line paste" : "确认多行粘贴";
+        message: root.lang-en
+            ? "The clipboard contains line breaks and may execute multiple commands. Review it before pasting."
+            : "剪贴板内容包含换行，粘贴后可能连续执行多个命令，请确认内容后再继续。";
+        detail: root.paste-confirm-preview;
+        confirm-label: root.lang-en ? "Paste" : "粘贴";
+        confirm => {
+            root.paste-confirmed(root.paste-confirm-tab);
+            root.paste-confirm-open = false;
+        }
+        cancel => {
+            root.paste-confirm-cancelled();
+            root.paste-confirm-open = false;
+        }
+    }
+
     // Host-key confirmation (#109-5). Reuses the confirm-dialog card. The backdrop
     // is NOT a dismiss here (#152): clicking outside the card used to count as a
     // reject and — worse — poison the host for the whole run. The user must pick
@@ -3710,6 +3764,7 @@ export component AppWindow inherits Window {
                     term-fonts: root.term-fonts;
                     term-font-family: root.term-font-family;
                     term-font-size: root.term-font-size;
+                    term-font-bold: root.term-font-bold;
                     ui-scale: root.ui-scale;
                     sftp-follow-cd <=> root.sftp-follow-cd;
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
@@ -3737,6 +3792,7 @@ export component AppWindow inherits Window {
                     pick-wallpaper-file() => { root.pick-wallpaper-file(); }
                     set-term-font(v) => { root.set-term-font(v); }
                     set-term-font-size(v) => { root.set-term-font-size(v); }
+                    set-term-font-bold(v) => { root.set-term-font-bold(v); }
                     set-ui-scale(v) => { root.set-ui-scale(v); }
                     set-panel-font(v) => { root.set-panel-font(v); }
                     set-sftp-follow-cd(v) => { root.set-sftp-follow-cd(v); }

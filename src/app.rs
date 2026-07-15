@@ -10,7 +10,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
 
 /// Per-terminal state: vt100 parser drives all rendering for both normal
 /// (bash) and alt-screen (vim/nano/htop) modes.
@@ -36,6 +37,9 @@ struct TermBuffer {
     /// `anchor` = where the drag began, `focus` = the moving end.
     sel_anchor: Option<(usize, u16)>,
     sel_focus: Option<(usize, u16)>,
+    /// Additional Ctrl-selected ranges. The last range is the active range;
+    /// Shift extends it from its anchor while Ctrl adds another range.
+    sel_ranges: Vec<((usize, u16), (usize, u16))>,
     /// Session scrollback: lines that have scrolled off the top (oldest first).
     history: Vec<Line>,
     /// Previous frame's grid lines, for scroll-off detection.
@@ -250,8 +254,31 @@ use crate::i18n::t;
 use crate::sftp::{spawn_sftp, SftpHandle};
 use crate::ssh::{
     format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent, SessionHandle,
+    SystemDetails,
 };
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
+
+#[derive(Clone, Default)]
+struct LocalHardwareInfo {
+    os: String,
+    kernel: String,
+    kernel_version: String,
+    arch: String,
+    hostname: String,
+    cpu_name: String,
+    cpu_vendor: String,
+    cpu_cores: String,
+    cpu_frequency: String,
+    gpus: Vec<LocalGpuInfo>,
+}
+
+#[derive(Clone, Default)]
+struct LocalGpuInfo {
+    name: String,
+    vendor: String,
+    driver: String,
+    memory: String,
+}
 
 fn tab_title_len(title: &str) -> i32 {
     title
@@ -293,6 +320,8 @@ struct TabStatus {
     disks: Vec<(String, u64, u64)>,
     /// Top remote processes by CPU, for the process monitor popup (#23).
     procs: Vec<ProcInfo>,
+    /// Detailed resource rows for the detached system-information window.
+    sys: SystemDetails,
 }
 type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
 /// Last local-machine sample (shown on the welcome tab).
@@ -781,6 +810,89 @@ pub fn run() -> Result<()> {
     // Keep one concrete model so the in-app process table can update in place.
     let proc_rows_model: Rc<VecModel<ProcRow>> = Rc::new(VecModel::default());
     window.set_proc_list(ModelRc::from(proc_rows_model.clone()));
+    let sys_metrics_model: Rc<VecModel<SysMetricRow>> = Rc::new(VecModel::default());
+    let sys_net_rows_model: Rc<VecModel<SysNetRow>> = Rc::new(VecModel::default());
+    let sys_disks_model: Rc<VecModel<DiskInfo>> = Rc::new(VecModel::default());
+    let sys_overview_model: Rc<VecModel<SysInfoRow>> = Rc::new(VecModel::default());
+    let sys_cpu_info_model: Rc<VecModel<SysInfoRow>> = Rc::new(VecModel::default());
+    let sys_gpu_info_model: Rc<VecModel<SysInfoRow>> = Rc::new(VecModel::default());
+    let sys_cpu_usage_model: Rc<VecModel<SysInfoRow>> = Rc::new(VecModel::default());
+    let sys_memory_model: Rc<VecModel<SysInfoRow>> = Rc::new(VecModel::default());
+    let sys_swap_model: Rc<VecModel<SysInfoRow>> = Rc::new(VecModel::default());
+    let sys_network_model: Rc<VecModel<SysInfoRow>> = Rc::new(VecModel::default());
+    let sys_filesystem_model: Rc<VecModel<SysInfoRow>> = Rc::new(VecModel::default());
+    window.set_sys_metrics(ModelRc::from(sys_metrics_model.clone()));
+    window.set_sys_net_rows(ModelRc::from(sys_net_rows_model.clone()));
+    window.set_sys_disks(ModelRc::from(sys_disks_model.clone()));
+    window.set_sys_overview_rows(ModelRc::from(sys_overview_model.clone()));
+    window.set_sys_cpu_info_rows(ModelRc::from(sys_cpu_info_model.clone()));
+    window.set_sys_gpu_info_rows(ModelRc::from(sys_gpu_info_model.clone()));
+    window.set_sys_cpu_usage_rows(ModelRc::from(sys_cpu_usage_model.clone()));
+    window.set_sys_memory_rows(ModelRc::from(sys_memory_model.clone()));
+    window.set_sys_swap_rows(ModelRc::from(sys_swap_model.clone()));
+    window.set_sys_network_rows(ModelRc::from(sys_network_model.clone()));
+    window.set_sys_filesystem_rows(ModelRc::from(sys_filesystem_model.clone()));
+    let sys_win = SystemInfoWindow::new().context("failed to build system info window")?;
+    sys_win.set_custom_titlebar(cfg!(not(target_os = "macos")));
+    sys_win.set_metrics(ModelRc::from(sys_metrics_model.clone()));
+    sys_win.set_nets(ModelRc::from(sys_net_rows_model.clone()));
+    sys_win.set_disks(ModelRc::from(sys_disks_model.clone()));
+    sys_win.set_overview_rows(ModelRc::from(sys_overview_model.clone()));
+    sys_win.set_cpu_info_rows(ModelRc::from(sys_cpu_info_model.clone()));
+    sys_win.set_gpu_info_rows(ModelRc::from(sys_gpu_info_model.clone()));
+    sys_win.set_cpu_usage_rows(ModelRc::from(sys_cpu_usage_model.clone()));
+    sys_win.set_memory_rows(ModelRc::from(sys_memory_model.clone()));
+    sys_win.set_swap_rows(ModelRc::from(sys_swap_model.clone()));
+    sys_win.set_network_rows(ModelRc::from(sys_network_model.clone()));
+    sys_win.set_filesystem_rows(ModelRc::from(sys_filesystem_model.clone()));
+    {
+        let weak = sys_win.as_weak();
+        sys_win.on_close(move || {
+            if let Some(w) = weak.upgrade() {
+                let _ = w.hide();
+            }
+        });
+    }
+    {
+        let weak = sys_win.as_weak();
+        sys_win.on_win_drag(move || {
+            if let Some(w) = weak.upgrade() {
+                w.window().with_winit_window(|ww| {
+                    let _ = ww.drag_window();
+                });
+                schedule_slint_pointer_ungrab(weak.clone());
+            }
+        });
+    }
+    {
+        use i_slint_backend_winit::winit::window::ResizeDirection;
+        let weak = sys_win.as_weak();
+        sys_win.on_win_resize_se(move || {
+            if let Some(w) = weak.upgrade() {
+                w.window().with_winit_window(|ww| {
+                    let _ = ww.drag_resize_window(ResizeDirection::SouthEast);
+                });
+                schedule_slint_pointer_ungrab(weak.clone());
+            }
+        });
+    }
+    {
+        let win_weak = window.as_weak();
+        let sys_weak = sys_win.as_weak();
+        window.on_open_system_info(move || {
+            let (Some(main), Some(sw)) = (win_weak.upgrade(), sys_weak.upgrade()) else {
+                return;
+            };
+            sw.set_host(main.get_conn_host());
+            sw.set_connection_state(main.get_connection_state());
+            sw.set_resource_title(main.get_resource_title());
+            sync_system_info_theme(&main, &sw);
+            let _ = sw.show();
+            place_system_info_window(&main, &sw);
+            sw.window().with_winit_window(|ww| ww.focus_window());
+        });
+    }
+
 
     // Apply the saved UI language.  The Rust-side flag drives `i18n::t(...)`;
     // `apply_to_slint` selects the bundled `.po` for the static `@tr(...)` text
@@ -820,6 +932,7 @@ pub fn run() -> Result<()> {
             window.set_term_font_family(fam.into());
         }
         window.set_term_font_size(s.font_size() as f32);
+        window.set_term_font_bold(s.terminal_bold());
         window.set_ui_scale(s.ui_scale() as f32 / 100.0); // global UI zoom (#100)
         window.set_panel_font(s.panel_font() as f32 / 100.0); // settings-panel font scale
     }
@@ -1133,6 +1246,20 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_size(size as f32);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_term_font_bold(move |bold: bool| {
+            {
+                let mut s = store.borrow_mut();
+                s.set_terminal_bold(bold);
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_term_font_bold(bold);
             }
         });
     }
@@ -2740,6 +2867,20 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
     };
 
     let mut rows: Vec<SessionInfo> = Vec::new();
+    for (i, s) in builtin_local_sessions().iter().enumerate() {
+        rows.push(SessionInfo {
+            id: s.id.clone().into(),
+            name: s.name.clone().into(),
+            host: s.host.clone().into(),
+            port: 0,
+            user: s.user.clone().into(),
+            auth: s.kind.as_str().into(),
+            last_used: "".into(),
+            group: "system".into(),
+            group_header: if i == 0 { "system".into() } else { "".into() },
+            collapsed: true,
+        });
+    }
     for group in &display_groups {
         let mut gs: Vec<&Session> = if group == "default" {
             sessions.iter().filter(|s| s.group.is_empty()).collect()
@@ -2776,6 +2917,57 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         }
     }
     model.set_vec(rows);
+}
+
+fn builtin_local_sessions() -> Vec<Session> {
+    let mut out = Vec::new();
+    #[cfg(windows)]
+    {
+        out.push(builtin_local_session("system:powershell", "PowerShell", "powershell"));
+        out.push(builtin_local_session("system:cmd", "CMD", "cmd"));
+        if wsl_available() {
+            out.push(builtin_local_session("system:wsl", "WSL", "wsl"));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let name = std::path::Path::new(&shell)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Shell")
+            .to_string();
+        out.push(builtin_local_session("system:shell", name, "shell"));
+    }
+    out
+}
+
+fn builtin_local_session(id: &str, name: impl Into<String>, host: &str) -> Session {
+    let mut s = Session::new_empty();
+    s.id = id.to_string();
+    s.name = name.into();
+    s.host = host.to_string();
+    s.user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_default();
+    s.group = "system".to_string();
+    s.kind = SessionKind::Local;
+    s
+}
+
+#[cfg(windows)]
+fn wsl_available() -> bool {
+    use std::os::windows::process::CommandExt;
+
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("wsl.exe")
+            .arg("--status")
+            .creation_flags(0x08000000)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3504,9 +3696,16 @@ fn wire_session_callbacks(
         let debug_api = debug_api.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
-            let session = match store.borrow().get(&id).cloned() {
-                Some(s) => s,
-                None => return,
+            let session = if id.starts_with("system:") {
+                match builtin_local_sessions().into_iter().find(|s| s.id == id) {
+                    Some(s) => s,
+                    None => return,
+                }
+            } else {
+                match store.borrow().get(&id).cloned() {
+                    Some(s) => s,
+                    None => return,
+                }
             };
             let tab_id = format!("term-{}", uuid::Uuid::new_v4());
             let tab_title = session.name.clone();
@@ -3518,6 +3717,7 @@ fn wire_session_callbacks(
                     format!("{} @{}", session.serial_port, session.baud_rate)
                 }
                 SessionKind::Telnet => format!("telnet {}:{}", session.host, session.port),
+                SessionKind::Local => format!("local {}", session.name),
             };
             let api_title = if tab_title.trim().is_empty() {
                 conn_label.clone()
@@ -3598,8 +3798,9 @@ fn wire_session_callbacks(
                 sftp_selected_count: 0,
                 sftp_sort_key: "".into(),
                 sftp_sort_dir: 0,
+                sftp_available: has_sftp,
                 tunnels: ModelRc::from(std::rc::Rc::new(VecModel::<TunnelInfo>::default())),
-                sftp_collapsed: sftp_collapsed_default,
+                sftp_collapsed: !has_sftp || sftp_collapsed_default,
                 sftp_panel_height: sftp_h_default,
                 sftp_panel_width: sftp_w_default,
                 sftp_saved_height: sftp_h_default,
@@ -3616,6 +3817,7 @@ fn wire_session_callbacks(
                     is_dark: is_dark_now,
                     sel_anchor: None,
                     sel_focus: None,
+                    sel_ranges: Vec::new(),
                     history: Vec::new(),
                     prev: Vec::new(),
                     view_offset: 0,
@@ -3761,6 +3963,13 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             session.clone(),
         ),
         SessionKind::Telnet => crate::telnet::spawn_telnet_session(
+            ctx.runtime.handle(),
+            tab_id.to_string(),
+            session.clone(),
+            initial_cols,
+            initial_rows,
+        ),
+        SessionKind::Local => crate::local::spawn_local_session(
             ctx.runtime.handle(),
             tab_id.to_string(),
             session.clone(),
@@ -4157,8 +4366,8 @@ fn normalized_model(buf: &[f32]) -> ModelRc<f32> {
 }
 
 /// Build the filesystem-usage model (path, "avail/total", used fraction).
-fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
-    let rows: Vec<DiskInfo> = disks
+fn disk_rows(disks: &[(String, u64, u64)]) -> Vec<DiskInfo> {
+    disks
         .iter()
         .map(|(mount, avail, total)| {
             let used = total.saturating_sub(*avail);
@@ -4173,8 +4382,11 @@ fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
                 percent,
             }
         })
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
+        .collect()
+}
+
+fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
+    ModelRc::from(Rc::new(VecModel::from(disk_rows(disks))))
 }
 
 /// Build the process-monitor model for the popup (#23). Available `cpu`/`mem`
@@ -4204,6 +4416,416 @@ fn proc_rows(procs: &[ProcInfo]) -> Vec<ProcRow> {
         .collect()
 }
 
+fn metric_rows(
+    cpu: f32,
+    mem: f32,
+    swap: f32,
+    mem_detail: impl Into<SharedString>,
+    swap_detail: impl Into<SharedString>,
+) -> Vec<SysMetricRow> {
+    vec![
+        SysMetricRow {
+            label: "CPU".into(),
+            percent: cpu,
+            detail: "".into(),
+            kind: 0,
+        },
+        SysMetricRow {
+            label: t("内存", "Memory").into(),
+            percent: mem,
+            detail: mem_detail.into(),
+            kind: 1,
+        },
+        SysMetricRow {
+            label: t("交换", "Swap").into(),
+            percent: swap,
+            detail: swap_detail.into(),
+            kind: 2,
+        },
+    ]
+}
+
+fn net_rows(net: &[(String, u64, u64)]) -> Vec<SysNetRow> {
+    net.iter()
+        .map(|(name, rx, tx)| SysNetRow {
+            name: name.clone().into(),
+            up: format_bytes_per_sec(*tx).into(),
+            down: format_bytes_per_sec(*rx).into(),
+        })
+        .collect()
+}
+
+fn pairs_to_overview_rows(pairs: &[(String, String)]) -> Vec<SysInfoRow> {
+    pairs
+        .chunks(2)
+        .map(|chunk| {
+            let first = &chunk[0];
+            let second = chunk.get(1);
+            SysInfoRow {
+                c1: first.0.clone().into(),
+                c2: first.1.clone().into(),
+                c3: second.map(|p| p.0.clone()).unwrap_or_default().into(),
+                c4: second.map(|p| p.1.clone()).unwrap_or_default().into(),
+                c5: "".into(),
+            }
+        })
+        .collect()
+}
+
+fn pairs_to_one_row(pairs: &[(String, String)]) -> Vec<SysInfoRow> {
+    let value = |idx: usize| {
+        pairs
+            .get(idx)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "-".to_string())
+    };
+    vec![SysInfoRow {
+        c1: value(0).into(),
+        c2: value(1).into(),
+        c3: value(2).into(),
+        c4: value(3).into(),
+        c5: value(4).into(),
+    }]
+}
+
+fn pairs_to_rows(pairs: &[(String, String)], width: usize) -> Vec<SysInfoRow> {
+    pairs
+        .chunks(width)
+        .filter(|chunk| chunk.iter().any(|(_, v)| !v.trim().is_empty() && v.trim() != "-"))
+        .map(|chunk| {
+            let value = |idx: usize| {
+                chunk
+                    .get(idx)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            SysInfoRow {
+                c1: value(0).into(),
+                c2: value(1).into(),
+                c3: value(2).into(),
+                c4: value(3).into(),
+                c5: value(4).into(),
+            }
+        })
+        .collect()
+}
+
+fn cpu_usage_detail_rows(pairs: &[(String, String)]) -> Vec<SysInfoRow> {
+    let value = |idx: usize| {
+        pairs
+            .get(idx)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "0.0%".to_string())
+    };
+    let extra = pairs
+        .iter()
+        .skip(4)
+        .map(|(k, v)| format!("{k} {v}"))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    vec![SysInfoRow {
+        c1: value(0).into(),
+        c2: value(2).into(),
+        c3: value(1).into(),
+        c4: value(3).into(),
+        c5: extra.into(),
+    }]
+}
+
+fn tuple5_rows(rows: &[(String, String, String, String, String)]) -> Vec<SysInfoRow> {
+    rows.iter()
+        .map(|r| SysInfoRow {
+            c1: r.0.clone().into(),
+            c2: r.1.clone().into(),
+            c3: r.2.clone().into(),
+            c4: r.3.clone().into(),
+            c5: r.4.clone().into(),
+        })
+        .collect()
+}
+
+fn nonempty_or_dash(value: impl Into<String>) -> String {
+    let value = value.into();
+    if value.trim().is_empty() {
+        "-".to_string()
+    } else {
+        value
+    }
+}
+
+fn local_hardware_info() -> &'static LocalHardwareInfo {
+    static INFO: OnceLock<LocalHardwareInfo> = OnceLock::new();
+    INFO.get_or_init(|| {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_all();
+        let first_cpu = sys.cpus().first();
+        let mut info = LocalHardwareInfo {
+            os: sysinfo::System::long_os_version()
+                .or_else(sysinfo::System::name)
+                .unwrap_or_else(|| std::env::consts::OS.to_string()),
+            kernel: sysinfo::System::name().unwrap_or_else(|| std::env::consts::FAMILY.to_string()),
+            kernel_version: sysinfo::System::kernel_version().unwrap_or_default(),
+            arch: std::env::consts::ARCH.to_string(),
+            hostname: sysinfo::System::host_name().unwrap_or_default(),
+            cpu_name: first_cpu
+                .map(|cpu| cpu.brand().to_string())
+                .unwrap_or_default(),
+            cpu_vendor: first_cpu
+                .map(|cpu| cpu.vendor_id().to_string())
+                .unwrap_or_default(),
+            cpu_cores: sys.cpus().len().to_string(),
+            cpu_frequency: first_cpu
+                .map(|cpu| {
+                    let mhz = cpu.frequency();
+                    if mhz == 0 {
+                        String::new()
+                    } else if mhz >= 1000 {
+                        format!("{:.2} GHz", mhz as f64 / 1000.0)
+                    } else {
+                        format!("{mhz} MHz")
+                    }
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        fill_local_gpu_info(&mut info);
+        info
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn fill_local_gpu_info(info: &mut LocalHardwareInfo) {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "$controllers = @(Get-CimInstance Win32_VideoController | Select-Object Name,AdapterCompatibility,DriverVersion,AdapterRAM); $regs = @(Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue; if ($p.DriverDesc) { [pscustomobject]@{ Name=$p.DriverDesc; Vendor=$p.ProviderName; Driver=$p.DriverVersion; Memory=$p.'HardwareInformation.qwMemorySize' } } }); [pscustomobject]@{ Controllers=$controllers; Registry=$regs } | ConvertTo-Json -Compress -Depth 4",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return;
+    };
+    let registry_values = value
+        .get("Registry")
+        .map(json_values)
+        .unwrap_or_default();
+    let controller_values = value
+        .get("Controllers")
+        .map(json_values)
+        .unwrap_or_else(|| json_values(&value));
+    let registry_gpus: Vec<LocalGpuInfo> = registry_values
+        .iter()
+        .filter_map(gpu_from_registry_json)
+        .collect();
+    info.gpus = controller_values
+        .iter()
+        .filter_map(|gpu| {
+            let get_str = |key: &str| {
+                gpu.get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            };
+            let name = get_str("Name");
+            if name.is_empty() {
+                return None;
+            }
+            let matched = registry_gpus
+                .iter()
+                .find(|item| item.name.eq_ignore_ascii_case(&name))
+                .or_else(|| {
+                    registry_gpus
+                        .iter()
+                        .find(|item| !item.name.is_empty() && name.contains(&item.name))
+                });
+            Some(LocalGpuInfo {
+                name,
+                vendor: nonempty_prefer(
+                    matched.map(|item| item.vendor.as_str()).unwrap_or_default(),
+                    &get_str("AdapterCompatibility"),
+                ),
+                driver: nonempty_prefer(
+                    matched.map(|item| item.driver.as_str()).unwrap_or_default(),
+                    &get_str("DriverVersion"),
+                ),
+                memory: nonempty_prefer(
+                    matched.map(|item| item.memory.as_str()).unwrap_or_default(),
+                    &gpu
+                        .get("AdapterRAM")
+                        .and_then(|v| v.as_u64())
+                        .filter(|bytes| *bytes > 0)
+                        .map(format_size)
+                        .unwrap_or_default(),
+                ),
+            })
+        })
+        .collect();
+}
+
+#[cfg(target_os = "windows")]
+fn json_values(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    if let Some(items) = value.as_array() {
+        items.clone()
+    } else if value.is_null() {
+        Vec::new()
+    } else {
+        vec![value.clone()]
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn nonempty_prefer(primary: &str, fallback: &str) -> String {
+    if primary.trim().is_empty() {
+        fallback.trim().to_string()
+    } else {
+        primary.trim().to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn gpu_from_registry_json(gpu: &serde_json::Value) -> Option<LocalGpuInfo> {
+    let get_str = |key: &str| {
+        gpu.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let name = get_str("Name");
+    if name.is_empty() {
+        return None;
+    }
+    Some(LocalGpuInfo {
+        name,
+        vendor: get_str("Vendor"),
+        driver: get_str("Driver"),
+        memory: gpu
+            .get("Memory")
+            .and_then(|v| {
+                v.as_u64().or_else(|| {
+                    v.as_array().and_then(|bytes| {
+                        let mut raw = [0u8; 8];
+                        let mut any = false;
+                        for (idx, b) in bytes.iter().take(8).enumerate() {
+                            if let Some(n) = b.as_u64() {
+                                raw[idx] = n as u8;
+                                any = true;
+                            }
+                        }
+                        any.then(|| u64::from_le_bytes(raw))
+                    })
+                })
+            })
+            .filter(|bytes| *bytes > 0)
+            .map(format_size)
+            .unwrap_or_default(),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn fill_local_gpu_info(_info: &mut LocalHardwareInfo) {}
+
+fn local_system_details(snap: &SystemSnapshot) -> SystemDetails {
+    let mem_used = snap.mem_used_mib.saturating_mul(1024 * 1024);
+    let mem_total = snap.mem_total_mib.saturating_mul(1024 * 1024);
+    let swap_used = snap.swap_used_mib.saturating_mul(1024 * 1024);
+    let swap_total = snap.swap_total_mib.saturating_mul(1024 * 1024);
+    let info = local_hardware_info();
+    SystemDetails {
+        overview: vec![
+            (t("操作系统", "Operating system").to_string(), nonempty_or_dash(&info.os)),
+            (
+                t("内核版本", "Kernel version").to_string(),
+                nonempty_or_dash(&info.kernel_version),
+            ),
+            (t("主机名称", "Hostname").to_string(), nonempty_or_dash(&info.hostname)),
+            (t("内核", "Kernel").to_string(), nonempty_or_dash(&info.kernel)),
+            (t("硬件架构", "Architecture").to_string(), nonempty_or_dash(&info.arch)),
+            (t("连接", "Connection").to_string(), t("本机", "Local").to_string()),
+        ],
+        cpu_info: vec![
+            (t("名称", "Name").to_string(), nonempty_or_dash(&info.cpu_name)),
+            (t("核心数", "Cores").to_string(), nonempty_or_dash(&info.cpu_cores)),
+            (t("频率", "Frequency").to_string(), nonempty_or_dash(&info.cpu_frequency)),
+            (t("缓存", "Cache").to_string(), "-".to_string()),
+            ("BogoMips".to_string(), nonempty_or_dash(&info.cpu_vendor)),
+        ],
+        gpu_info: info
+            .gpus
+            .iter()
+            .flat_map(|gpu| {
+                [
+                    (t("名称", "Name").to_string(), nonempty_or_dash(&gpu.name)),
+                    (t("厂商", "Vendor").to_string(), nonempty_or_dash(&gpu.vendor)),
+                    (t("驱动", "Driver").to_string(), nonempty_or_dash(&gpu.driver)),
+                    (t("内存", "Memory").to_string(), nonempty_or_dash(&gpu.memory)),
+                ]
+            })
+            .collect(),
+        cpu_usage: vec![
+            (t("用户", "User").to_string(), format!("{:.1}%", snap.cpu_percent * 100.0)),
+            ("Nice".to_string(), "-".to_string()),
+            (t("系统", "System").to_string(), "-".to_string()),
+            (t("空闲", "Idle").to_string(), "-".to_string()),
+        ],
+        memory: vec![
+            (t("总计", "Total").to_string(), format_size(mem_total)),
+            (t("已使用", "Used").to_string(), format_size(mem_used)),
+            (
+                t("剩余", "Free").to_string(),
+                format_size(mem_total.saturating_sub(mem_used)),
+            ),
+            (t("已用", "Usage").to_string(), format!("{:.1}%", snap.mem_percent * 100.0)),
+            (t("缓存", "Cached").to_string(), "-".to_string()),
+        ],
+        swap: vec![
+            (t("总计", "Total").to_string(), format_size(swap_total)),
+            (t("已使用", "Used").to_string(), format_size(swap_used)),
+            (
+                t("剩余", "Free").to_string(),
+                format_size(swap_total.saturating_sub(swap_used)),
+            ),
+            (t("已用", "Usage").to_string(), format!("{:.1}%", snap.swap_percent * 100.0)),
+        ],
+        networks: vec![(
+            t("本机", "Local").to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            format_bytes_per_sec(snap.net_tx_per_sec),
+            format_bytes_per_sec(snap.net_rx_per_sec),
+        )],
+        filesystems: snap
+            .disks
+            .iter()
+            .map(|(mount, avail, total)| {
+                let used = total.saturating_sub(*avail);
+                let pct = if *total == 0 {
+                    "-".to_string()
+                } else {
+                    format!("{:.1}%", used as f64 * 100.0 / *total as f64)
+                };
+                (
+                    mount.clone(),
+                    format_size(*total),
+                    pct,
+                    format_size(*avail),
+                    mount.clone(),
+                )
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod process_row_tests {
     use super::{proc_rows, ProcInfo};
@@ -4222,6 +4844,52 @@ mod process_row_tests {
         assert_eq!(rows[0].mem.as_str(), "-");
         assert_eq!(rows[0].cpu_frac, 0.0);
     }
+
+}
+
+fn sync_system_info_theme(main: &AppWindow, sys: &SystemInfoWindow) {
+    sys.set_dark_mode(main.get_dark_mode());
+    sys.set_ui_scale(main.get_ui_scale());
+    sys.set_ui_font_family(main.get_ui_font_family());
+    sys.set_wallpaper_img(main.get_wallpaper_img());
+    sys.set_wallpaper_active(main.get_wallpaper_active());
+    sys.set_wp_accent(main.get_wp_accent());
+    sys.set_wp_tint(main.get_wp_tint());
+}
+
+fn place_system_info_window(main: &AppWindow, sys: &SystemInfoWindow) {
+    use i_slint_backend_winit::winit::dpi::{LogicalPosition, LogicalSize};
+
+    let Some((mon_x, mon_y, mon_w, mon_h, scale)) = main
+        .window()
+        .with_winit_window(|ww| {
+            let scale = ww.scale_factor().max(0.01);
+            let monitor = ww.current_monitor().or_else(|| ww.primary_monitor())?;
+            let pos = monitor.position();
+            let size = monitor.size();
+            Some((
+                pos.x as f64 / scale,
+                pos.y as f64 / scale,
+                size.width as f64 / scale,
+                size.height as f64 / scale,
+                scale,
+            ))
+        })
+        .flatten()
+    else {
+        return;
+    };
+
+    let target_w = (mon_w * 0.5).clamp(760.0, (mon_w - 24.0).max(760.0));
+    let target_h = (mon_h * 0.5).clamp(520.0, (mon_h - 24.0).max(520.0));
+    let x = mon_x + (mon_w - target_w).max(0.0) / 2.0;
+    let y = mon_y + (mon_h - target_h).max(0.0) / 2.0;
+
+    sys.window().with_winit_window(|ww| {
+        let _ = ww.request_inner_size(LogicalSize::new(target_w, target_h));
+        ww.set_outer_position(LogicalPosition::new(x, y));
+        let _ = scale; // documents that all values above are already logical.
+    });
 }
 
 /// Persist the current panel docking layout (both panels' edge + size) and the
@@ -5011,6 +5679,94 @@ fn refresh_sidebar(
             vm.set_vec(proc_rows(procs));
         }
     };
+    let set_system_models =
+        |win: &AppWindow,
+         cpu: f32,
+         mem: f32,
+         swap: f32,
+         mem_detail: SharedString,
+         swap_detail: SharedString,
+         nets: Vec<SysNetRow>,
+         disks: Vec<DiskInfo>,
+         sys: SystemDetails| {
+            if let Some(vm) = win
+                .get_sys_metrics()
+                .as_any()
+                .downcast_ref::<VecModel<SysMetricRow>>()
+            {
+                vm.set_vec(metric_rows(cpu, mem, swap, mem_detail, swap_detail));
+            }
+            if let Some(vm) = win
+                .get_sys_net_rows()
+                .as_any()
+                .downcast_ref::<VecModel<SysNetRow>>()
+            {
+                vm.set_vec(nets);
+            }
+            if let Some(vm) = win
+                .get_sys_disks()
+                .as_any()
+                .downcast_ref::<VecModel<DiskInfo>>()
+            {
+                vm.set_vec(disks);
+            }
+            if let Some(vm) = win
+                .get_sys_overview_rows()
+                .as_any()
+                .downcast_ref::<VecModel<SysInfoRow>>()
+            {
+                vm.set_vec(pairs_to_overview_rows(&sys.overview));
+            }
+            if let Some(vm) = win
+                .get_sys_cpu_info_rows()
+                .as_any()
+                .downcast_ref::<VecModel<SysInfoRow>>()
+            {
+                vm.set_vec(pairs_to_one_row(&sys.cpu_info));
+            }
+            if let Some(vm) = win
+                .get_sys_gpu_info_rows()
+                .as_any()
+                .downcast_ref::<VecModel<SysInfoRow>>()
+            {
+                vm.set_vec(pairs_to_rows(&sys.gpu_info, 4));
+            }
+            if let Some(vm) = win
+                .get_sys_cpu_usage_rows()
+                .as_any()
+                .downcast_ref::<VecModel<SysInfoRow>>()
+            {
+                vm.set_vec(cpu_usage_detail_rows(&sys.cpu_usage));
+            }
+            if let Some(vm) = win
+                .get_sys_memory_rows()
+                .as_any()
+                .downcast_ref::<VecModel<SysInfoRow>>()
+            {
+                vm.set_vec(pairs_to_one_row(&sys.memory));
+            }
+            if let Some(vm) = win
+                .get_sys_swap_rows()
+                .as_any()
+                .downcast_ref::<VecModel<SysInfoRow>>()
+            {
+                vm.set_vec(pairs_to_one_row(&sys.swap));
+            }
+            if let Some(vm) = win
+                .get_sys_network_rows()
+                .as_any()
+                .downcast_ref::<VecModel<SysInfoRow>>()
+            {
+                vm.set_vec(tuple5_rows(&sys.networks));
+            }
+            if let Some(vm) = win
+                .get_sys_filesystem_rows()
+                .as_any()
+                .downcast_ref::<VecModel<SysInfoRow>>()
+            {
+                vm.set_vec(tuple5_rows(&sys.filesystems));
+            }
+        };
     win.set_proc_available(false);
     set_procs(win, &[]);
 
@@ -5059,6 +5815,17 @@ fn refresh_sidebar(
             win.set_disks(disk_model(&st.disks));
             win.set_proc_available(true);
             set_procs(win, &st.procs);
+            set_system_models(
+                win,
+                st.cpu,
+                pct(st.mem_used_kib, st.mem_total_kib),
+                pct(st.swap_used_kib, st.swap_total_kib),
+                format_mem(st.mem_used_kib / 1024, st.mem_total_kib / 1024).into(),
+                format_mem(st.swap_used_kib / 1024, st.swap_total_kib / 1024).into(),
+                net_rows(&st.net),
+                disk_rows(&st.disks),
+                st.sys.clone(),
+            );
         }
         // Disconnected / timed-out session.
         Some(st) if st.state == 2 => {
@@ -5068,6 +5835,17 @@ fn refresh_sidebar(
             win.set_resource_title(t("服务器资源", "Server resources").into());
             clear_stats(win);
             set_top_local(win);
+            set_system_models(
+                win,
+                0.0,
+                0.0,
+                0.0,
+                "".into(),
+                "".into(),
+                Vec::new(),
+                disk_rows(&snap.disks),
+                local_system_details(&snap),
+            );
         }
         // Still connecting.
         Some(st) => {
@@ -5077,6 +5855,17 @@ fn refresh_sidebar(
             win.set_resource_title(t("服务器资源", "Server resources").into());
             clear_stats(win);
             set_top_local(win);
+            set_system_models(
+                win,
+                0.0,
+                0.0,
+                0.0,
+                "".into(),
+                "".into(),
+                Vec::new(),
+                disk_rows(&snap.disks),
+                local_system_details(&snap),
+            );
         }
         // Welcome tab (or unknown) → local machine top + bottom.
         None => {
@@ -5085,6 +5874,21 @@ fn refresh_sidebar(
             win.set_conn_host("".into());
             show_local_res(win);
             set_top_local(win);
+            set_system_models(
+                win,
+                snap.cpu_percent,
+                snap.mem_percent,
+                snap.swap_percent,
+                format_mem(snap.mem_used_mib, snap.mem_total_mib).into(),
+                format_mem(snap.swap_used_mib, snap.swap_total_mib).into(),
+                vec![SysNetRow {
+                    name: t("本机", "Local").into(),
+                    up: format_bytes_per_sec(snap.net_tx_per_sec).into(),
+                    down: format_bytes_per_sec(snap.net_rx_per_sec).into(),
+                }],
+                disk_rows(&snap.disks),
+                local_system_details(&snap),
+            );
         }
     }
 }
@@ -5219,6 +6023,7 @@ fn apply_session_event_to_window(
             net,
             disks,
             procs,
+            sys,
         } => {
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.cpu = cpu_percent;
@@ -5229,6 +6034,7 @@ fn apply_session_event_to_window(
                 st.net = net;
                 st.disks = disks;
                 st.procs = procs;
+                st.sys = sys;
                 // A sample means the channel is alive → treat as connected.
                 if st.state != 1 {
                     st.state = 1;
@@ -7592,6 +8398,7 @@ fn wire_key_input(
                             b.view_offset = 0;
                             b.sel_anchor = None;
                             b.sel_focus = None;
+                            b.sel_ranges.clear();
                             b.raw.clear();
                         }
                     }
@@ -7925,6 +8732,7 @@ fn wire_key_input(
     // Middle-click / Ctrl+Shift+V: paste clipboard text into PTY.
     {
         let handles = handles.clone();
+        let weak = window.as_weak();
         window.on_paste_from_clipboard(move |tab_id: SharedString| {
             // Clone the (Send) command sender for this tab so the clipboard read
             // can run off the UI thread.  Reading arboard on the event-loop
@@ -7935,20 +8743,62 @@ fn wire_key_input(
                 .get(tab_id.as_str())
                 .map(|h| h.commands.clone());
             let Some(sender) = sender else { return };
+            let weak = weak.clone();
+            let tab_id = tab_id.to_string();
             std::thread::spawn(move || {
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
-                        // Normalise line endings to a single CR so multi-line and
-                        // backslash-continued commands paste correctly (see the
-                        // function doc for the failure mode this prevents).
-                        let bytes = normalize_pasted_newlines(&text).into_bytes();
-                        let _ = sender.send(SessionCommand::RawInput(bytes));
+                        if text.contains(['\r', '\n']) {
+                            let preview: String = text.chars().take(1200).collect();
+                            let truncated = text.chars().count() > 1200;
+                            let preview = if truncated {
+                                format!("{preview}\n…")
+                            } else {
+                                preview
+                            };
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(w) = weak.upgrade() {
+                                    w.set_paste_confirm_tab(tab_id.into());
+                                    w.set_paste_confirm_text(text.into());
+                                    w.set_paste_confirm_preview(preview.into());
+                                    w.set_paste_confirm_open(true);
+                                }
+                            });
+                        } else {
+                            // Normalise line endings to a single CR so the
+                            // terminal receives the same input on every OS.
+                            let bytes = normalize_pasted_newlines(&text).into_bytes();
+                            let _ = sender.send(SessionCommand::RawInput(bytes));
+                        }
                     }
                     Err(e) => tracing::warn!("paste_from_clipboard: clipboard error: {}", e),
                 }
             });
         });
     }
+
+    // Accept a previously reviewed multi-line paste (#262).
+    {
+        let handles_paste = handles.clone();
+        let weak = window.as_weak();
+        window.on_paste_confirmed(move |tab_id: SharedString| {
+            let Some(sender) = handles_paste
+                .borrow()
+                .get(tab_id.as_str())
+                .map(|h| h.commands.clone())
+            else {
+                return;
+            };
+            let Some(w) = weak.upgrade() else { return };
+            let text = w.get_paste_confirm_text().to_string();
+            let _ = sender.send(SessionCommand::RawInput(
+                normalize_pasted_newlines(&text).into_bytes(),
+            ));
+            w.set_paste_confirm_open(false);
+        });
+    }
+
+    window.on_paste_confirm_cancelled(|| {});
 
     // Context menu → 清空缓存: reset the local vt100 buffer (drops scrollback),
     // wipe the displayed screen, then nudge the remote to redraw a fresh prompt.
@@ -7968,6 +8818,7 @@ fn wire_key_input(
                 buf.view_offset = 0;
                 buf.sel_anchor = None;
                 buf.sel_focus = None;
+                buf.sel_ranges.clear();
                 buf.displayed_text = Vec::new();
                 buf.raw.clear();
             }
@@ -8110,7 +8961,7 @@ fn wire_key_input(
     {
         let bufs_sel = bufs.clone();
         let weak = window.as_weak();
-        window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32| {
+        window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32, ctrl: bool, shift: bool| {
             let tid = tab_id.to_string();
             with_term_buf(&bufs_sel, &tid, |buf| {
                 let (rows, cols) = buf.parser.screen().size();
@@ -8118,8 +8969,21 @@ fn wire_key_input(
                 let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
                 // Anchor + focus in absolute scrollback coordinates.
                 let abs = buf.vis_to_abs(r);
-                buf.sel_anchor = Some((abs, c));
-                buf.sel_focus = Some((abs, c));
+                let point = (abs, c);
+                if ctrl && !shift {
+                    buf.sel_ranges.push((point, point));
+                } else if shift && !buf.sel_ranges.is_empty() {
+                    let anchor = buf.sel_ranges.last().map(|range| range.0).unwrap_or(point);
+                    if let Some(range) = buf.sel_ranges.last_mut() {
+                        *range = (anchor, point);
+                    }
+                } else {
+                    buf.sel_ranges.clear();
+                    buf.sel_ranges.push((point, point));
+                }
+                let (anchor, focus) = buf.sel_ranges.last().copied().unwrap_or((point, point));
+                buf.sel_anchor = Some(anchor);
+                buf.sel_focus = Some(focus);
             });
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_sel, &tid);
@@ -8138,6 +9002,9 @@ fn wire_key_input(
                 if buf.sel_anchor.is_some() {
                     let abs = buf.vis_to_abs(r);
                     buf.sel_focus = Some((abs, c));
+                    if let Some(range) = buf.sel_ranges.last_mut() {
+                        range.1 = (abs, c);
+                    }
                 }
             });
             if let Some(win) = weak.upgrade() {
@@ -8158,6 +9025,7 @@ fn wire_key_input(
                     // Zero-area selection (a plain click) → clear it.
                     buf.sel_anchor = None;
                     buf.sel_focus = None;
+                    buf.sel_ranges.clear();
                     None
                 } else {
                     Some(extracted)
@@ -8224,6 +9092,9 @@ fn wire_key_input(
                 };
                 let abs = buf.vis_to_abs(edge_vis);
                 buf.sel_focus = Some((abs, focus_col));
+                if let Some(range) = buf.sel_ranges.last_mut() {
+                    range.1 = (abs, focus_col);
+                }
             }
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_sel, &tid);
@@ -9193,40 +10064,50 @@ impl TermBuffer {
     /// Highlight rectangles for the current selection, clipped to the visible
     /// window of the current view.
     fn selection_rects_visible(&self, cols: u16) -> Vec<TermMatch> {
-        let (Some((ar, ac)), Some((fr, fc))) = (self.sel_anchor, self.sel_focus) else {
-            return Vec::new();
-        };
-        let (lo_r, lo_c, hi_r, hi_c) = if (ar, ac) <= (fr, fc) {
-            (ar, ac, fr, fc)
+        let ranges = if self.sel_ranges.is_empty() {
+            match (self.sel_anchor, self.sel_focus) {
+                (Some(anchor), Some(focus)) => vec![(anchor, focus)],
+                _ => Vec::new(),
+            }
         } else {
-            (fr, fc, ar, ac)
+            self.sel_ranges.clone()
         };
-        if (lo_r, lo_c) == (hi_r, hi_c) {
+        if ranges.is_empty() {
             return Vec::new();
         }
         let (_, live_used) = self.live_rows();
         let top = self.view_top_abs(live_used);
         let rows = self.parser.screen().size().0;
         let mut out = Vec::new();
-        for vis in 0..rows {
-            let abs = top + vis as usize;
-            if abs < lo_r || abs > hi_r {
+        for ((ar, ac), (fr, fc)) in ranges {
+            let (lo_r, lo_c, hi_r, hi_c) = if (ar, ac) <= (fr, fc) {
+                (ar, ac, fr, fc)
+            } else {
+                (fr, fc, ar, ac)
+            };
+            if (lo_r, lo_c) == (hi_r, hi_c) {
                 continue;
             }
-            let (c0, c1) = if abs == lo_r && abs == hi_r {
-                (lo_c.min(hi_c), lo_c.max(hi_c))
-            } else if abs == lo_r {
-                (lo_c, cols.saturating_sub(1))
-            } else if abs == hi_r {
-                (0, hi_c)
-            } else {
-                (0, cols.saturating_sub(1))
-            };
-            out.push(TermMatch {
-                row: vis as i32,
-                col: c0 as i32,
-                len: (c1.saturating_sub(c0) + 1) as i32,
-            });
+            for vis in 0..rows {
+                let abs = top + vis as usize;
+                if abs < lo_r || abs > hi_r {
+                    continue;
+                }
+                let (c0, c1) = if abs == lo_r && abs == hi_r {
+                    (lo_c.min(hi_c), lo_c.max(hi_c))
+                } else if abs == lo_r {
+                    (lo_c, cols.saturating_sub(1))
+                } else if abs == hi_r {
+                    (0, hi_c)
+                } else {
+                    (0, cols.saturating_sub(1))
+                };
+                out.push(TermMatch {
+                    row: vis as i32,
+                    col: c0 as i32,
+                    len: (c1.saturating_sub(c0) + 1) as i32,
+                });
+            }
         }
         out
     }
@@ -9264,9 +10145,30 @@ impl TermBuffer {
     /// Extract the selected text from the combined buffer (whole selection,
     /// even the parts currently scrolled out of view).
     fn extract_selection_text(&self) -> String {
-        let (Some((ar, ac)), Some((fr, fc))) = (self.sel_anchor, self.sel_focus) else {
-            return String::new();
+        let ranges = if self.sel_ranges.is_empty() {
+            match (self.sel_anchor, self.sel_focus) {
+                (Some(anchor), Some(focus)) => vec![(anchor, focus)],
+                _ => Vec::new(),
+            }
+        } else {
+            self.sel_ranges.clone()
         };
+        if ranges.is_empty() {
+            return String::new();
+        }
+        ranges
+            .iter()
+            .map(|&(anchor, focus)| self.extract_range_text(anchor, focus))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn extract_range_text(
+        &self,
+        (ar, ac): (usize, u16),
+        (fr, fc): (usize, u16),
+    ) -> String {
         let (lo_r, lo_c, hi_r, hi_c) = if (ar, ac) <= (fr, fc) {
             (ar, ac, fr, fc)
         } else {
@@ -9400,6 +10302,7 @@ impl TermBuffer {
         // Scrollback line count changes, so absolute selection coords no longer map.
         self.sel_anchor = None;
         self.sel_focus = None;
+        self.sel_ranges.clear();
         self.feed_batched(&stream);
     }
 
@@ -10108,6 +11011,7 @@ mod selection_tests {
             is_dark: false,
             sel_anchor: None,
             sel_focus: None,
+            sel_ranges: Vec::new(),
             history: history.iter().map(|s| hist_line(s)).collect(),
             prev: Vec::new(),
             view_offset,

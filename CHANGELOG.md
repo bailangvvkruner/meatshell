@@ -3,6 +3,35 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（中文在前，English after）.
 
+## [0.6.2]
+
+### 新增 / Added
+
+- **新增终端字体加粗开关 (#262)。** 设置 → 字体新增“终端字体加粗”，可将普通终端输出强制渲染为加粗字重，并会随配置持久化；ANSI 自带粗体仍然照常生效。
+- **新增详细系统信息窗口。** 点击侧栏“服务器资源 / 本机资源”标题或信息按钮可打开独立窗口，按概览、CPU、GPU、CPU 占用、内存、交换、网络接口与文件系统分区展示当前资源来源的详细状态，并跟随侧栏数据实时刷新。
+- **新增本地终端入口。** 快速连接列表新增内置 `system` 分组，可直接打开本机 PowerShell、CMD、WSL（Windows 可用时）或当前系统 Shell；内置项不写入配置，也不允许编辑、删除或移动分组。
+
+### 修复 / Fixed
+
+- **修复 SFTP 文件列表下方出现大块空白的问题 (#259)。** “文件 / 隧道”两个内容区改为互斥渲染，隐藏的隧道面板不再继续占用 SFTP 面板布局高度，文件列表可用空间恢复正常。
+- **修复 oh-my-zsh 首屏显示 shell integration 注入命令的问题 (#257)。** 连接 zsh/oh-my-zsh 服务器时，隐藏注入命令回显的逻辑现在能处理 `\r` 与软换行，并优先按注入命令尾部定位删除范围，避免 `test -z "$FISH_VERSION" ...` 泄露到终端首屏。
+
+---
+
+### Added
+
+- **Add a bold terminal text option (#262).** Settings → Font now includes a bold terminal text toggle that persists in the config and forces regular terminal output to render with a bold face while preserving ANSI bold behavior.
+- **Add Ctrl multi-selection and Shift range extension in the terminal (#262).** Hold Ctrl to add separate selection ranges and Shift to extend the active range; copied text preserves selection order.
+- **Add a multi-line paste safety prompt (#262).** Clipboard content containing line breaks now requires explicit review and confirmation before it is sent to the terminal.
+- **Collapse the built-in system terminal group by default.** WSL is listed only when `wsl.exe --status` reports that WSL is available.
+- **Add a server resource details window.** Clicking the sidebar “Server resources / Local resources” title or info button opens a detached system-information window with CPU, memory, swap, network, and filesystem status that updates with the sidebar data.
+
+### Fixed
+
+- **Fix the long shell-integration setup command appearing after SSH login (#266).** Late-echoed initialization commands are now filtered even when they arrive after the initial connection-output suppression window.
+- **Fix a large blank area under the SFTP file list (#259).** The Files / Tunnels content panes now render mutually exclusively, so the hidden tunnel panel no longer consumes SFTP panel layout height and the file list regains its available space.
+- **Fix shell-integration setup echo leaking on oh-my-zsh servers (#257).** When connecting to zsh/oh-my-zsh hosts, the setup-echo suppression now handles `\r` and soft-wrapped output and anchors removal on the setup command suffix, preventing the `test -z "$FISH_VERSION" ...` command from appearing on the first terminal screen.
+
 ## [0.6.1] - 2026-07-11
 
 ### 新增 / Added

@@ -110,6 +110,7 @@ export component TerminalView inherits Rectangle {
     in property <[TabInfo]> sftp-transfer-targets: [];
     in property <string> sftp-sort-key: "";
     in property <int> sftp-sort-dir: 0;
+    in property <bool> sftp-available: true;
     in property <[TunnelInfo]> tunnels: [];
 
     // Per-session now (#v0.5): the AppWindow stores these in each TerminalState
@@ -208,7 +209,7 @@ export component TerminalView inherits Rectangle {
     // arrow keys (alternate-scroll).
     callback terminal-wheel(int /* dir */, int /* col */, int /* row */);
     callback terminal-scroll-to(int);       // jump to an absolute scrollback offset (#103)
-    callback select-start(int, int);        // begin drag-selection at (row, col)
+    callback select-start(int, int, bool, bool); // row, col, ctrl, shift
     callback select-update(int, int);       // extend drag-selection to (row, col)
     callback select-end();                  // finish selection → copy to clipboard
     callback select-autoscroll(int);        // auto-scroll while dragging past edge (dir: -1 up / +1 down)
@@ -253,6 +254,7 @@ export component TerminalView inherits Rectangle {
         text: "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM"; // exactly 50×M
         font-family: Theme.term-font-family;
         font-size: Theme.term-font-size;
+        font-weight: Theme.term-font-bold ? 700 : 400;
         // Keep it in layout but invisible: opacity:0 forces full font loading.
         opacity: 0;
         // Park it at y<0 so it never overlaps terminal content.
@@ -473,7 +475,9 @@ export component TerminalView inherits Rectangle {
                                         root.selecting = true;
                                         root.select-start(
                                             floor(self.mouse-y / root.cell-h),
-                                            floor(self.mouse-x / root.cell-w));
+                                            floor(self.mouse-x / root.cell-w),
+                                            ev.modifiers.control,
+                                            ev.modifiers.shift);
                                     }
                                 } else if (ev.kind == PointerEventKind.up) {
                                     if (ev.button == PointerEventButton.middle) {
@@ -578,7 +582,7 @@ export component TerminalView inherits Rectangle {
                                 // *isolated* CJK punctuation (、。,) on fallback (#54).
                                 font-family: span.cjk ? Theme.ui-font-family : Theme.term-font-family;
                                 font-size: Theme.term-font-size;
-                                font-weight: span.bold ? 700 : 400;
+                                font-weight: (Theme.term-font-bold || span.bold) ? 700 : 400;
                             }
                         }
 
@@ -618,7 +622,9 @@ export component TerminalView inherits Rectangle {
                                         root.selecting = true;
                                         root.select-start(
                                             floor(self.mouse-y / root.cell-h),
-                                            floor(self.mouse-x / root.cell-w));
+                                            floor(self.mouse-x / root.cell-w),
+                                            ev.modifiers.control,
+                                            ev.modifiers.shift);
                                     }
                                 } else if (ev.kind == PointerEventKind.up) {
                                     if (ev.button == PointerEventButton.middle) {
@@ -1477,7 +1483,7 @@ export component TerminalView inherits Rectangle {
 
         // --- SFTP resize splitter (orientation follows the dock edge) -------
         Rectangle {
-            visible: !root.sftp-collapsed;   // gone when collapsed (like the resource splitter)
+            visible: root.sftp-available && !root.sftp-collapsed;   // gone when collapsed (like the resource splitter)
             x: root.sftp-dock == "left"   ? parent.sf-w
              : root.sftp-dock == "right"  ? parent.width - parent.sf-w - 4px
              : 0px;
@@ -1532,7 +1538,7 @@ export component TerminalView inherits Rectangle {
         }
 
         // --- SFTP panel — positioned on the docked edge ---------------------
-        SftpPanel {
+        if root.sftp-available : SftpPanel {
             x: root.sftp-dock == "right"  ? parent.width - parent.sf-w : 0px;
             y: root.sftp-dock == "bottom" ? parent.height - parent.sf-h : 0px;
             width:  root.sftp-horizontal ? parent.sf-w : parent.width;
@@ -1637,7 +1643,13 @@ export component TerminalView inherits Rectangle {
             height: root.sftp-horizontal ? parent.height : parent.sf-h;
             dock-edge: root.sftp-dock;
             glyph: "\u{E2C7}";   // folder — SFTP
-            expand => { root.set-sftp-collapsed(false); }
+            tooltip: root.sftp-available ? "SFTP" : @tr("SFTP not available");
+            enabled: root.sftp-available;
+            expand => {
+                if (root.sftp-available) {
+                    root.set-sftp-collapsed(false);
+                }
+            }
         }
         }
     }

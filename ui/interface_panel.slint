@@ -180,6 +180,7 @@ export component InterfacePanel inherits Rectangle {
     in property <[string]> term-fonts;
     in property <string> term-font-family;
     in property <length> term-font-size;
+    in-out property <bool> term-font-bold;
     in property <float> ui-scale;
     in-out property <bool> sftp-follow-cd;
     in-out property <bool> collapse-sidebar-default;
@@ -213,6 +214,7 @@ export component InterfacePanel inherits Rectangle {
 
     callback set-term-font(string);
     callback set-term-font-size(int);
+    callback set-term-font-bold(bool);
     callback set-ui-scale(int);
     callback set-panel-font(int);   // settings-panel font scale, percent
     callback set-sftp-follow-cd(bool);
@@ -345,6 +347,15 @@ export component InterfacePanel inherits Rectangle {
                     }
                 }
                 SettingRow {
+                    label: root.lang-en ? "Bold terminal text" : "终端字体加粗";
+                    desc: root.lang-en ? "Makes regular terminal output use a bold face."
+                                       : "让普通终端输出使用加粗字重。";
+                    Switch {
+                        on: root.term-font-bold;
+                        toggled(v) => { root.term-font-bold = v; root.set-term-font-bold(v); }
+                    }
+                }
+                SettingRow {
                     label: root.lang-en ? "UI scale" : "界面缩放";
                     desc: root.lang-en ? "Zooms the whole interface (not this panel)."
                                        : "缩放整个界面(不影响本面板)。";
@@ -377,6 +388,7 @@ export component InterfacePanel inherits Rectangle {
                         text: "meatshell ~$ echo preview 0123";
                         font-family: Theme.term-font-family;
                         font-size: Theme.term-font-size;
+                        font-weight: Theme.term-font-bold ? 700 : 400;
                         color: Theme.term-fg;
                         vertical-alignment: center;
                         height: parent.height;

@@ -296,26 +296,53 @@ component StatsBlock inherits VerticalLayout {
     in property <float> swap-percent;
     in property <string> mem-detail;
     in property <string> swap-detail;
+    callback show-system-info();
     callback show-processes();
     callback toggle-resource-pin();
     spacing: 6px;
     HorizontalLayout {
         spacing: 6px;
-        Text { text: root.resource-title; color: Theme.text-secondary; font-size: Theme.fs-sm;
-               vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+        Rectangle {
+            height: 20px;
+            horizontal-stretch: 1;
+            border-radius: Theme.radius-sm;
+            background: sys-ta.has-hover ? Theme.bg-hover : transparent;
+            sys-ta := TouchArea { mouse-cursor: pointer; clicked => { root.show-system-info(); } }
+            Text {
+                x: 4px;
+                width: parent.width - 8px;
+                text: root.resource-title;
+                color: Theme.text-secondary;
+                font-size: Theme.fs-sm;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+        Rectangle {
+            width: 22px; height: 20px;
+            border-radius: Theme.radius-sm;
+            background: info-ta.has-hover ? Theme.bg-hover : transparent;
+            info-ta := TouchArea { mouse-cursor: pointer; clicked => { root.show-system-info(); } }
+            Text {
+                text: "\u{E88E}";
+                font-family: "Material Icons";
+                color: Theme.text-secondary;
+                font-size: Theme.fs-sm;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
         Rectangle {
             width: 20px; height: 20px;
             border-radius: Theme.radius-sm;
             background: pin-ta.has-hover || root.resource-pinned ? Theme.bg-hover : transparent;
-            pin-ta := TouchArea {
-                mouse-cursor: pointer;
-                clicked => { root.toggle-resource-pin(); }
-            }
+            pin-ta := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-resource-pin(); } }
             Text {
                 text: "\u{F10D}"; // push_pin
                 font-family: "Material Icons";
                 color: root.resource-pinned ? Theme.accent : Theme.text-secondary;
                 font-size: 14px;
+
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
@@ -445,6 +472,7 @@ export component Sidebar inherits Rectangle {
     // always matches Cargo.toml without hand-editing this file.
     in property <string> app-version;
     callback select-net-iface(string);
+    callback show-system-info();         // open the system-information window
     callback show-processes();           // open the process monitor popup (#23)
     callback toggle-resource-pin();      // keep showing the current resource source
     callback copy-host(string);          // copy the connection IP/host to clipboard (#192)
@@ -514,6 +542,7 @@ export component Sidebar inherits Rectangle {
                 proc-available: root.proc-available;
                 cpu-percent: root.cpu-percent; mem-percent: root.mem-percent; swap-percent: root.swap-percent;
                 mem-detail: root.mem-detail; swap-detail: root.swap-detail;
+                show-system-info() => { root.show-system-info(); }
                 show-processes() => { root.show-processes(); }
                 toggle-resource-pin() => { root.toggle-resource-pin(); }
             }
@@ -569,6 +598,7 @@ export component Sidebar inherits Rectangle {
                     proc-available: root.proc-available;
                     cpu-percent: root.cpu-percent; mem-percent: root.mem-percent; swap-percent: root.swap-percent;
                     mem-detail: root.mem-detail; swap-detail: root.swap-detail;
+                    show-system-info() => { root.show-system-info(); }
                     show-processes() => { root.show-processes(); }
                     toggle-resource-pin() => { root.toggle-resource-pin(); }
                 }

@@ -274,6 +274,8 @@ pub enum SessionKind {
     Serial,
     /// Plain Telnet over TCP, for legacy network gear (#17).
     Telnet,
+    /// Local shell process on this machine (PowerShell/CMD/WSL/$SHELL).
+    Local,
 }
 
 impl SessionKind {
@@ -282,6 +284,7 @@ impl SessionKind {
             SessionKind::Ssh => "ssh",
             SessionKind::Serial => "serial",
             SessionKind::Telnet => "telnet",
+            SessionKind::Local => "local",
         }
     }
 
@@ -289,6 +292,7 @@ impl SessionKind {
         match s {
             "serial" => SessionKind::Serial,
             "telnet" => SessionKind::Telnet,
+            "local" => SessionKind::Local,
             _ => SessionKind::Ssh,
         }
     }
@@ -606,6 +610,9 @@ pub struct ConfigFile {
     /// Terminal font size in px. 0 = the built-in default.
     #[serde(default)]
     pub font_size: u32,
+    /// Force regular terminal text to render with a bold face (#262).
+    #[serde(default)]
+    pub terminal_bold: bool,
     /// Global UI scale in percent (#100). 0 = default (100%).
     #[serde(default)]
     pub ui_scale: u32,
@@ -1025,6 +1032,15 @@ impl ConfigStore {
 
     pub fn set_font_size(&mut self, size: u32) {
         self.cache.font_size = size.clamp(8, 32);
+    }
+
+    /// Force regular terminal text to render with a bold face (#262).
+    pub fn terminal_bold(&self) -> bool {
+        self.cache.terminal_bold
+    }
+
+    pub fn set_terminal_bold(&mut self, bold: bool) {
+        self.cache.terminal_bold = bold;
     }
 
     /// Global UI scale in percent (#100). Defaults to 100.
