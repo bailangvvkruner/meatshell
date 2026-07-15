@@ -5317,6 +5317,60 @@ fn term_match_eq(a: &TermMatch, b: &TermMatch) -> bool {
     a.row == b.row && a.col == b.col && a.len == b.len
 }
 
+fn term_span_key(span: &TermSpan) -> (i32, i32) {
+    (span.row, span.col)
+}
+
+/// Synchronize the flat, row-major span model by grid position. A style change
+/// can split or merge one run; aligning only by vector index would then rewrite
+/// every later span even when the rest of the screen is unchanged.
+fn sync_term_span_rows(model: &ModelRc<TermSpan>, rows: &[TermSpan]) -> bool {
+    let model = model
+        .as_any()
+        .downcast_ref::<VecModel<TermSpan>>()
+        .expect("terminal display model must be a VecModel");
+    let mut model_index = 0;
+    let mut row_index = 0;
+    let mut changed = false;
+
+    while model_index < model.row_count() && row_index < rows.len() {
+        let current = model
+            .row_data(model_index)
+            .expect("terminal span index must be in bounds");
+        match term_span_key(&current).cmp(&term_span_key(&rows[row_index])) {
+            std::cmp::Ordering::Less => {
+                model.remove(model_index);
+                changed = true;
+            }
+            std::cmp::Ordering::Greater => {
+                model.insert(model_index, rows[row_index].clone());
+                model_index += 1;
+                row_index += 1;
+                changed = true;
+            }
+            std::cmp::Ordering::Equal => {
+                if !term_span_eq(&current, &rows[row_index]) {
+                    model.set_row_data(model_index, rows[row_index].clone());
+                    changed = true;
+                }
+                model_index += 1;
+                row_index += 1;
+            }
+        }
+    }
+
+    while model_index < model.row_count() {
+        model.remove(model_index);
+        changed = true;
+    }
+    if row_index < rows.len() {
+        model.extend_from_slice(&rows[row_index..]);
+        changed = true;
+    }
+
+    changed
+}
+
 /// Keep the same Slint model so repeaters retain their components, notifying
 /// only changed rows and any added/removed tail.
 fn sync_vec_model_rows<T: Clone + 'static>(
@@ -5372,7 +5426,7 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     let (smax, soff) = (b.scroll_max, b.scroll_offset);
     let mut changed = false;
     set_terminal_row(win, tab_id, |row| {
-        let model_changed = sync_vec_model_rows(&row.spans, &b.spans, term_span_eq)
+        let model_changed = sync_term_span_rows(&row.spans, &b.spans)
             | sync_vec_model_rows(&row.find_matches, &matches, term_match_eq)
             | sync_vec_model_rows(&row.selection, &sel, term_match_eq);
 
@@ -5391,9 +5445,11 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
             row.scroll_offset = soff;
         }
         changed = model_changed || scalar_changed;
-        if changed {
-            // The spans model stays pointer-stable for repeater reuse, so this
-            // signal also keeps the viewport pinned after real visual changes.
+        if changed && !alt {
+            // Normal-screen output must keep the scrollback viewport pinned.
+            // Alt-screen TUIs are already fixed at y=0; changing the outer
+            // TerminalState there would invalidate far more UI than the nested
+            // span-model notifications that already describe the real changes.
             row.render_revision = row.render_revision.wrapping_add(1);
         }
     });
@@ -5457,6 +5513,36 @@ mod terminal_model_tests {
             model.as_any().downcast_ref::<VecModel<TermSpan>>().unwrap(),
             concrete.as_ref()
         ));
+    }
+
+    #[test]
+    fn terminal_span_sync_aligns_run_splits_by_grid_position() {
+        let mut row_zero = span("row zero");
+        row_zero.row = 0;
+        row_zero.col = 0;
+        let mut row_one = span("row one");
+        row_one.row = 1;
+        row_one.col = 0;
+        let mut row_two = span("row two");
+        row_two.row = 2;
+        row_two.col = 0;
+
+        let initial = vec![row_zero.clone(), row_one.clone(), row_two.clone()];
+        let concrete = Rc::new(VecModel::from(initial));
+        let model = ModelRc::from(concrete.clone());
+
+        let mut split_left = row_zero.clone();
+        split_left.text = "row ".into();
+        split_left.cells = 4;
+        let mut split_right = row_zero;
+        split_right.text = "zero".into();
+        split_right.col = 4;
+        split_right.cells = 4;
+        let expected = vec![split_left, split_right, row_one, row_two];
+
+        assert!(sync_term_span_rows(&model, &expected));
+        assert!(model_matches(&concrete, &expected));
+        assert!(!sync_term_span_rows(&model, &expected));
     }
 
     #[test]
