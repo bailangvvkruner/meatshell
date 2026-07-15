@@ -9,6 +9,12 @@ repository = "https://github.com/your/meatshell"
 readme = "README.md"
 rust-version = "1.75"
 
+[features]
+default = []
+# Normal Windows debug builds use the GUI subsystem just like releases. Enable
+# this explicitly when a developer needs live tracing on stderr.
+dev-console = []
+
 [dependencies]
 slint = { version = "1.8", features = ["compat-1-2"] }
 # ICU4X (pulled in by Slint's text layout) spams stderr with raw `eprintln!`

@@ -79,8 +79,19 @@ enum CsiState {
     Csi,
 }
 
-/// Max UI renders per second for a tab under sustained output (#209).
-const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+/// Sustained terminal output is expensive with the Windows software renderer.
+/// Keep the existing foreground rate for responsive TUIs, while a visible
+/// background window only needs occasional updates until it regains focus.
+const RENDER_ACTIVE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+const RENDER_BACKGROUND_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+fn terminal_render_interval(window_focused: bool) -> std::time::Duration {
+    if window_focused {
+        RENDER_ACTIVE_MIN_INTERVAL
+    } else {
+        RENDER_BACKGROUND_MIN_INTERVAL
+    }
+}
 
 /// Per-tab terminal buffer — each tab has its own lock so a burst of output on
 /// one session (e.g. `unzip` listing thousands of files) doesn't block keyboard
@@ -89,7 +100,7 @@ type TermBufferHandle = Arc<Mutex<TermBuffer>>;
 type TermBuffers = Arc<Mutex<HashMap<String, TermBufferHandle>>>;
 
 /// Coalesces render requests so a firehose of output schedules at most one UI
-/// flush at a time per tab, throttled to ~30 fps (#209).
+/// flush at a time per tab, with focus-aware throttling (#209).
 struct TabRenderGate {
     state: AtomicU8,
     last_render: Mutex<std::time::Instant>,
@@ -102,7 +113,7 @@ impl TabRenderGate {
     fn new() -> Self {
         Self {
             state: AtomicU8::new(0),
-            last_render: Mutex::new(std::time::Instant::now() - RENDER_MIN_INTERVAL),
+            last_render: Mutex::new(std::time::Instant::now() - RENDER_ACTIVE_MIN_INTERVAL),
         }
     }
 
@@ -151,6 +162,18 @@ mod render_gate_tests {
 
     fn state(gate: &TabRenderGate) -> u8 {
         gate.state.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn terminal_render_rate_backs_off_when_window_is_unfocused() {
+        assert_eq!(
+            terminal_render_interval(true),
+            std::time::Duration::from_millis(33)
+        );
+        assert_eq!(
+            terminal_render_interval(false),
+            std::time::Duration::from_millis(200)
+        );
     }
 
     #[test]
@@ -386,9 +409,13 @@ fn run_coalesced_tab_render(
     };
     let Some(gate) = gate else { return };
 
+    let min_interval = weak
+        .upgrade()
+        .map(|window| terminal_render_interval(window.get_window_focused()))
+        .unwrap_or(RENDER_BACKGROUND_MIN_INTERVAL);
     let delay = {
         let last = *gate.last_render.lock().unwrap();
-        RENDER_MIN_INTERVAL.saturating_sub(last.elapsed())
+        min_interval.saturating_sub(last.elapsed())
     };
 
     let weak2 = weak.clone();
@@ -5345,14 +5372,9 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     let (smax, soff) = (b.scroll_max, b.scroll_offset);
     let mut changed = false;
     set_terminal_row(win, tab_id, |row| {
-        changed |= sync_vec_model_rows(&row.spans, &b.spans, term_span_eq);
-        changed |= sync_vec_model_rows(&row.find_matches, &matches, term_match_eq);
-        changed |= sync_vec_model_rows(&row.selection, &sel, term_match_eq);
-
-        // The spans model stays pointer-stable for repeater reuse, so explicitly
-        // preserve the old `changed spans` viewport pinning signal.
-        row.render_revision = row.render_revision.wrapping_add(1);
-        changed = true;
+        let model_changed = sync_vec_model_rows(&row.spans, &b.spans, term_span_eq)
+            | sync_vec_model_rows(&row.find_matches, &matches, term_match_eq)
+            | sync_vec_model_rows(&row.selection, &sel, term_match_eq);
 
         let scalar_changed = row.cursor_row != cr
             || row.cursor_col != cc
@@ -5367,7 +5389,12 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
             row.is_alt_screen = alt;
             row.scroll_max = smax;
             row.scroll_offset = soff;
-            changed = true;
+        }
+        changed = model_changed || scalar_changed;
+        if changed {
+            // The spans model stays pointer-stable for repeater reuse, so this
+            // signal also keeps the viewport pinned after real visual changes.
+            row.render_revision = row.render_revision.wrapping_add(1);
         }
     });
     if changed {

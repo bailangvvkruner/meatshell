@@ -1,7 +1,13 @@
 // Entry point. Wires the Slint UI to the config store, system sampler and
 // SSH session manager.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Keep normal Windows launches free of a console window in both debug and
+// release builds. `cargo run --features dev-console` restores the console for
+// development; test harnesses retain it so `cargo test` output stays visible.
+#![cfg_attr(
+    all(windows, not(test), not(feature = "dev-console")),
+    windows_subsystem = "windows"
+)]
 
 mod app;
 mod config;
