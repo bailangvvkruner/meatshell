@@ -7972,6 +7972,94 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
 // Raw keystroke forwarding and PTY resize
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalMouseEventKind {
+    Press,
+    Release,
+    Motion,
+}
+
+fn append_mouse_utf8_value(output: &mut Vec<u8>, value: u16) {
+    let mut encoded = [0u8; 4];
+    let ch = char::from_u32(u32::from(value)).expect("mouse protocol value is valid Unicode");
+    output.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+}
+
+/// Encode one xterm mouse report. `Some([])` means mouse tracking is active but
+/// this mode does not report that event (for example, release in X10 mode).
+fn encode_terminal_mouse_event(
+    screen: &vt100::Screen,
+    kind: TerminalMouseEventKind,
+    button: u16,
+    col: i32,
+    row: i32,
+    ctrl: bool,
+    alt: bool,
+) -> Option<Vec<u8>> {
+    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
+    let mode = screen.mouse_protocol_mode();
+    if mode == MouseProtocolMode::None {
+        return None;
+    }
+
+    let modifiers = u16::from(alt) * 8 + u16::from(ctrl) * 16;
+    let (button_code, release) = match kind {
+        TerminalMouseEventKind::Press => (button + modifiers, false),
+        TerminalMouseEventKind::Release => {
+            if mode == MouseProtocolMode::Press {
+                return Some(Vec::new());
+            }
+            let code = if screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr {
+                button + modifiers
+            } else {
+                3 + modifiers
+            };
+            (code, true)
+        }
+        TerminalMouseEventKind::Motion => {
+            let reports_motion = match mode {
+                MouseProtocolMode::ButtonMotion => button <= 2,
+                MouseProtocolMode::AnyMotion => true,
+                _ => false,
+            };
+            if !reports_motion {
+                return Some(Vec::new());
+            }
+            (button.min(3) + 32 + modifiers, false)
+        }
+    };
+
+    let (rows, cols) = screen.size();
+    let col = (col.clamp(0, cols.saturating_sub(1) as i32) as u16) + 1;
+    let row = (row.clamp(0, rows.saturating_sub(1) as i32) as u16) + 1;
+
+    match screen.mouse_protocol_encoding() {
+        MouseProtocolEncoding::Sgr => Some(
+            format!(
+                "\x1b[<{button_code};{col};{row}{}",
+                if release { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        ),
+        MouseProtocolEncoding::Default => Some(vec![
+            0x1b,
+            b'[',
+            b'M',
+            (button_code + 32).min(255) as u8,
+            (col.min(223) + 32) as u8,
+            (row.min(223) + 32) as u8,
+        ]),
+        MouseProtocolEncoding::Utf8 => {
+            let mut output = b"\x1b[M".to_vec();
+            append_mouse_utf8_value(&mut output, (button_code + 32).min(2047));
+            append_mouse_utf8_value(&mut output, col.min(2015) + 32);
+            append_mouse_utf8_value(&mut output, row.min(2015) + 32);
+            Some(output)
+        }
+    }
+}
+
 fn wire_key_input(
     window: &AppWindow,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
@@ -8904,21 +8992,17 @@ fn wire_key_input(
             let bytes = term_buf(&bufs_wheel, &tid).map(|h| {
                 let buf = h.lock().unwrap();
                 let screen = buf.parser.screen();
-                if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
-                    // 1-based cell under the cursor, clamped to the screen.
-                    let (rows, cols) = screen.size();
-                    let c = (col.clamp(0, cols.saturating_sub(1) as i32) as u16) + 1;
-                    let r = (row.clamp(0, rows.saturating_sub(1) as i32) as u16) + 1;
-                    let btn: u16 = if dir > 0 { 64 } else { 65 }; // wheel up / down
-                    if screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr {
-                        format!("\x1b[<{btn};{c};{r}M").into_bytes()
-                    } else {
-                        // Legacy X10 encoding: ESC [ M  Cb Cx Cy  (each value + 32).
-                        let cb = (btn + 32) as u8;
-                        let cx = (c.min(223) + 32) as u8;
-                        let cy = (r.min(223) + 32) as u8;
-                        vec![0x1b, b'[', b'M', cb, cx, cy]
-                    }
+                let button = if dir > 0 { 64 } else { 65 }; // wheel up / down
+                if let Some(bytes) = encode_terminal_mouse_event(
+                    screen,
+                    TerminalMouseEventKind::Press,
+                    button,
+                    col,
+                    row,
+                    false,
+                    false,
+                ) {
+                    bytes
                 } else {
                     // alternate-scroll: 3 arrow presses per notch, app-cursor aware.
                     let one: &[u8] = if dir > 0 {
@@ -8939,6 +9023,53 @@ fn wire_key_input(
                 h.send_raw(bytes);
             }
         });
+    }
+
+    // Pointer presses/releases/motion belong to terminal applications that
+    // enabled xterm mouse tracking (btop, htop, vim, tmux, etc.). The callback
+    // returns false when tracking is off so Slint can keep local text selection.
+    {
+        let bufs_pointer = bufs.clone();
+        let handles_pointer = handles.clone();
+        window.on_terminal_pointer(
+            move |tab_id: SharedString,
+                  kind: i32,
+                  button: i32,
+                  col: i32,
+                  row: i32,
+                  ctrl: bool,
+                  alt: bool| {
+                let kind = match kind {
+                    0 => TerminalMouseEventKind::Press,
+                    1 => TerminalMouseEventKind::Release,
+                    2 => TerminalMouseEventKind::Motion,
+                    _ => return false,
+                };
+                let button = button.clamp(0, 3) as u16;
+                let tid = tab_id.to_string();
+                let bytes = term_buf(&bufs_pointer, &tid).and_then(|h| {
+                    let buf = h.lock().unwrap();
+                    encode_terminal_mouse_event(
+                        buf.parser.screen(),
+                        kind,
+                        button,
+                        col,
+                        row,
+                        ctrl,
+                        alt,
+                    )
+                });
+                let Some(bytes) = bytes else { return false };
+                let handles = handles_pointer.borrow();
+                let Some(handle) = handles.get(&tid) else {
+                    return false;
+                };
+                if !bytes.is_empty() {
+                    handle.send_raw(bytes);
+                }
+                true
+            },
+        );
     }
 
     // Scrollbar drag → jump to an absolute scrollback offset (#103).
@@ -10927,6 +11058,145 @@ mod key_tests {
         assert_eq!(normalize_pasted_newlines("a\rb"), "a\rb");
         // No newlines → unchanged.
         assert_eq!(normalize_pasted_newlines("echo hi"), "echo hi");
+    }
+}
+
+#[cfg(test)]
+mod terminal_mouse_tests {
+    use super::{encode_terminal_mouse_event, TerminalMouseEventKind};
+
+    fn parser_with_mode(mode: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(mode);
+        parser
+    }
+
+    #[test]
+    fn mouse_tracking_off_leaves_clicks_for_local_selection() {
+        let parser = parser_with_mode(b"");
+        assert_eq!(
+            encode_terminal_mouse_event(
+                parser.screen(),
+                TerminalMouseEventKind::Press,
+                0,
+                4,
+                2,
+                false,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sgr_double_click_reports_two_complete_left_clicks() {
+        let parser = parser_with_mode(b"\x1b[?1000h\x1b[?1006h");
+        let report = |kind| {
+            encode_terminal_mouse_event(parser.screen(), kind, 0, 4, 2, false, false)
+                .unwrap()
+        };
+        let actual = [
+            report(TerminalMouseEventKind::Press),
+            report(TerminalMouseEventKind::Release),
+            report(TerminalMouseEventKind::Press),
+            report(TerminalMouseEventKind::Release),
+        ]
+        .concat();
+        assert_eq!(actual, b"\x1b[<0;5;3M\x1b[<0;5;3m\x1b[<0;5;3M\x1b[<0;5;3m");
+    }
+
+    #[test]
+    fn x10_mode_consumes_release_without_reporting_it() {
+        let parser = parser_with_mode(b"\x1b[?9h");
+        assert_eq!(
+            encode_terminal_mouse_event(
+                parser.screen(),
+                TerminalMouseEventKind::Press,
+                0,
+                0,
+                0,
+                false,
+                false,
+            ),
+            Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+        );
+        assert_eq!(
+            encode_terminal_mouse_event(
+                parser.screen(),
+                TerminalMouseEventKind::Release,
+                0,
+                0,
+                0,
+                false,
+                false,
+            ),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn button_motion_only_reports_while_a_button_is_down() {
+        let parser = parser_with_mode(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            encode_terminal_mouse_event(
+                parser.screen(),
+                TerminalMouseEventKind::Motion,
+                3,
+                7,
+                8,
+                false,
+                false,
+            ),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            encode_terminal_mouse_event(
+                parser.screen(),
+                TerminalMouseEventKind::Motion,
+                0,
+                7,
+                8,
+                false,
+                false,
+            ),
+            Some(b"\x1b[<32;8;9M".to_vec())
+        );
+    }
+
+    #[test]
+    fn any_motion_reports_without_a_pressed_button() {
+        let parser = parser_with_mode(b"\x1b[?1003h\x1b[?1006h");
+        assert_eq!(
+            encode_terminal_mouse_event(
+                parser.screen(),
+                TerminalMouseEventKind::Motion,
+                3,
+                7,
+                8,
+                false,
+                false,
+            ),
+            Some(b"\x1b[<35;8;9M".to_vec())
+        );
+    }
+
+    #[test]
+    fn utf8_mouse_mode_preserves_coordinates_above_223() {
+        let mut parser = vt100::Parser::new(24, 400, 0);
+        parser.process(b"\x1b[?1000h\x1b[?1005h");
+        assert_eq!(
+            encode_terminal_mouse_event(
+                parser.screen(),
+                TerminalMouseEventKind::Press,
+                0,
+                250,
+                2,
+                false,
+                false,
+            ),
+            // Cb=' ', Cx=251+32=U+011B, Cy=3+32='#'.
+            Some(vec![0x1b, b'[', b'M', b' ', 0xc4, 0x9b, b'#'])
+        );
     }
 }
 

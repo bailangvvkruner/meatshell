@@ -776,6 +776,8 @@ export component AppWindow inherits Window {
     callback terminal-scroll(string /* tab-id */, int /* delta-lines */);
     // Wheel forwarded to an alt-screen program (#170): tab-id, dir (+1 up/-1 down), col, row.
     callback terminal-wheel(string, int, int, int);
+    // xterm mouse tracking: tab-id, kind, button, col, row, ctrl, alt.
+    callback terminal-pointer(string, int, int, int, int, bool, bool) -> bool;
     callback terminal-scroll-to(string /* tab-id */, int /* offset */); // scrollbar drag (#103)
     // Drag-selection lifecycle (grid row/col coordinates).
     callback term-select-start(string /* tab-id */, int /* row */, int /* col */, bool /* ctrl */, bool /* shift */);
@@ -1452,6 +1454,9 @@ export component AppWindow inherits Window {
                     find-query-changed(q) => { root.find-query-changed(term.id, q); }
                     terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
                     terminal-wheel(d, c, r) => { root.terminal-wheel(term.id, d, c, r); }
+                    terminal-pointer(k, b, c, r, ctrl, alt) => {
+                        return root.terminal-pointer(term.id, k, b, c, r, ctrl, alt);
+                    }
                     terminal-scroll-to(o) => { root.terminal-scroll-to(term.id, o); }
                     select-start(r, c, ctrl, shift) => { root.term-select-start(term.id, r, c, ctrl, shift); }
                     select-update(r, c) => { root.term-select-update(term.id, r, c); }
