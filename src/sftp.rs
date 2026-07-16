@@ -1728,6 +1728,7 @@ async fn list_dirs_only_impl(sftp: &SftpSession, path: &str) -> Result<Vec<(Stri
 }
 
 /// Emit a transfer-progress event.
+#[allow(clippy::too_many_arguments)]
 fn emit_transfer(
     events: &UnboundedSender<SessionEvent>,
     id: &str,

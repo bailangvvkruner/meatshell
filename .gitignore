@@ -3,7 +3,6 @@
 /artifacts/
 /config/
 /log/
-Cargo.lock
 *.rs.bk
 *.profraw
 .DS_Store

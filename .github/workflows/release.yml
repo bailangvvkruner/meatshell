@@ -84,7 +84,7 @@ jobs:
             libudev-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
 
@@ -94,15 +94,14 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build (release)
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Verify binary version
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -eu
-          VERSION="${GITHUB_REF_NAME:-dev}"
-          EXPECTED="${VERSION#v}"
+          EXPECTED="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           ACTUAL="$(target/${{ matrix.target }}/release/${{ matrix.bin }} --version)"
           test "$ACTUAL" = "meatshell ${EXPECTED}"
 
@@ -114,6 +113,7 @@ jobs:
         run: |
           set -eu
           VERSION="${GITHUB_REF_NAME:-dev}"
+          VERSION="${VERSION//\//-}"
           wget -q -O linuxdeploy \
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           wget -q -O linuxdeploy-plugin-appimage \
@@ -139,6 +139,7 @@ jobs:
           else
             VERSION="${GITHUB_REF_NAME:-dev}"
           fi
+          VERSION="${VERSION//\//-}"
           STAGE="meatshell-${VERSION}-${{ matrix.name }}"
 
           if [ "${{ runner.os }}" = "macOS" ]; then
@@ -336,7 +337,7 @@ jobs:
         run: |
           set -eu
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+            | sh -s -- -y --profile minimal --default-toolchain 1.97.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo build
@@ -350,7 +351,7 @@ jobs:
           set -eu
           . "$HOME/.cargo/env"
           rustc --version
-          cargo build --release --target aarch64-unknown-linux-gnu
+          cargo build --locked --release --target aarch64-unknown-linux-gnu
 
       - name: Verify glibc baseline
         shell: bash
@@ -368,6 +369,7 @@ jobs:
         run: |
           set -eu
           VERSION="${GITHUB_REF_NAME:-dev}"
+          VERSION="${VERSION//\//-}"
           STAGE="meatshell-${VERSION}-linux-aarch64-glibc228"
 
           mkdir "$STAGE"
@@ -427,7 +429,7 @@ jobs:
         run: |
           set -eu
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+            | sh -s -- -y --profile minimal --default-toolchain 1.97.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo build
@@ -441,7 +443,7 @@ jobs:
           set -eu
           . "$HOME/.cargo/env"
           rustc --version
-          cargo build --release --target x86_64-unknown-linux-gnu
+          cargo build --locked --release --target x86_64-unknown-linux-gnu
 
       - name: Verify glibc baseline
         shell: bash
@@ -459,6 +461,7 @@ jobs:
         run: |
           set -eu
           VERSION="${GITHUB_REF_NAME:-dev}"
+          VERSION="${VERSION//\//-}"
           STAGE="meatshell-${VERSION}-linux-x86_64-glibc228"
 
           mkdir "$STAGE"

@@ -7,7 +7,7 @@ description = "A lightweight FinalShell-style SSH/terminal client written in Rus
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/your/meatshell"
 readme = "README.md"
-rust-version = "1.75"
+rust-version = "1.92"
 
 [features]
 default = []
@@ -16,7 +16,7 @@ default = []
 dev-console = []
 
 [dependencies]
-slint = { version = "1.8", features = ["compat-1-2"] }
+slint = { version = "1.17.1", features = ["compat-1-2"] }
 # ICU4X (pulled in by Slint's text layout) spams stderr with raw `eprintln!`
 # ("ICU4X data error: No segmentation model for language: ja") because its
 # `log` shim falls back to eprintln when the `logging` feature is off. Turning
@@ -24,7 +24,7 @@ slint = { version = "1.8", features = ["compat-1-2"] }
 # subscriber, where init_tracing silences the `icu_provider` target.
 icu_provider = { version = "2", features = ["logging"] }
 # Direct access to the winit window/events (OS file-drop for drag-and-drop upload).
-i-slint-backend-winit = "1.16"
+i-slint-backend-winit = "1.17.1"
 # Raw HWND access (matches winit's rwh 0.6) for the Win11 rounded-corner + shadow
 # DWM tweaks on the frameless window (#162 / #166). Only used under cfg(windows).
 raw-window-handle = "0.6"
@@ -112,19 +112,18 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 # Keep the software renderer available, but also compile Skia so
 # MSVC releases can use its native Direct3D 12 surface. GNU/MinGW builds keep
 # the software backend because rust-skia does not publish binaries for them.
-i-slint-backend-winit = { version = "1.16", features = ["renderer-skia"] }
-i-slint-core = "1.16"
+i-slint-backend-winit = { version = "1.17.1", features = ["renderer-skia"] }
+i-slint-core = "1.17.1"
 
-# Compile the Skia renderer in *only* on macOS (feature is additive over the base
-# slint dependency) so users can opt into it at launch with SLINT_BACKEND=winit-skia.
-# The default stays femtovg — see the renderer history note in main.rs (#108/#129).
-# Windows/Linux never compile Skia; on Windows it conflicts with another ICU
-# import library at link time when using the MSVC toolchain (#224).
+# Also compile the Skia renderer on macOS (the feature is additive over the base
+# Slint dependency) so users can opt into it with SLINT_BACKEND=winit-skia.
+# Windows MSVC is configured above for Direct3D; GNU/MinGW and Linux keep the
+# lighter non-Skia backend.
 [target.'cfg(target_os = "macos")'.dependencies]
-slint = { version = "1.8", features = ["renderer-skia"] }
+slint = { version = "1.17.1", features = ["renderer-skia"] }
 
 [build-dependencies]
-slint-build = "1.8"
+slint-build = "1.17.1"
 
 # Embeds assets/meatshell.ico into the .exe so Explorer / taskbar / shortcuts
 # show the app icon. Windows-only; ignored on other targets.

@@ -5,6 +5,18 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
+### 构建 / Build
+
+- **升级并固定最新编译链。** 仓库与 GitHub Actions 统一使用 Rust 1.97.0，Slint 全组件升级到 1.17.1，Windows Skia 升级到 0.99.0，并刷新锁文件内所有兼容版本依赖；项目实际最低 Rust 版本同步为 1.92。
+- **修复分支云构建打包失败。** workflow 手动构建含 `/` 的分支名时会先将路径分隔符转换为 `-`，避免创建 Windows、Linux 或 macOS 产物目录时报错；非 Windows 二进制版本校验改为读取包版本，不再把分支名误当版本号。
+
+---
+
+### Build
+
+- **Update and pin the current build toolchain.** The repository and GitHub Actions now use Rust 1.97.0, all Slint components use 1.17.1, Windows Skia uses 0.99.0, and the lockfile contains the latest compatible dependency versions. The effective MSRV is now 1.92.
+- **Fix packaging for cloud builds from branches.** Workflow runs now replace `/` in branch names with `-` before creating Windows, Linux, or macOS artifact paths. Non-Windows version checks read the Cargo package version instead of treating the branch name as a version.
+
 ## [0.6.3] - 2026-07-16
 
 ### 新增 / Added

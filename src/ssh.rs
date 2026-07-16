@@ -584,7 +584,7 @@ pub enum SessionEvent {
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
         /// Detailed system information for the detached system-info window.
-        sys: SystemDetails,
+        sys: Box<SystemDetails>,
     },
 
     /// A command the user ran in the terminal, captured via the shell hook
@@ -1856,7 +1856,7 @@ async fn run_session(
                                     let _ = events.send(SessionEvent::Output(format!(
                                         "\r\n[meatshell] {}: {e}\r\n",
                                         t("ZMODEM 接收失败,已取消", "ZMODEM receive failed; cancelled")
-                                    ).into()));
+                                    )));
                                 }
                             }
                             continue;
@@ -2491,7 +2491,7 @@ fn parse_monitor_block(
         }
         *prev_net_at = now;
         // Show busiest first so the default-selected NIC is the active one.
-        net.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+        net.sort_by_key(|item| std::cmp::Reverse(item.1 + item.2));
     }
 
     let cpu_percent = if have_cpu {
@@ -2541,7 +2541,7 @@ fn parse_monitor_block(
         disks,
         current_user,
         procs,
-        sys,
+        sys: Box::new(sys),
     })
 }
 
@@ -2591,6 +2591,7 @@ fn cpu_usage_rows(nums: &[u64]) -> Vec<(String, String)> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_system_details(
     sys: &std::collections::HashMap<String, String>,
     cpu_nums: &[u64],

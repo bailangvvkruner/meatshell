@@ -369,7 +369,7 @@ pub fn generate_token() -> String {
 }
 
 fn validate_token(token: &str) -> Result<()> {
-    let len = token.as_bytes().len();
+    let len = token.len();
     if !(MIN_TOKEN_BYTES..=MAX_TOKEN_BYTES).contains(&len) {
         bail!("Debug API token must be {MIN_TOKEN_BYTES}..={MAX_TOKEN_BYTES} bytes");
     }
@@ -719,19 +719,17 @@ struct InputResponse {
     bytes: usize,
 }
 
-fn terminal_input_target(
-    state: &DebugApiState,
-    id: &str,
-) -> std::result::Result<InputTarget, Response> {
-    let target = lock(&state.inner.input_senders).get(id).cloned();
-    target.ok_or_else(|| {
-        let status = if lock(&state.inner.terminals).contains_key(id) {
-            StatusCode::CONFLICT
-        } else {
-            StatusCode::NOT_FOUND
-        };
-        api_error(status, "terminal_unavailable", "terminal is not connected")
-    })
+fn terminal_input_target(state: &DebugApiState, id: &str) -> Option<InputTarget> {
+    lock(&state.inner.input_senders).get(id).cloned()
+}
+
+fn terminal_unavailable(state: &DebugApiState, id: &str) -> Response {
+    let status = if lock(&state.inner.terminals).contains_key(id) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    api_error(status, "terminal_unavailable", "terminal is not connected")
 }
 
 async fn dispatch_debug_bytes(
@@ -798,9 +796,8 @@ async fn input(
         );
     }
 
-    let target = match terminal_input_target(&context.state, &id) {
-        Ok(target) => target,
-        Err(response) => return response,
+    let Some(target) = terminal_input_target(&context.state, &id) else {
+        return terminal_unavailable(&context.state, &id);
     };
 
     let mut bytes = request.text.into_bytes();
@@ -896,9 +893,8 @@ async fn pointer(
         );
     }
 
-    let target = match terminal_input_target(&context.state, &id) {
-        Ok(target) => target,
-        Err(response) => return response,
+    let Some(target) = terminal_input_target(&context.state, &id) else {
+        return terminal_unavailable(&context.state, &id);
     };
     let encoder = context
         .state

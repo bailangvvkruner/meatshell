@@ -893,7 +893,7 @@ impl ConfigStore {
 
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);
-        fs::write(&key_path, &key)
+        fs::write(&key_path, key)
             .with_context(|| format!("failed to write {}", key_path.display()))?;
         #[cfg(unix)]
         {
@@ -1763,7 +1763,7 @@ impl ConfigStore {
     /// Returns `(added, skipped)`. The store is saved if anything was added.
     pub fn import_json(&mut self, raw: &str) -> Result<(usize, usize)> {
         let file: ExportFile =
-            serde_json::from_str(&raw).context("not a valid meatshell export file")?;
+            serde_json::from_str(raw).context("not a valid meatshell export file")?;
 
         let mut added = 0usize;
         let mut skipped = 0usize;
@@ -1961,10 +1961,12 @@ mod tests {
         assert_eq!((old.window_width, old.window_height), (1200.0, 720.0));
         assert!(!old.window_maximized);
 
-        let mut current = ConfigFile::default();
-        current.window_width = 1360.0;
-        current.window_height = 840.0;
-        current.window_maximized = true;
+        let current = ConfigFile {
+            window_width: 1360.0,
+            window_height: 840.0,
+            window_maximized: true,
+            ..ConfigFile::default()
+        };
         let round_trip: ConfigFile =
             serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
         assert_eq!(

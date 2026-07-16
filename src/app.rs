@@ -1118,7 +1118,7 @@ pub fn run() -> Result<()> {
     {
         // ✕ hides the window (data keeps flowing into the shared model).
         let weak = proc_win.as_weak();
-        proc_win.on_close(move || {
+        proc_win.on_request_close(move || {
             if let Some(w) = weak.upgrade() {
                 let _ = w.hide();
             }
@@ -1172,7 +1172,7 @@ pub fn run() -> Result<()> {
     }
     {
         let weak = sys_win.as_weak();
-        sys_win.on_close(move || {
+        sys_win.on_request_close(move || {
             if let Some(w) = weak.upgrade() {
                 let _ = w.hide();
             }
@@ -1887,7 +1887,7 @@ pub fn run() -> Result<()> {
     let tabs_model: Rc<VecModel<TabInfo>> = Rc::new(VecModel::default());
     tabs_model.push(TabInfo {
         id: "welcome".into(),
-        title_len: tab_title_len(&t("新标签页", "New tab")),
+        title_len: tab_title_len(t("新标签页", "New tab")),
         title: t("新标签页", "New tab").into(),
         kind: "welcome".into(),
         connected: false,
@@ -2157,7 +2157,7 @@ pub fn run() -> Result<()> {
         let tabs_model = tabs_model.clone();
         let debug_api = debug_api.clone();
         window.on_set_language(move |code| {
-            crate::i18n::set_language(&code.to_string());
+            crate::i18n::set_language(code.as_ref());
             {
                 let mut s = store.borrow_mut();
                 s.set_language(crate::i18n::current_code().to_string());
@@ -2167,7 +2167,7 @@ pub fn run() -> Result<()> {
             for i in 0..tabs_model.row_count() {
                 if let Some(mut row) = tabs_model.row_data(i) {
                     if row.id.as_str() == "welcome" {
-                        row.title_len = tab_title_len(&t("新标签页", "New tab"));
+                        row.title_len = tab_title_len(t("新标签页", "New tab"));
                         row.title = t("新标签页", "New tab").into();
                         tabs_model.set_row_data(i, row);
                     }
@@ -2673,7 +2673,7 @@ pub fn run() -> Result<()> {
             if !startup_geometry_done {
                 if let Some(win) = weak.upgrade() {
                     if let Some(size) =
-                        clamp_window_size_to_monitor(&win.window(), ev_windowed_size.get())
+                        clamp_window_size_to_monitor(win.window(), ev_windowed_size.get())
                     {
                         ev_windowed_size.set(Some(size));
                         if restore_window_maximized {
@@ -3120,7 +3120,7 @@ fn contains_logical(rect: LogicalRect, x: f32, y: f32) -> bool {
 
 fn app_content_area(win: &AppWindow) -> LogicalRect {
     let size = win.window().size();
-    let scale = win.window().scale_factor().max(0.01) as f32;
+    let scale = win.window().scale_factor().max(0.01);
     let mut area = LogicalRect {
         x: 0.0,
         y: if win.get_custom_titlebar() {
@@ -3608,6 +3608,7 @@ fn wsl_available() -> bool {
 // Session callbacks (welcome page + dialog)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn wire_session_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
@@ -3903,7 +3904,7 @@ fn wire_session_callbacks(
         window.on_remove_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove(&id.to_string());
+                s.remove(id.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -3924,7 +3925,7 @@ fn wire_session_callbacks(
         window.on_duplicate_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut copy = orig;
                     copy.id = uuid::Uuid::new_v4().to_string();
                     copy.name = format!("{} (copy)", copy.name);
@@ -3950,7 +3951,7 @@ fn wire_session_callbacks(
         window.on_move_session(move |id: SharedString, group: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut moved = orig;
                     // "default" is the display label for ungrouped → store empty.
                     moved.group = if group.as_str() == "default" {
@@ -4016,7 +4017,7 @@ fn wire_session_callbacks(
                 if orig.is_empty() {
                     s.add_group(name.to_string());
                 } else {
-                    s.rename_group(&orig.to_string(), name.to_string());
+                    s.rename_group(orig.as_ref(), name.to_string());
                 }
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
@@ -4036,7 +4037,7 @@ fn wire_session_callbacks(
         window.on_delete_group(move |name: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove_group(&name.to_string());
+                s.remove_group(name.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -4086,7 +4087,7 @@ fn wire_session_callbacks(
             } else {
                 draft.private_key_path.to_string().replace('\\', "/")
             };
-            let kind = crate::config::SessionKind::from_str(&draft.kind.to_string());
+            let kind = crate::config::SessionKind::from_str(draft.kind.as_ref());
             let user = if kind == SessionKind::Ssh {
                 ssh_username_or_root(draft.user.as_str()).to_string()
             } else {
@@ -4121,7 +4122,7 @@ fn wire_session_callbacks(
                     draft.port as u16
                 },
                 user,
-                auth: AuthMethod::from_str(&draft.auth.to_string()),
+                auth: AuthMethod::from_str(draft.auth.as_ref()),
                 password,
                 // Store the key path with forward slashes uniformly.
                 private_key_path,
@@ -4843,7 +4844,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         Err(_) => break,
                     }
                 }
-                let ui_batch: Vec<SessionEvent> = drained.drain(..).collect();
+                let ui_batch: Vec<SessionEvent> = std::mem::take(&mut drained);
                 if ui_batch.is_empty() {
                     continue;
                 }
@@ -5704,8 +5705,8 @@ fn char_at_cell_start(prefix: &[usize], target: usize) -> usize {
 /// than `target` (#132).
 fn char_after_cell_end(prefix: &[usize], target: usize) -> usize {
     let n = prefix.len().saturating_sub(1); // chars.len()
-    for i in 0..n {
-        if prefix[i] > target {
+    for (i, start) in prefix.iter().copied().take(n).enumerate() {
+        if start > target {
             return i;
         }
     }
@@ -6137,6 +6138,7 @@ fn apply_terminal_raster_result(win: &AppWindow, result: RasterResult, is_latest
     win.window().request_redraw();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn submit_terminal_raster(
     win: &AppWindow,
     tab_id: &str,
@@ -6921,6 +6923,7 @@ fn refresh_sidebar(
 
 /// Apply a session event to the live UI models. Must be called on the Slint
 /// event loop thread.
+#[allow(clippy::too_many_arguments)]
 fn apply_session_event_to_window(
     win: &AppWindow,
     tab_id: &str,
@@ -7064,7 +7067,7 @@ fn apply_session_event_to_window(
                     st.user = current_user;
                 }
                 st.procs = procs;
-                st.sys = sys;
+                st.sys = *sys;
                 // A sample means the channel is alive → treat as connected.
                 if st.state != 1 {
                     st.state = 1;
@@ -7356,7 +7359,7 @@ struct PendingHostKey {
 thread_local! {
     /// Prompts awaiting a decision; the front one is shown. Lives on the Slint
     /// event-loop thread (all access is from there).
-    static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> = RefCell::new(VecDeque::new());
+    static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> = const { RefCell::new(VecDeque::new()) };
     /// host:port → decision, remembered for this run so a duplicate prompt
     /// (second connection to the same host) is answered without a new dialog.
     static HOSTKEY_DECIDED: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
@@ -7502,7 +7505,7 @@ struct PendingCred {
 }
 
 thread_local! {
-    static CRED_QUEUE: RefCell<VecDeque<PendingCred>> = RefCell::new(VecDeque::new());
+    static CRED_QUEUE: RefCell<VecDeque<PendingCred>> = const { RefCell::new(VecDeque::new()) };
     /// session id → the answer given this run (`None` = cancelled), so a second
     /// connection for the same session is answered without re-prompting.
     static CRED_DECIDED: RefCell<HashMap<String, Option<crate::ssh::CredentialReply>>> =
@@ -7639,7 +7642,7 @@ struct PendingMfa {
 }
 
 thread_local! {
-    static MFA_QUEUE: RefCell<VecDeque<PendingMfa>> = RefCell::new(VecDeque::new());
+    static MFA_QUEUE: RefCell<VecDeque<PendingMfa>> = const { RefCell::new(VecDeque::new()) };
 }
 
 /// Queue an MFA prompt: a concurrent connection for the same session (the shell
@@ -7846,12 +7849,15 @@ fn refresh_panes(
 /// "tabstrip"/"left"/"right"/"up"/"down"/"center"; `None` when the point is
 /// outside every pane. The 30% edge bands trigger a split; the tab strip and
 /// middle drop into the pane's tab group.
+type PaneDropRect = (f32, f32, f32, f32);
+type DragTarget = (u64, &'static str, PaneDropRect);
+
 fn drag_target(
     layout: &crate::panes::Layout,
     content: (f32, f32),
     x: f32,
     y: f32,
-) -> Option<(u64, &'static str, (f32, f32, f32, f32))> {
+) -> Option<DragTarget> {
     const STRIP: f32 = 36.0;
     const EDGE: f32 = 0.30;
     let (cw, ch) = (content.0.max(1.0), content.1.max(1.0));
@@ -7888,6 +7894,7 @@ fn drag_target(
 // Tab callbacks
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn wire_tab_callbacks(
     window: &AppWindow,
     tabs_model: Rc<VecModel<TabInfo>>,
@@ -9437,7 +9444,7 @@ fn wire_key_input(
                 if orig.is_empty() {
                     s.add_quick_group(name.to_string());
                 } else {
-                    s.rename_quick_group(&orig.to_string(), name.to_string());
+                    s.rename_quick_group(orig.as_ref(), name.to_string());
                 }
                 let _ = s.save();
             }
@@ -9454,7 +9461,7 @@ fn wire_key_input(
         window.on_delete_quick_group(move |name: SharedString| {
             {
                 let mut s = store_rc.borrow_mut();
-                s.remove_quick_group(&name.to_string());
+                s.remove_quick_group(name.as_ref());
                 let _ = s.save();
             }
             if let Some(w) = weak.upgrade() {
@@ -10554,7 +10561,7 @@ fn webdav_create_dir(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Resu
     let req = webdav_auth_req(agent.request("MKCOL", url), auth);
     match req.call() {
         Ok(_) => Ok(()),
-        Err(ureq::Error::Status(status, _)) if status == 405 => Ok(()),
+        Err(ureq::Error::Status(405, _)) => Ok(()),
         Err(ureq::Error::Status(status, _))
             if status == 401 || status == 403 || status == 404 || status == 409 =>
         {
@@ -11383,7 +11390,7 @@ fn log_level_marker(text: &str, max_chars: usize) -> Option<(usize, usize, u8)> 
                 continue;
             }
             let candidate = (start, start + word.len(), colour);
-            if best.map_or(true, |current| start < current.0) {
+            if best.is_none_or(|current| start < current.0) {
                 best = Some(candidate);
             }
             break;
@@ -11481,7 +11488,7 @@ fn devops_marker(text: &str, max_chars: usize) -> Option<(usize, usize, u8)> {
                 continue;
             }
             let candidate = (start, start + word.len(), colour);
-            if best.map_or(true, |current| start < current.0) {
+            if best.is_none_or(|current| start < current.0) {
                 best = Some(candidate);
             }
             break;
@@ -11534,8 +11541,8 @@ fn ascii_word_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     bytes
         .get(start.wrapping_sub(1))
-        .map_or(true, |b| !is_word(*b))
-        && bytes.get(end).map_or(true, |b| !is_word(*b))
+        .is_none_or(|b| !is_word(*b))
+        && bytes.get(end).is_none_or(|b| !is_word(*b))
 }
 
 /// Detect how many lines scrolled off the top between two screen snapshots by
@@ -12117,8 +12124,8 @@ fn render_term_span(span: &HistSpan, row: i32, is_dark: bool) -> Vec<TermSpan> {
                 let plain_cjk = contains_cjk(&plain);
                 result.push(TermSpan {
                     text: std::mem::take(&mut plain).into(),
-                    fg: fg.clone(),
-                    bg: bg.clone(),
+                    fg,
+                    bg,
                     bold: span.bold,
                     row,
                     col: plain_col,
@@ -12131,8 +12138,8 @@ fn render_term_span(span: &HistSpan, row: i32, is_dark: bool) -> Vec<TermSpan> {
             }
             result.push(TermSpan {
                 text: "".into(),
-                fg: fg.clone(),
-                bg: bg.clone(),
+                fg,
+                bg,
                 bold: span.bold,
                 row,
                 col,
