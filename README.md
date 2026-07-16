@@ -96,8 +96,9 @@ open /Applications/meatshell.app
 
 - [x] FinalShell 风格 UI，深色 / 浅色 / 跟随系统主题
 - [x] 本机 + 远端资源监控（CPU / 内存 / 交换 / 网络 / 磁盘）
-- [x] 远端进程监控（按 CPU 排序的只读进程表）
+- [x] 远端进程监控（按 CPU 排序、PID 复制与权限确认后结束进程）
 - [x] 完整 VT/ANSI 终端模拟（btop / htop / vim 全屏正常渲染）
+- [x] 彩色 emoji（支持肤色、旗帜及 ZWJ 组合序列）
 - [x] 多标签页（欢迎页 + 多个会话）
 - [x] 会话管理：新建 / 编辑 / 删除 / 分组，本地 JSON 持久化，导出 / 导入
   - 配置位置：`%APPDATA%/meatshell/sessions.json`（Windows）
@@ -114,6 +115,10 @@ open /Applications/meatshell.app
 - [x] 已知主机（`known_hosts`）校验 + 首次连接确认
 - [x] 多标签页终端分屏
 - [x] 可开关的本机 AI / 调试接口（Bearer 鉴权，见 [调用说明](docs/debug-api.md)）
+
+彩色 emoji 图形来自 [Twemoji](https://github.com/jdecked/twemoji)，按
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 使用；完整署名见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ### 计划中
 

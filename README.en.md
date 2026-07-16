@@ -102,8 +102,9 @@ open /Applications/meatshell.app
 
 - [x] FinalShell-style UI with dark / light / follow-system themes
 - [x] Local + remote resource monitoring (CPU / memory / swap / network / disk)
-- [x] Remote process monitor (read-only table sorted by CPU)
+- [x] Remote process monitor (CPU-sorted table with PID copy and permission-aware termination)
 - [x] Full VT/ANSI terminal emulation (btop / htop / vim render correctly)
+- [x] Color emoji, including skin tones, flags, and ZWJ sequences
 - [x] Tabs (welcome page + multiple sessions)
 - [x] Session management: create / edit / delete / groups, local JSON, export / import
   - Config location: `%APPDATA%/meatshell/sessions.json` (Windows)
@@ -120,6 +121,10 @@ open /Applications/meatshell.app
 - [x] Known-hosts (`known_hosts`) verification + first-connect confirmation
 - [x] Split panes for tabbed terminals
 - [x] Opt-in local AI / Debug API with Bearer authentication ([API guide](docs/debug-api.md))
+
+Color emoji graphics are provided by [Twemoji](https://github.com/jdecked/twemoji)
+under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the full attribution.
 
 ### Planned
 

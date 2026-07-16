@@ -23,12 +23,11 @@ import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton, ToolStrip } from "widgets.slint";
 import { TerminalView, TermSpan, TermRowImage, TermMatch, QuickCmd } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
+import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
-
-import { InterfacePanel } from "interface_panel.slint";
-// Re-export so `slint::include_modules!` generates the detached system information window.
-export { SystemInfoWindow }
-
+import { InterfacePanel, OutputRuleItem } from "interface_panel.slint";
+// Re-export so `slint::include_modules!` generates the detached Rust window types.
+export { ProcWindow, SystemInfoWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
 export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd }
@@ -45,16 +44,6 @@ export struct TransferInfo {
     percent: float,   // 0.0..1.0
     state: int,       // 0 active / 1 done / 2 error
     is-upload: bool,
-}
-
-// One row in the read-only remote process table.
-export struct ProcRow {
-    pid: string,
-    user: string,
-    cpu: string,
-    mem: string,
-    command: string,
-    cpu-frac: float,
 }
 
 export struct TerminalState {
@@ -345,10 +334,11 @@ export component AppWindow inherits Window {
     callback open-repo();                          // open the project's GitHub page
     in-out property <bool> shortcuts-open: false; // centered keyboard-shortcuts dialog (#103)
     in property <string> download-dir;      // preset SFTP download folder ("" = ask)
-    in-out property <bool> proc-open: false; // in-app process monitor popup (#23)
+    callback open-processes();
     in property <bool> proc-available;       // a live remote session is active
     in property <[ProcRow]> proc-list;       // top remote processes by CPU
     callback open-system-info();
+    in property <bool> system-info-available; // connected Linux session only (#268)
     in property <[SysMetricRow]> sys-metrics;
     in property <[SysNetRow]> sys-net-rows;
     in property <[DiskInfo]> sys-disks;
@@ -404,6 +394,10 @@ export component AppWindow inherits Window {
     in-out property <bool> term-font-bold <=> Theme.term-font-bold;
     in-out property <bool> hardware-acceleration-enabled: true;
     in property <bool> hardware-acceleration-available: false;
+    in-out property <bool> output-highlight-enabled: true;
+    in-out property <string> output-highlight-preset: "log";
+    in property <[OutputRuleItem]> output-highlight-rules;
+    in-out property <string> output-highlight-rule-status;
     in-out property <float> ui-scale <=> Theme.ui-scale;   // global UI zoom (#100)
     in-out property <float> panel-font <=> Theme.panel-font;  // settings-panel font scale
     callback set-panel-font(int);                          // apply + persist (percent)
@@ -439,10 +433,28 @@ export component AppWindow inherits Window {
     property <length> ifd-base-h;
     property <length> ifd-grab-x;
     property <length> ifd-grab-y;
+
+    // A drag/resize assignment breaks the initial centering bindings. Recenter
+    // every time the modal opens so coordinates from a larger/DPI-different
+    // monitor can never leave the settings card outside the current window.
+    changed interface-open => {
+        if (root.interface-open) {
+            root.ifd-dragging = false;
+            root.ifd-resizing = false;
+            root.ifd-w = clamp(root.ifd-w, 640px, max(640px, root.width - 56px));
+            root.ifd-h = clamp(root.ifd-h, 420px, max(420px, root.height - 56px));
+            root.ifd-x = round((root.width - root.ifd-w) / 2 / 1px) * 1px;
+            root.ifd-y = round((root.height - root.ifd-h) / 2 / 1px) * 1px;
+        }
+    }
     callback set-term-font(string);                // apply + persist font family
     callback set-term-font-size(int);              // apply + persist font size (px)
     callback set-term-font-bold(bool);             // apply + persist bold terminal text
     callback set-hardware-acceleration(bool);      // save + restart with selected renderer
+    callback set-output-highlight(bool, string);   // enable + built-in preset
+    callback add-output-highlight-rule(string, bool, bool, bool, string) -> bool;
+    callback remove-output-highlight-rule(int);
+    callback set-output-highlight-rule-enabled(int, bool);
     callback set-ui-scale(int);                    // apply + persist UI scale (percent) (#100)
     // Immersive wallpaper (set by Rust). The active id + custom file basename
     // feed the Interface → Wallpaper picker.
@@ -1099,11 +1111,12 @@ export component AppWindow inherits Window {
             net-selected: root.net-selected;
             net-show-selector: root.net-show-selector;
             disks: root.disks;
+            system-info-available: root.system-info-available;
             proc-available: root.proc-available;
             app-version: root.app-version;
             select-net-iface(i) => { root.select-net-iface(i); }
             show-system-info() => { root.open-system-info(); }
-            show-processes() => { root.proc-open = true; }
+            show-processes() => { root.open-processes(); }
             toggle-resource-pin() => {
                 if root.resource-pinned {
                     root.resource-pinned = false;
@@ -1331,15 +1344,6 @@ export component AppWindow inherits Window {
                     visible: term.id == pane.active-id;
                     width: term.id == pane.active-id ? parent.width : 0px;
                     height: term.id == pane.active-id ? parent.height : 0px;
-                    // A modal process popup takes focus away from the terminal.
-                    // When it closes, restore the focused pane's visible
-                    // TerminalView; its forward-focus routes to ime-input.
-                    property <bool> process-popup-open: root.proc-open;
-                    changed process-popup-open => {
-                        if (!self.process-popup-open && pane.focused && self.visible) {
-                            self.focus();
-                        }
-                    }
                     tab-id: term.id;
                     status-line: term.status;
                     spans: term.spans;
@@ -2125,143 +2129,6 @@ export component AppWindow inherits Window {
                 }
             }
         }
-
-    // --- Process monitor popup (#23) --------------------------------------
-    // Keep this inside the main window. Besides avoiding renderer-specific
-    // multi-window failures, the responsive bounds keep the table usable when
-    // the main window is close to its minimum size.
-    if root.proc-open : Rectangle {
-        width: parent.width;
-        height: parent.height;
-        background: #00000080;
-        proc-fs := FocusScope {
-            init => { self.focus(); }
-            key-pressed(e) => {
-                if (e.text == Key.Escape) { root.proc-open = false; }
-                accept
-            }
-            key-released(e) => { accept }
-        }
-        TouchArea {
-            clicked => { root.proc-open = false; }
-            scroll-event(e) => { accept }
-        }
-
-        Rectangle {
-            width: min(680px, max(420px, parent.width - 48px));
-            height: min(520px, max(280px, parent.height - 96px));
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Theme.bg-panel;
-            border-radius: Theme.radius-md;
-            border-width: 1px;
-            border-color: Theme.border-strong;
-            drop-shadow-blur: 16px;
-            drop-shadow-color: #00000070;
-            clip: true;
-
-            // Swallow clicks so they do not reach the backdrop or terminal.
-            TouchArea { clicked => { proc-fs.focus(); } }
-
-            VerticalLayout {
-                padding: 14px;
-                spacing: 10px;
-
-                HorizontalLayout {
-                    Text {
-                        text: @tr("Processes")
-                            + (root.connection-state != "" ? "  ·  " + root.connection-state : "");
-                        color: Theme.text-primary;
-                        font-size: Theme.fs-md;
-                        font-weight: 600;
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                    Rectangle {
-                        width: 24px;
-                        height: 24px;
-                        border-radius: Theme.radius-sm;
-                        background: proc-close-ta.has-hover ? Theme.bg-hover : transparent;
-                        proc-close-ta := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.proc-open = false; }
-                        }
-                        Text {
-                            text: "\u{E5CD}";
-                            font-family: "Material Icons";
-                            color: Theme.text-secondary;
-                            font-size: Theme.fs-sm;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-
-                HorizontalLayout {
-                    padding-left: 6px;
-                    padding-right: 6px;
-                    spacing: 6px;
-                    Text { text: "PID"; width: 56px; color: Theme.text-muted; font-size: Theme.fs-xs; }
-                    Text { text: @tr("User"); width: 84px; color: Theme.text-muted; font-size: Theme.fs-xs; overflow: elide; }
-                    Text { text: "CPU%"; width: 52px; color: Theme.text-muted; font-size: Theme.fs-xs;
-                           horizontal-alignment: right; }
-                    Text { text: "MEM%"; width: 52px; color: Theme.text-muted; font-size: Theme.fs-xs;
-                           horizontal-alignment: right; }
-                    Text { text: @tr("Command"); horizontal-stretch: 1; color: Theme.text-muted;
-                           font-size: Theme.fs-xs; overflow: elide; }
-                }
-
-                Flickable {
-                    vertical-stretch: 1;
-                    viewport-width: self.width;
-                    viewport-height: max(self.height, proc-col.preferred-height);
-                    proc-col := VerticalLayout {
-                        alignment: start;
-                        spacing: 1px;
-
-                        if root.proc-list.length == 0 : Text {
-                            text: @tr("No processes");
-                            color: Theme.text-muted;
-                            font-size: Theme.fs-xs;
-                        }
-
-                        for p in root.proc-list : Rectangle {
-                            height: 22px;
-                            border-radius: 2px;
-                            clip: true;
-
-                            Rectangle {
-                                x: 0;
-                                y: 0;
-                                height: parent.height;
-                                width: parent.width * clamp(p.cpu-frac, 0.0, 1.0);
-                                background: p.cpu-frac > 0.5 ? Theme.warning.with-alpha(0.28)
-                                          : Theme.accent.with-alpha(0.20);
-                            }
-                            HorizontalLayout {
-                                padding-left: 6px;
-                                padding-right: 6px;
-                                spacing: 6px;
-                                Text { text: p.pid; width: 56px; color: Theme.text-secondary;
-                                       font-size: Theme.fs-xs; vertical-alignment: center; overflow: elide; }
-                                Text { text: p.user; width: 84px; color: Theme.text-secondary;
-                                       font-size: Theme.fs-xs; vertical-alignment: center; overflow: elide; }
-                                Text { text: p.cpu; width: 52px; color: Theme.text-primary;
-                                       font-size: Theme.fs-xs; vertical-alignment: center;
-                                       horizontal-alignment: right; overflow: elide; }
-                                Text { text: p.mem; width: 52px; color: Theme.text-secondary;
-                                       font-size: Theme.fs-xs; vertical-alignment: center;
-                                       horizontal-alignment: right; overflow: elide; }
-                                Text { text: p.command; horizontal-stretch: 1; color: Theme.text-muted;
-                                       font-size: Theme.fs-xs; vertical-alignment: center; overflow: elide; }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // --- Settings menu popup (top-right) ----------------------------------
     // Click-outside-to-close backdrop (same pattern as the download popup).
@@ -3788,6 +3655,10 @@ export component AppWindow inherits Window {
                     term-font-bold: root.term-font-bold;
                     hardware-acceleration-enabled: root.hardware-acceleration-enabled;
                     hardware-acceleration-available: root.hardware-acceleration-available;
+                    output-highlight-enabled <=> root.output-highlight-enabled;
+                    output-highlight-preset <=> root.output-highlight-preset;
+                    output-highlight-rules: root.output-highlight-rules;
+                    output-highlight-rule-status <=> root.output-highlight-rule-status;
                     ui-scale: root.ui-scale;
                     sftp-follow-cd <=> root.sftp-follow-cd;
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
@@ -3817,6 +3688,19 @@ export component AppWindow inherits Window {
                     set-term-font-size(v) => { root.set-term-font-size(v); }
                     set-term-font-bold(v) => { root.set-term-font-bold(v); }
                     set-hardware-acceleration(v) => { root.set-hardware-acceleration(v); }
+                    set-output-highlight(enabled, preset) => {
+                        root.set-output-highlight(enabled, preset);
+                    }
+                    add-output-highlight-rule(pattern, regex, case-sensitive, whole-line, color) => {
+                        root.add-output-highlight-rule(
+                            pattern, regex, case-sensitive, whole-line, color)
+                    }
+                    remove-output-highlight-rule(index) => {
+                        root.remove-output-highlight-rule(index);
+                    }
+                    set-output-highlight-rule-enabled(index, enabled) => {
+                        root.set-output-highlight-rule-enabled(index, enabled);
+                    }
                     set-ui-scale(v) => { root.set-ui-scale(v); }
                     set-panel-font(v) => { root.set-panel-font(v); }
                     set-sftp-follow-cd(v) => { root.set-sftp-follow-cd(v); }

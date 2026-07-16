@@ -41,6 +41,7 @@ const INPUT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 const SCREENSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const MAX_SCREENSHOT_EDGE: u32 = 4096;
 const MAX_SCREENSHOT_PIXELS: u64 = 16 * 1024 * 1024;
+const MAX_POINTER_COORDINATE: i32 = 4095;
 // JSON escaping can expand a control byte to six ASCII bytes. Keeping raw text
 // at 128 KiB guarantees the encoded screen response remains below 1 MiB.
 const MAX_SCREEN_TEXT_BYTES: usize = 128 * 1024;
@@ -75,12 +76,31 @@ impl TerminalMetadata {
 }
 
 type ScreenReader = Arc<dyn Fn(&str, usize) -> Option<Vec<String>> + Send + Sync + 'static>;
+type PointerEncoder =
+    Arc<dyn Fn(&str, DebugPointerEvent) -> Option<Vec<u8>> + Send + Sync + 'static>;
 type ScreenshotRequester = Arc<
     dyn Fn(oneshot::Sender<Result<ScreenshotFrame, String>>) -> Result<(), String>
         + Send
         + Sync
         + 'static,
 >;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DebugPointerEventKind {
+    Press,
+    Release,
+    Motion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DebugPointerEvent {
+    pub(crate) kind: DebugPointerEventKind,
+    pub(crate) button: u16,
+    pub(crate) col: i32,
+    pub(crate) row: i32,
+    pub(crate) ctrl: bool,
+    pub(crate) alt: bool,
+}
 
 /// A renderer snapshot copied into an owned RGBA buffer before it leaves the
 /// Slint event loop. PNG encoding and optional downscaling happen off-thread.
@@ -100,6 +120,7 @@ struct DebugApiStateInner {
     terminals: Mutex<HashMap<String, TerminalMetadata>>,
     input_senders: Mutex<HashMap<String, InputTarget>>,
     screen_reader: ScreenReader,
+    pointer_encoder: RwLock<Option<PointerEncoder>>,
     screenshot_requester: RwLock<Option<ScreenshotRequester>>,
     screenshot_permits: Arc<Semaphore>,
 }
@@ -124,10 +145,25 @@ impl DebugApiState {
                 terminals: Mutex::new(HashMap::new()),
                 input_senders: Mutex::new(HashMap::new()),
                 screen_reader: Arc::new(screen_reader),
+                pointer_encoder: RwLock::new(None),
                 screenshot_requester: RwLock::new(None),
                 screenshot_permits: Arc::new(Semaphore::new(1)),
             }),
         }
+    }
+
+    /// Register the terminal-state bridge used by pointer injection. The
+    /// callback returns `None` while the target application has mouse tracking
+    /// disabled, so API pointer requests can never become shell text.
+    pub(crate) fn set_pointer_encoder<F>(&self, encoder: F)
+    where
+        F: Fn(&str, DebugPointerEvent) -> Option<Vec<u8>> + Send + Sync + 'static,
+    {
+        *self
+            .inner
+            .pointer_encoder
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(encoder));
     }
 
     /// Register the UI-thread bridge used by `GET /v1/screenshot`.
@@ -309,21 +345,11 @@ impl DebugApiController {
         }
     }
 
+    #[cfg(test)]
     pub fn is_running(&self) -> bool {
         self.running
             .as_ref()
             .is_some_and(|running| !running.task.is_finished())
-    }
-
-    pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.running
-            .as_ref()
-            .filter(|running| !running.task.is_finished())
-            .map(|running| running.address)
-    }
-
-    pub fn local_url(&self) -> Option<String> {
-        self.local_addr().map(|address| format!("http://{address}"))
     }
 }
 
@@ -372,6 +398,7 @@ fn build_router(state: DebugApiState, auth: AuthState) -> Router {
         .route("/v1/terminals", get(terminals))
         .route("/v1/terminals/:id/screen", get(screen))
         .route("/v1/terminals/:id/input", post(input))
+        .route("/v1/terminals/:id/pointer", post(pointer))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn_with_state(auth, authorize))
         .with_state(ApiContext { state })
@@ -692,6 +719,71 @@ struct InputResponse {
     bytes: usize,
 }
 
+fn terminal_input_target(
+    state: &DebugApiState,
+    id: &str,
+) -> std::result::Result<InputTarget, Response> {
+    let target = lock(&state.inner.input_senders).get(id).cloned();
+    target.ok_or_else(|| {
+        let status = if lock(&state.inner.terminals).contains_key(id) {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        api_error(status, "terminal_unavailable", "terminal is not connected")
+    })
+}
+
+async fn dispatch_debug_bytes(
+    state: &DebugApiState,
+    id: &str,
+    target: InputTarget,
+    bytes: Vec<u8>,
+) -> std::result::Result<usize, Response> {
+    let Ok(_permit) = target.permits.clone().try_acquire_owned() else {
+        return Err(api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "input_busy",
+            "too many terminal inputs are still pending",
+        ));
+    };
+
+    let byte_count = bytes.len();
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if target
+        .sender
+        .send(SessionCommand::DebugInput { bytes, ack: ack_tx })
+        .is_err()
+    {
+        state.remove_input_sender(id);
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "terminal_unavailable",
+            "terminal input channel is closed",
+        ));
+    }
+
+    match tokio::time::timeout(INPUT_ACK_TIMEOUT, ack_rx).await {
+        Ok(Ok(Ok(()))) => Ok(byte_count),
+        Ok(Ok(Err(_))) | Ok(Err(_)) => {
+            state.remove_input_sender(id);
+            Err(api_error(
+                StatusCode::CONFLICT,
+                "terminal_unavailable",
+                "terminal failed to accept input",
+            ))
+        }
+        Err(_) => {
+            state.remove_input_sender(id);
+            Err(api_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "input_timeout",
+                "terminal did not acknowledge input in time",
+            ))
+        }
+    }
+}
+
 async fn input(
     State(context): State<ApiContext>,
     Path(id): Path<String>,
@@ -706,65 +798,171 @@ async fn input(
         );
     }
 
-    let target = lock(&context.state.inner.input_senders).get(&id).cloned();
-    let Some(target) = target else {
-        let status = if lock(&context.state.inner.terminals).contains_key(&id) {
-            StatusCode::CONFLICT
-        } else {
-            StatusCode::NOT_FOUND
-        };
-        return api_error(status, "terminal_unavailable", "terminal is not connected");
-    };
-    let Ok(_permit) = target.permits.clone().try_acquire_owned() else {
-        return api_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "input_busy",
-            "too many terminal inputs are still pending",
-        );
+    let target = match terminal_input_target(&context.state, &id) {
+        Ok(target) => target,
+        Err(response) => return response,
     };
 
     let mut bytes = request.text.into_bytes();
     if request.submit {
         bytes.push(b'\r');
     }
-    let byte_count = bytes.len();
-    let (ack_tx, ack_rx) = oneshot::channel();
-    if target
-        .sender
-        .send(SessionCommand::DebugInput { bytes, ack: ack_tx })
-        .is_err()
-    {
-        context.state.remove_input_sender(&id);
-        return api_error(
-            StatusCode::CONFLICT,
-            "terminal_unavailable",
-            "terminal input channel is closed",
-        );
-    }
-
-    match tokio::time::timeout(INPUT_ACK_TIMEOUT, ack_rx).await {
-        Ok(Ok(Ok(()))) => Json(InputResponse {
+    match dispatch_debug_bytes(&context.state, &id, target, bytes).await {
+        Ok(byte_count) => Json(InputResponse {
             accepted: true,
             bytes: byte_count,
         })
         .into_response(),
-        Ok(Ok(Err(_))) | Ok(Err(_)) => {
-            context.state.remove_input_sender(&id);
-            api_error(
-                StatusCode::CONFLICT,
-                "terminal_unavailable",
-                "terminal failed to accept input",
-            )
-        }
-        Err(_) => {
-            context.state.remove_input_sender(&id);
-            api_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                "input_timeout",
-                "terminal did not acknowledge input in time",
-            )
+        Err(response) => response,
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PointerRequestKind {
+    Click,
+    Press,
+    Release,
+    Motion,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PointerButton {
+    Left,
+    Middle,
+    Right,
+}
+
+impl PointerButton {
+    fn protocol_button(self) -> u16 {
+        match self {
+            Self::Left => 0,
+            Self::Middle => 1,
+            Self::Right => 2,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct PointerRequest {
+    kind: PointerRequestKind,
+    button: PointerButton,
+    col: i32,
+    row: i32,
+    clicks: Option<u8>,
+    #[serde(default)]
+    ctrl: bool,
+    #[serde(default)]
+    alt: bool,
+}
+
+#[derive(Serialize)]
+struct PointerResponse {
+    accepted: bool,
+    events: usize,
+    bytes: usize,
+}
+
+async fn pointer(
+    State(context): State<ApiContext>,
+    Path(id): Path<String>,
+    Json(request): Json<PointerRequest>,
+) -> Response {
+    if !(0..=MAX_POINTER_COORDINATE).contains(&request.col)
+        || !(0..=MAX_POINTER_COORDINATE).contains(&request.row)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_pointer",
+            "pointer coordinates must be between 0 and 4095",
+        );
+    }
+
+    let clicks = request.clicks.unwrap_or(1);
+    if matches!(request.kind, PointerRequestKind::Click) {
+        if !(1..=2).contains(&clicks) {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_pointer",
+                "clicks must be 1 or 2",
+            );
+        }
+    } else if request.clicks.is_some() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_pointer",
+            "clicks is only valid for click events",
+        );
+    }
+
+    let target = match terminal_input_target(&context.state, &id) {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let encoder = context
+        .state
+        .inner
+        .pointer_encoder
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(encoder) = encoder else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "pointer_unavailable",
+            "terminal pointer injection is unavailable",
+        );
+    };
+
+    let event = |kind| DebugPointerEvent {
+        kind,
+        button: request.button.protocol_button(),
+        col: request.col,
+        row: request.row,
+        ctrl: request.ctrl,
+        alt: request.alt,
+    };
+    let events = match request.kind {
+        PointerRequestKind::Click => {
+            let mut events = Vec::with_capacity(usize::from(clicks) * 2);
+            for _ in 0..clicks {
+                events.push(event(DebugPointerEventKind::Press));
+                events.push(event(DebugPointerEventKind::Release));
+            }
+            events
+        }
+        PointerRequestKind::Press => vec![event(DebugPointerEventKind::Press)],
+        PointerRequestKind::Release => vec![event(DebugPointerEventKind::Release)],
+        PointerRequestKind::Motion => vec![event(DebugPointerEventKind::Motion)],
+    };
+
+    let mut bytes = Vec::with_capacity(events.len() * 16);
+    for event in &events {
+        let Some(encoded) = encoder(&id, *event) else {
+            return api_error(
+                StatusCode::CONFLICT,
+                "mouse_tracking_disabled",
+                "terminal application has not enabled mouse tracking",
+            );
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+
+    let byte_count = if bytes.is_empty() {
+        0
+    } else {
+        match dispatch_debug_bytes(&context.state, &id, target, bytes).await {
+            Ok(byte_count) => byte_count,
+            Err(response) => return response,
+        }
+    };
+    Json(PointerResponse {
+        accepted: true,
+        events: events.len(),
+        bytes: byte_count,
+    })
+    .into_response()
 }
 
 #[derive(Serialize)]
@@ -895,6 +1093,17 @@ mod tests {
         let state = DebugApiState::new(|id, _max_lines| {
             (id == "term-1").then(|| vec!["old".into(), "new".into()])
         });
+        state.set_pointer_encoder(|id, event| {
+            if id != "term-1" {
+                return None;
+            }
+            let kind = match event.kind {
+                DebugPointerEventKind::Press => 'P',
+                DebugPointerEventKind::Release => 'R',
+                DebugPointerEventKind::Motion => 'M',
+            };
+            Some(format!("{kind}{}:{};", event.col, event.row).into_bytes())
+        });
         state.set_screenshot_requester(|reply| {
             reply
                 .send(Ok(ScreenshotFrame {
@@ -914,13 +1123,15 @@ mod tests {
         state.set_input_sender("term-1", tx);
         let (observed_tx, observed_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let command = rx.blocking_recv().unwrap();
-            match command {
-                SessionCommand::DebugInput { bytes, ack } => {
-                    observed_tx.send(bytes).unwrap();
-                    let _ = ack.send(Ok(()));
+            for _ in 0..2 {
+                let command = rx.blocking_recv().unwrap();
+                match command {
+                    SessionCommand::DebugInput { bytes, ack } => {
+                        observed_tx.send(bytes).unwrap();
+                        let _ = ack.send(Ok(()));
+                    }
+                    other => panic!("unexpected command: {other:?}"),
                 }
-                other => panic!("unexpected command: {other:?}"),
             }
         });
 
@@ -981,6 +1192,18 @@ mod tests {
         );
         assert!(input.starts_with("HTTP/1.1 200"));
         assert_eq!(observed_rx.recv().unwrap(), b"pwd\r");
+
+        let body = r#"{"kind":"click","button":"left","col":4,"row":5,"clicks":2}"#;
+        let pointer = request(
+            address,
+            &format!(
+                "POST /v1/terminals/term-1/pointer HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(pointer.starts_with("HTTP/1.1 200"));
+        assert!(pointer.contains("\"events\":4"));
+        assert_eq!(observed_rx.recv().unwrap(), b"P4:5;R4:5;P4:5;R4:5;");
 
         controller.start(address.port(), ROTATED_TOKEN).unwrap();
         let old_token = request(

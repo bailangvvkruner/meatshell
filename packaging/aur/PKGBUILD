@@ -5,7 +5,7 @@
 # .github/workflows/aur-publish.yml keeps pkgver + checksums in sync on each
 # release; you can also `makepkg -si` this file directly.
 pkgname=meatshell-bin
-pkgver=0.3.6
+pkgver=0.6.3
 pkgrel=1
 pkgdesc="Lightweight FinalShell-style SSH/SFTP/terminal client (Rust + Slint)"
 arch=('x86_64' 'aarch64')
@@ -31,4 +31,5 @@ package() {
     install -Dm644 "${_dir}/meatshell.desktop"  "${pkgdir}/usr/share/applications/meatshell.desktop"
     install -Dm644 "${_dir}/icon@512.png"       "${pkgdir}/usr/share/icons/hicolor/512x512/apps/meatshell.png"
     install -Dm644 "${_dir}/README.md"          "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+    install -Dm644 "${_dir}/THIRD_PARTY_NOTICES.md" "${pkgdir}/usr/share/doc/${pkgname}/THIRD_PARTY_NOTICES.md"
 }

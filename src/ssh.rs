@@ -122,10 +122,7 @@ fn contains_zmodem_init(data: &[u8]) -> bool {
 }
 
 fn line_start_before(text: &str, pos: usize) -> usize {
-    text[..pos]
-        .rfind(['\r', '\n'])
-        .map(|i| i + 1)
-        .unwrap_or(0)
+    text[..pos].rfind(['\r', '\n']).map(|i| i + 1).unwrap_or(0)
 }
 
 fn include_following_line_break(text: &str, mut pos: usize) -> usize {
@@ -146,10 +143,7 @@ fn include_following_line_break(text: &str, mut pos: usize) -> usize {
 
 fn prompt_setup_echo_end(text: &str, prefix_pos: usize) -> usize {
     if let Some(rel) = text[prefix_pos..].find(PROMPT_SETUP_SUFFIX) {
-        return include_following_line_break(
-            text,
-            prefix_pos + rel + PROMPT_SETUP_SUFFIX.len(),
-        );
+        return include_following_line_break(text, prefix_pos + rel + PROMPT_SETUP_SUFFIX.len());
     }
     let line_end = text[prefix_pos..]
         .find(['\r', '\n'])
@@ -329,8 +323,22 @@ pub enum SessionCommand {
     },
     /// Stop a runtime tunnel created for this connected session (#206).
     StopTunnel(String),
+    /// Terminate one remote process on a short-lived exec channel. Supplying a
+    /// password selects the privileged `sudo -S` path; the secret is never
+    /// written to the interactive PTY or shell history.
+    KillProcess {
+        pid: u32,
+        root_password: Option<crate::config::Secret>,
+        reply: tokio::sync::oneshot::Sender<ProcessKillResult>,
+    },
     /// Gracefully disconnect and drop the session.
     Close,
+}
+
+#[derive(Debug)]
+pub struct ProcessKillResult {
+    pub success: bool,
+    pub message: String,
 }
 
 /// Carries the user's answer to a host-key confirmation prompt back to the
@@ -497,7 +505,6 @@ pub struct SystemDetails {
     pub swap: Vec<(String, String)>,
     pub networks: Vec<(String, String, String, String, String)>,
     pub filesystems: Vec<(String, String, String, String, String)>,
-
 }
 
 /// One SSH tunnel row shown in the runtime tunnel panel (#206).
@@ -572,6 +579,8 @@ pub enum SessionEvent {
         net: Vec<(String, u64, u64)>,
         /// Per-filesystem (mount_point, available_bytes, total_bytes).
         disks: Vec<(String, u64, u64)>,
+        /// Effective login name reported by the remote host (`id -un`).
+        current_user: String,
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
         /// Detailed system information for the detached system-info window.
@@ -641,15 +650,282 @@ impl SessionHandle {
     }
 
     pub fn add_tunnel(&self, id: String, forward: PortForward) {
-        let _ = self.commands.send(SessionCommand::AddTunnel { id, forward });
+        let _ = self
+            .commands
+            .send(SessionCommand::AddTunnel { id, forward });
     }
 
     pub fn stop_tunnel(&self, id: String) {
         let _ = self.commands.send(SessionCommand::StopTunnel(id));
     }
 
+    pub fn kill_process(
+        &self,
+        pid: u32,
+        root_password: Option<crate::config::Secret>,
+    ) -> tokio::sync::oneshot::Receiver<ProcessKillResult> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.commands.send(SessionCommand::KillProcess {
+            pid,
+            root_password,
+            reply,
+        });
+        rx
+    }
+
     pub fn close(&self) {
         let _ = self.commands.send(SessionCommand::Close);
+    }
+}
+
+async fn kill_remote_process(
+    handle: Arc<Handle<ClientHandler>>,
+    pid: u32,
+    root_password: Option<crate::config::Secret>,
+) -> ProcessKillResult {
+    use zeroize::Zeroize as _;
+
+    let privileged = root_password.is_some();
+    let stage = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let operation_stage = stage.clone();
+    let operation = async move {
+        let started = std::time::Instant::now();
+        tracing::warn!("[PROC_KILL] pid={pid} privileged={privileged} stage=open-channel begin");
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .context("open process-control channel")?;
+        operation_stage.store(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "[PROC_KILL] pid={pid} stage=open-channel ok elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        if privileged {
+            // `sudo` authentication is commonly configured by PAM to require a
+            // controlling terminal. Disable echo at the SSH PTY level so the
+            // password can never be reflected into channel output or logs.
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[(russh::Pty::ECHO, 0)])
+                .await
+                .context("request process-control terminal")?;
+            operation_stage.store(2, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "[PROC_KILL] pid={pid} stage=request-pty ok echo=off elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+        }
+        let command = process_kill_command(pid, privileged);
+        channel
+            .exec(true, command.as_bytes())
+            .await
+            .context("execute process-control command")?;
+        operation_stage.store(3, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "[PROC_KILL] pid={pid} stage=exec-sudo ok elapsed_ms={} waiting_for_password_prompt={privileged}",
+            started.elapsed().as_millis()
+        );
+        if !privileged {
+            channel
+                .eof()
+                .await
+                .context("finish process-control input")?;
+        }
+
+        let mut response = String::new();
+        let mut password_sent = !privileged;
+        let prompt_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let exit_status = loop {
+            let msg = if !password_sent {
+                match tokio::time::timeout_at(prompt_deadline, channel.wait()).await {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        tracing::warn!(
+                            "[PROC_KILL] pid={pid} stage=wait-password-prompt timeout; sending password fallback"
+                        );
+                        if let Some(password) = root_password.as_ref() {
+                            let mut input = password.as_str().as_bytes().to_vec();
+                            input.push(b'\r');
+                            let sent = channel.data(&input[..]).await;
+                            input.zeroize();
+                            sent.context("write root password after prompt timeout")?;
+                        }
+                        password_sent = true;
+                        operation_stage.store(5, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
+            } else {
+                channel.wait().await
+            };
+            let Some(msg) = msg else { break 1 };
+            match msg {
+                // ExitStatus is the authoritative completion result. Some SSH
+                // servers keep a PTY channel open and never promptly follow it
+                // with Close, so waiting beyond this point causes a false timeout.
+                ChannelMsg::ExitStatus {
+                    exit_status: status,
+                } => {
+                    operation_stage.store(6, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        "[PROC_KILL] pid={pid} stage=exit-status status={status} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                    break status;
+                }
+                ChannelMsg::Close => {
+                    tracing::warn!(
+                        "[PROC_KILL] pid={pid} stage=channel-close without-exit-status elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                    break 1;
+                }
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    let text = String::from_utf8_lossy(&data);
+                    let safe = process_control_log_text(
+                        &text,
+                        root_password.as_ref().map(|secret| secret.as_str()),
+                    );
+                    if !safe.is_empty() {
+                        tracing::warn!("[PROC_KILL] pid={pid} stage=remote-output text={safe:?}");
+                    }
+                    if response.len() < 1024 {
+                        response.push_str(&safe);
+                        response.truncate(response.len().min(1024));
+                    }
+                    if !password_sent && looks_like_sudo_password_prompt(&text) {
+                        tracing::warn!(
+                            "[PROC_KILL] pid={pid} stage=password-prompt detected; submitting secret"
+                        );
+                        if let Some(password) = root_password.as_ref() {
+                            let mut input = password.as_str().as_bytes().to_vec();
+                            input.push(b'\r');
+                            let sent = channel.data(&input[..]).await;
+                            input.zeroize();
+                            sent.context("write root password after prompt")?;
+                        }
+                        password_sent = true;
+                        operation_stage.store(5, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            "[PROC_KILL] pid={pid} stage=password-submitted elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        );
+                    }
+                }
+                _ => {}
+            }
+        };
+        anyhow::Ok((exit_status, response))
+    };
+
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(15), operation).await {
+        Ok(Ok((0, _))) => ProcessKillResult {
+            success: true,
+            message: format!("{} PID {pid}", t("已发送 SIGTERM：", "SIGTERM sent to")),
+        },
+        Ok(Ok((_, response))) if privileged => ProcessKillResult {
+            success: false,
+            message: process_kill_failure_message(&response, true),
+        },
+        Ok(Ok((_, response))) => ProcessKillResult {
+            success: false,
+            message: process_kill_failure_message(&response, false),
+        },
+        Ok(Err(err)) => ProcessKillResult {
+            success: false,
+            message: format!(
+                "{}: {err}",
+                t("结束进程失败", "Failed to terminate process")
+            ),
+        },
+        Err(_) => {
+            let stage =
+                process_control_stage_name(stage.load(std::sync::atomic::Ordering::Relaxed));
+            tracing::warn!("[PROC_KILL] pid={pid} result=timeout stage={stage}");
+            ProcessKillResult {
+                success: false,
+                message: format!(
+                    "{} ({stage})",
+                    t(
+                        "结束进程超时，诊断已写入 error.log",
+                        "Timed out; diagnostics were written to error.log"
+                    )
+                ),
+            }
+        }
+    };
+    tracing::warn!(
+        "[PROC_KILL] pid={pid} result={} message={:?}",
+        if result.success { "success" } else { "failure" },
+        result.message
+    );
+    result
+}
+
+fn process_control_stage_name(stage: u8) -> &'static str {
+    match stage {
+        0 => "open-channel",
+        1 => "request-pty",
+        2 => "exec-sudo",
+        3 => "wait-password-prompt",
+        5 => "wait-exit-status",
+        6 => "completed",
+        _ => "unknown",
+    }
+}
+
+fn looks_like_sudo_password_prompt(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("password") || lower.contains("密码")
+}
+
+fn process_control_log_text(text: &str, password: Option<&str>) -> String {
+    let mut safe = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    if let Some(password) = password.filter(|value| !value.is_empty()) {
+        safe = safe.replace(password, "[REDACTED]");
+    }
+    safe.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(512)
+        .collect()
+}
+
+fn process_kill_failure_message(response: &str, privileged: bool) -> String {
+    let detail = response
+        .replace(['\r', '\n'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !detail.is_empty() {
+        return format!("{}: {detail}", t("结束失败", "Failed to terminate process"));
+    }
+    if privileged {
+        t(
+            "结束失败：服务器未返回具体的 sudo/PAM 错误",
+            "Failed: the server returned no specific sudo/PAM error",
+        )
+        .to_string()
+    } else {
+        t(
+            "结束失败：进程已退出或无权操作",
+            "Failed: the process exited or permission was denied",
+        )
+        .to_string()
+    }
+}
+
+fn process_kill_command(pid: u32, privileged: bool) -> String {
+    if privileged {
+        // `sudo` authenticates the connected account, matching what users run
+        // manually. `su root` instead asks for the root account password, which
+        // is commonly locked even when the user is an authorised sudoer.
+        format!("LC_ALL=C sudo -S -p 'Password:' -- kill -TERM {pid}")
+    } else {
+        format!("kill -TERM {pid}")
     }
 }
 
@@ -901,18 +1177,16 @@ pub(crate) async fn authenticate_session(
             }
             ok
         }
-        AuthMethod::KeyboardInteractive => {
-            keyboard_interactive_auth(
-                handle,
-                &user,
-                password.as_str(),
-                &session.id,
-                &session.host,
-                events,
-            )
-            .await
-            .context("keyboard-interactive auth failed")?
-        }
+        AuthMethod::KeyboardInteractive => keyboard_interactive_auth(
+            handle,
+            &user,
+            password.as_str(),
+            &session.id,
+            &session.host,
+            events,
+        )
+        .await
+        .context("keyboard-interactive auth failed")?,
         AuthMethod::Key => {
             // An encrypted private key needs its passphrase; we reuse the
             // session's password field for it (empty = unencrypted key) (#90).
@@ -1041,7 +1315,8 @@ const RESOURCE_MONITOR_COMMAND: &[u8] = concat!(
     "while IFS= read -r __ms_tick; do ",
     "awk '/^cpu /{print}' /proc/stat; ",
     "awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; ",
-    "cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ",
+    "cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; ",
+    "echo __ME__; id -un 2>/dev/null; echo __PS__; ",
     "case \"$__ms_ps\" in ",
     "gnu) echo __PS_GNU__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200;; ",
     "top) echo __PS_TOP__; top -bn1 2>/dev/null | head -n 48 | cut -c -200;; ",
@@ -1394,7 +1669,12 @@ async fn run_session(
     // tasks can share it (russh's Handle isn't Clone, but its methods are &self).
     let mut runtime_forwards: std::collections::HashMap<String, RuntimeForward> =
         std::collections::HashMap::new();
-    for (idx, f) in session.forwards.iter().enumerate().filter(|(_, f)| f.kind == "remote") {
+    for (idx, f) in session
+        .forwards
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.kind == "remote")
+    {
         let bind = if f.bind_addr.trim().is_empty() {
             "127.0.0.1".to_string()
         } else {
@@ -1507,6 +1787,13 @@ async fn run_session(
                             f.info.status = t("已停止", "stopped").to_string();
                             emit_tunnel_update(&runtime_forwards, &events);
                         }
+                    }
+                    Some(SessionCommand::KillProcess { pid, root_password, reply }) => {
+                        let exec_handle = handle.clone();
+                        tokio::spawn(async move {
+                            let result = kill_remote_process(exec_handle, pid, root_password).await;
+                            let _ = reply.send(result);
+                        });
                     }
                     Some(SessionCommand::Close) | None => {
                         let _ = channel.eof().await;
@@ -2037,6 +2324,7 @@ fn parse_monitor_block(
     let mut procs: Vec<ProcInfo> = Vec::new();
     let mut process_format = ProcessSampleFormat::GnuPs;
     let mut process_columns: Option<ProcessColumns> = None;
+    let mut current_user = String::new();
     let mut sys_kv: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     // The sample is split into sections by `echo` markers; everything before the
@@ -2044,6 +2332,7 @@ fn parse_monitor_block(
     enum Section {
         Top,
         Df,
+        Me,
         Ps,
         Sys,
     }
@@ -2062,6 +2351,10 @@ fn parse_monitor_block(
         }
         if line == "__PS__" {
             section = Section::Ps;
+            continue;
+        }
+        if line == "__ME__" {
+            section = Section::Me;
             continue;
         }
         if line == "__SYS__" {
@@ -2129,6 +2422,12 @@ fn parse_monitor_block(
                     if let Some(process) = process {
                         procs.push(process);
                     }
+                }
+                continue;
+            }
+            Section::Me => {
+                if current_user.is_empty() {
+                    current_user = line.trim().chars().take(64).collect();
                 }
                 continue;
             }
@@ -2240,6 +2539,7 @@ fn parse_monitor_block(
         swap_total_kib: swap_total,
         net,
         disks,
+        current_user,
         procs,
         sys,
     })
@@ -2320,19 +2620,34 @@ fn build_system_details(
 
     SystemDetails {
         overview: vec![
-            (t("操作系统", "Operating system").to_string(), sys_value(sys, "OS")),
-            (t("内核版本", "Kernel version").to_string(), sys_value(sys, "KERNEL_RELEASE")),
-            (t("主机名称", "Hostname").to_string(), sys_value(sys, "HOSTNAME")),
+            (
+                t("操作系统", "Operating system").to_string(),
+                sys_value(sys, "OS"),
+            ),
+            (
+                t("内核版本", "Kernel version").to_string(),
+                sys_value(sys, "KERNEL_RELEASE"),
+            ),
+            (
+                t("主机名称", "Hostname").to_string(),
+                sys_value(sys, "HOSTNAME"),
+            ),
             (t("IP", "IP").to_string(), sys_value(sys, "IPS")),
             (t("负载", "Load").to_string(), sys_value(sys, "LOAD")),
             (t("内核", "Kernel").to_string(), sys_value(sys, "KERNEL")),
-            (t("硬件架构", "Architecture").to_string(), sys_value(sys, "ARCH")),
+            (
+                t("硬件架构", "Architecture").to_string(),
+                sys_value(sys, "ARCH"),
+            ),
             (t("连接", "Connection").to_string(), sys_value(sys, "IPS")),
             (t("运行", "Uptime").to_string(), sys_value(sys, "UPTIME")),
         ],
         cpu_info: vec![
             (t("名称", "Name").to_string(), cpu_model),
-            (t("核心数", "Cores").to_string(), sys_value(sys, "CPU_CORES")),
+            (
+                t("核心数", "Cores").to_string(),
+                sys_value(sys, "CPU_CORES"),
+            ),
             (t("频率", "Frequency").to_string(), "-".to_string()),
             (t("缓存", "Cache").to_string(), sys_value(sys, "CPU_CACHE")),
             ("BogoMips".to_string(), sys_value(sys, "CPU_BOGO")),
@@ -2343,7 +2658,10 @@ fn build_system_details(
             (t("总计", "Total").to_string(), kib_size(mem_total)),
             (t("已使用", "Used").to_string(), kib_size(mem_used)),
             (t("剩余", "Free").to_string(), kib_size(mem_avail)),
-            (t("已用", "Usage").to_string(), percent_text(mem_used, mem_total)),
+            (
+                t("已用", "Usage").to_string(),
+                percent_text(mem_used, mem_total),
+            ),
             (t("缓冲", "Buffers").to_string(), kib_size(mem_buffers)),
             (t("缓存", "Cached").to_string(), kib_size(mem_cached)),
         ],
@@ -2351,7 +2669,10 @@ fn build_system_details(
             (t("总计", "Total").to_string(), kib_size(swap_total)),
             (t("已使用", "Used").to_string(), kib_size(swap_used)),
             (t("剩余", "Free").to_string(), kib_size(swap_free)),
-            (t("已用", "Usage").to_string(), percent_text(swap_used, swap_total)),
+            (
+                t("已用", "Usage").to_string(),
+                percent_text(swap_used, swap_total),
+            ),
         ],
         networks: net_counters
             .iter()
@@ -2793,7 +3114,6 @@ mod prompt_setup_echo_tests {
         );
         assert!(strip_late_prompt_setup_echo(&mut text));
         assert_eq!(text, "prompt\r\nafter");
-
     }
 }
 
@@ -3065,6 +3385,61 @@ mod monitor_hardening_tests {
         assert!(parse_monitor_block(&block, &mut prev, &mut prev_net, &mut at).is_some());
         // The remembered interface set is capped, not 500.
         assert!(prev_net.len() <= 64, "prev_net held {}", prev_net.len());
+    }
+
+    #[test]
+    fn monitor_reports_effective_user_for_ownership_checks() {
+        let block = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n__DF__\n__ME__\nalice\n__PS__\n10 alice 1.0 2.0 sleep 30";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats {
+                current_user,
+                procs,
+                ..
+            } => {
+                assert_eq!(current_user, "alice");
+                assert_eq!(procs[0].user, "alice");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod process_control_tests {
+    use super::{looks_like_sudo_password_prompt, process_control_log_text, process_kill_command};
+
+    #[test]
+    fn own_process_uses_plain_term_signal() {
+        assert_eq!(process_kill_command(4242, false), "kill -TERM 4242");
+    }
+
+    #[test]
+    fn privileged_process_uses_root_su_without_embedding_password() {
+        assert_eq!(
+            process_kill_command(4242, true),
+            "LC_ALL=C sudo -S -p 'Password:' -- kill -TERM 4242"
+        );
+    }
+
+    #[test]
+    fn recognizes_su_password_prompt() {
+        assert!(looks_like_sudo_password_prompt("Password: "));
+        assert!(looks_like_sudo_password_prompt("请输入密码："));
+        assert!(!looks_like_sudo_password_prompt("Authentication failure"));
+    }
+
+    #[test]
+    fn diagnostic_output_redacts_password_and_controls() {
+        let safe =
+            process_control_log_text("Password:\r\nsecret-value\x1b[0m", Some("secret-value"));
+        assert!(!safe.contains("secret-value"));
+        assert!(safe.contains("[REDACTED]"));
+        assert!(!safe.contains('\r'));
+        assert!(!safe.contains('\n'));
     }
 }
 

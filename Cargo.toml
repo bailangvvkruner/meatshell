@@ -1,6 +1,6 @@
 [package]
 name = "meatshell"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 authors = ["meatshell contributors"]
 description = "A lightweight FinalShell-style SSH/terminal client written in Rust + Slint"
@@ -30,6 +30,7 @@ i-slint-backend-winit = "1.16"
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+regex = "1"
 anyhow = "1"
 thiserror = "1"
 directories = "5"
@@ -59,6 +60,13 @@ portable-pty = "0.8"
 # same version vt100 uses so "is this glyph 2 cells wide?" agrees with how vt100
 # lays CJK glyphs on the grid — otherwise selection/find columns drift (#132).
 unicode-width = "0.1.14"
+# Split terminal output into complete emoji grapheme clusters (ZWJ sequences,
+# flags, skin tones, variation selectors) before replacing them with images.
+unicode-segmentation = "1.12"
+# Slint's software/femtovg text rasterizers flatten color-font glyphs to a
+# monochrome mask. Embedded 72px Twemoji PNGs keep emoji colored on every
+# renderer without switching the whole Windows application to Skia (#269).
+twemoji-assets = { version = "1.5", default-features = false, features = ["png"] }
 russh-sftp = "2"
 rfd = "0.15"
 arboard = "3"

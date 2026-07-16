@@ -3573,7 +3573,7 @@ checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "meatshell"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3594,6 +3594,7 @@ dependencies = [
  "portable-pty",
  "rand 0.8.6",
  "raw-window-handle",
+ "regex",
  "rfd",
  "russh",
  "russh-keys",
@@ -3610,6 +3611,8 @@ dependencies = [
  "tokio-socks",
  "tracing",
  "tracing-subscriber",
+ "twemoji-assets",
+ "unicode-segmentation",
  "unicode-width 0.1.14",
  "ureq",
  "uuid",
@@ -6876,6 +6879,12 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 dependencies = [
  "core_maths",
 ]
+
+[[package]]
+name = "twemoji-assets"
+version = "1.5.1+17.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6857896b4a287e70f8197ab8fb9d68b3c43bb7ae97595aceaf2d11c21b93d9e9"
 
 [[package]]
 name = "typed-index-collections"

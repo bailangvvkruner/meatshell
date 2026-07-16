@@ -50,6 +50,12 @@
                               Source="$(var.CargoTargetBinDir)\meatshell.exe"
                               KeyPath="yes"/>
                     </Component>
+                    <Component Id="ThirdPartyNotices" Guid="*">
+                        <File Id="thirdPartyNoticesFile"
+                              Name="THIRD_PARTY_NOTICES.md"
+                              Source="THIRD_PARTY_NOTICES.md"
+                              KeyPath="yes"/>
+                    </Component>
                 </Directory>
             </Directory>
             <Directory Id="ProgramMenuFolder">
@@ -73,6 +79,7 @@
 
         <Feature Id="MainProgram" Title="meatshell" Level="1">
             <ComponentRef Id="MainExecutable"/>
+            <ComponentRef Id="ThirdPartyNotices"/>
             <ComponentRef Id="ApplicationShortcut"/>
         </Feature>
 
