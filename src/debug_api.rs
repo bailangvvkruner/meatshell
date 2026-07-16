@@ -38,6 +38,9 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 16 * 1024;
 const MAX_OUTSTANDING_INPUTS: usize = 4;
 const INPUT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SCREENSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const MAX_SCREENSHOT_EDGE: u32 = 4096;
+const MAX_SCREENSHOT_PIXELS: u64 = 16 * 1024 * 1024;
 // JSON escaping can expand a control byte to six ASCII bytes. Keeping raw text
 // at 128 KiB guarantees the encoded screen response remains below 1 MiB.
 const MAX_SCREEN_TEXT_BYTES: usize = 128 * 1024;
@@ -72,6 +75,20 @@ impl TerminalMetadata {
 }
 
 type ScreenReader = Arc<dyn Fn(&str, usize) -> Option<Vec<String>> + Send + Sync + 'static>;
+type ScreenshotRequester = Arc<
+    dyn Fn(oneshot::Sender<Result<ScreenshotFrame, String>>) -> Result<(), String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// A renderer snapshot copied into an owned RGBA buffer before it leaves the
+/// Slint event loop. PNG encoding and optional downscaling happen off-thread.
+pub(crate) struct ScreenshotFrame {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
+}
 
 #[derive(Clone)]
 struct InputTarget {
@@ -83,6 +100,8 @@ struct DebugApiStateInner {
     terminals: Mutex<HashMap<String, TerminalMetadata>>,
     input_senders: Mutex<HashMap<String, InputTarget>>,
     screen_reader: ScreenReader,
+    screenshot_requester: RwLock<Option<ScreenshotRequester>>,
+    screenshot_permits: Arc<Semaphore>,
 }
 
 /// Thread-safe state shared by the UI/session layer and the HTTP handlers.
@@ -105,8 +124,25 @@ impl DebugApiState {
                 terminals: Mutex::new(HashMap::new()),
                 input_senders: Mutex::new(HashMap::new()),
                 screen_reader: Arc::new(screen_reader),
+                screenshot_requester: RwLock::new(None),
+                screenshot_permits: Arc::new(Semaphore::new(1)),
             }),
         }
+    }
+
+    /// Register the UI-thread bridge used by `GET /v1/screenshot`.
+    pub(crate) fn set_screenshot_requester<F>(&self, requester: F)
+    where
+        F: Fn(oneshot::Sender<Result<ScreenshotFrame, String>>) -> Result<(), String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        *self
+            .inner
+            .screenshot_requester
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(requester));
     }
 
     pub fn upsert_terminal(&self, terminal: TerminalMetadata) {
@@ -332,6 +368,7 @@ fn set_auth_token(auth: &AuthState, token: &str) {
 fn build_router(state: DebugApiState, auth: AuthState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/screenshot", get(screenshot))
         .route("/v1/terminals", get(terminals))
         .route("/v1/terminals/:id/screen", get(screen))
         .route("/v1/terminals/:id/input", post(input))
@@ -420,6 +457,182 @@ async fn terminals(State(context): State<ApiContext>) -> Json<TerminalsResponse>
     Json(TerminalsResponse {
         terminals: context.state.terminals(),
     })
+}
+
+#[derive(Default, Deserialize)]
+struct ScreenshotQuery {
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+}
+
+async fn screenshot(
+    State(context): State<ApiContext>,
+    Query(query): Query<ScreenshotQuery>,
+) -> Response {
+    if query.max_width == Some(0) || query.max_height == Some(0) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_dimensions",
+            "screenshot dimensions must be greater than zero",
+        );
+    }
+    let max_width = query
+        .max_width
+        .unwrap_or(MAX_SCREENSHOT_EDGE)
+        .min(MAX_SCREENSHOT_EDGE);
+    let max_height = query
+        .max_height
+        .unwrap_or(MAX_SCREENSHOT_EDGE)
+        .min(MAX_SCREENSHOT_EDGE);
+
+    let requester = context
+        .state
+        .inner
+        .screenshot_requester
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(requester) = requester else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "screenshot_unavailable",
+            "window screenshot capture is unavailable",
+        );
+    };
+    let Ok(_permit) = context
+        .state
+        .inner
+        .screenshot_permits
+        .clone()
+        .try_acquire_owned()
+    else {
+        return api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "screenshot_busy",
+            "another screenshot is still being captured",
+        );
+    };
+
+    let started = std::time::Instant::now();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if let Err(error) = requester(reply_tx) {
+        tracing::warn!("failed to schedule Debug API screenshot: {error}");
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "screenshot_unavailable",
+            "window screenshot capture is unavailable",
+        );
+    }
+    let frame = match tokio::time::timeout(SCREENSHOT_TIMEOUT, reply_rx).await {
+        Ok(Ok(Ok(frame))) => frame,
+        Ok(Ok(Err(error))) => {
+            tracing::warn!("Debug API screenshot capture failed: {error}");
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "screenshot_failed",
+                "window screenshot capture failed",
+            );
+        }
+        Ok(Err(_)) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "screenshot_unavailable",
+                "window screenshot capture is unavailable",
+            );
+        }
+        Err(_) => {
+            return api_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "screenshot_timeout",
+                "window screenshot capture timed out",
+            );
+        }
+    };
+
+    let Some(remaining) = SCREENSHOT_TIMEOUT.checked_sub(started.elapsed()) else {
+        return api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "screenshot_timeout",
+            "window screenshot capture timed out",
+        );
+    };
+    let encoded =
+        tokio::task::spawn_blocking(move || encode_screenshot(frame, max_width, max_height));
+    let png = match tokio::time::timeout(remaining, encoded).await {
+        Ok(Ok(Ok(png))) => png,
+        Ok(Ok(Err(error))) => {
+            tracing::warn!("Debug API screenshot encoding failed: {error}");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "screenshot_failed",
+                "window screenshot encoding failed",
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("Debug API screenshot worker failed: {error}");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "screenshot_failed",
+                "window screenshot encoding failed",
+            );
+        }
+        Err(_) => {
+            return api_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "screenshot_timeout",
+                "window screenshot encoding timed out",
+            );
+        }
+    };
+
+    ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+}
+
+fn encode_screenshot(frame: ScreenshotFrame, max_width: u32, max_height: u32) -> Result<Vec<u8>> {
+    let expected_len = u64::from(frame.width)
+        .checked_mul(u64::from(frame.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("screenshot dimensions overflow")?;
+    if frame.width == 0
+        || frame.height == 0
+        || expected_len != u64::try_from(frame.rgba.len()).unwrap_or(u64::MAX)
+    {
+        bail!("invalid RGBA screenshot buffer");
+    }
+
+    let pixel_scale =
+        (MAX_SCREENSHOT_PIXELS as f64 / (f64::from(frame.width) * f64::from(frame.height))).sqrt();
+    let scale = 1.0_f64
+        .min(f64::from(max_width) / f64::from(frame.width))
+        .min(f64::from(max_height) / f64::from(frame.height))
+        .min(pixel_scale);
+    let output_width = (f64::from(frame.width) * scale).floor().max(1.0) as u32;
+    let output_height = (f64::from(frame.height) * scale).floor().max(1.0) as u32;
+
+    let pixels = if output_width == frame.width && output_height == frame.height {
+        frame.rgba
+    } else {
+        let source = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+            .context("invalid RGBA screenshot buffer")?;
+        image::imageops::resize(
+            &source,
+            output_width,
+            output_height,
+            image::imageops::FilterType::Triangle,
+        )
+        .into_raw()
+    };
+
+    let mut png = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::png::PngEncoder::new(&mut png),
+        &pixels,
+        output_width,
+        output_height,
+        image::ExtendedColorType::Rgba8,
+    )
+    .context("encode screenshot as PNG")?;
+    Ok(png)
 }
 
 #[derive(Default, Deserialize)]
@@ -613,15 +826,19 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
     const ROTATED_TOKEN: &str = "fedcba9876543210fedcba9876543210";
 
-    fn request(address: SocketAddr, request: &str) -> String {
+    fn request_bytes(address: SocketAddr, request: &str) -> Vec<u8> {
         let mut stream = std::net::TcpStream::connect(address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
         response
+    }
+
+    fn request(address: SocketAddr, request: &str) -> String {
+        String::from_utf8(request_bytes(address, request)).unwrap()
     }
 
     #[test]
@@ -641,6 +858,18 @@ mod tests {
         assert_eq!(text, "two\nthree");
         assert_eq!(count, 2);
         assert!(truncated);
+    }
+
+    #[test]
+    fn screenshot_encoder_preserves_aspect_ratio_and_caps_dimensions() {
+        let frame = ScreenshotFrame {
+            width: 4,
+            height: 2,
+            rgba: vec![255; 4 * 2 * 4],
+        };
+        let png = encode_screenshot(frame, 2, 2).unwrap();
+        let decoded = image::load_from_memory(&png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
     }
 
     #[test]
@@ -665,6 +894,15 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let state = DebugApiState::new(|id, _max_lines| {
             (id == "term-1").then(|| vec!["old".into(), "new".into()])
+        });
+        state.set_screenshot_requester(|reply| {
+            reply
+                .send(Ok(ScreenshotFrame {
+                    width: 2,
+                    height: 1,
+                    rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+                }))
+                .map_err(|_| "screenshot receiver closed".to_string())
         });
         state.upsert_terminal(TerminalMetadata::new(
             "term-1",
@@ -715,6 +953,23 @@ mod tests {
         );
         assert!(screen.starts_with("HTTP/1.1 200"));
         assert!(screen.contains("\"text\":\"new\""));
+
+        let screenshot = request_bytes(
+            address,
+            &format!(
+                "GET /v1/screenshot?max_width=1&max_height=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        let body_start = screenshot
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .unwrap();
+        let headers = std::str::from_utf8(&screenshot[..body_start]).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200"));
+        assert!(headers.contains("content-type: image/png"));
+        let decoded = image::load_from_memory(&screenshot[body_start..]).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1, 1));
 
         let body = r#"{"text":"pwd","submit":true}"#;
         let input = request(

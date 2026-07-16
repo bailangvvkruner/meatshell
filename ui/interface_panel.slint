@@ -76,11 +76,13 @@ component SettingRow inherits Rectangle {
 // binding-break-on-self-assign gotcha).
 component Switch inherits Rectangle {
     in property <bool> on;
+    in property <bool> enabled: true;
     callback toggled(bool);
     width: 38px;
     height: 22px;
     border-radius: 11px;
-    background: root.on ? Theme.accent : Theme.bg-active;
+    background: root.on && root.enabled ? Theme.accent : Theme.bg-active;
+    opacity: root.enabled ? 1 : 0.5;
     animate background { duration: 120ms; }
     Rectangle {
         width: 16px;
@@ -92,6 +94,7 @@ component Switch inherits Rectangle {
         animate x { duration: 120ms; easing: ease-out; }
     }
     TouchArea {
+        enabled: root.enabled;
         mouse-cursor: pointer;
         clicked => { root.toggled(!root.on); }
     }
@@ -181,6 +184,8 @@ export component InterfacePanel inherits Rectangle {
     in property <string> term-font-family;
     in property <length> term-font-size;
     in-out property <bool> term-font-bold;
+    in-out property <bool> hardware-acceleration-enabled;
+    in property <bool> hardware-acceleration-available;
     in property <float> ui-scale;
     in-out property <bool> sftp-follow-cd;
     in-out property <bool> collapse-sidebar-default;
@@ -215,6 +220,7 @@ export component InterfacePanel inherits Rectangle {
     callback set-term-font(string);
     callback set-term-font-size(int);
     callback set-term-font-bold(bool);
+    callback set-hardware-acceleration(bool);
     callback set-ui-scale(int);
     callback set-panel-font(int);   // settings-panel font scale, percent
     callback set-sftp-follow-cd(bool);
@@ -353,6 +359,22 @@ export component InterfacePanel inherits Rectangle {
                     Switch {
                         on: root.term-font-bold;
                         toggled(v) => { root.term-font-bold = v; root.set-term-font-bold(v); }
+                    }
+                }
+                SettingRow {
+                    label: root.lang-en ? "Hardware acceleration" : "硬件加速";
+                    desc: root.hardware-acceleration-available
+                        ? (root.lang-en ? "Switches the renderer immediately by restarting the application."
+                                        : "切换后将自动重启应用并立即更换渲染后端。")
+                        : (root.lang-en ? "GPU rendering requires the Windows MSVC build."
+                                        : "GPU 渲染需要 Windows MSVC 版本，当前构建不可用。");
+                    Switch {
+                        on: root.hardware-acceleration-enabled;
+                        enabled: root.hardware-acceleration-available;
+                        toggled(v) => {
+                            root.hardware-acceleration-enabled = v;
+                            root.set-hardware-acceleration(v);
+                        }
                     }
                 }
                 SettingRow {

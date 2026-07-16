@@ -27,6 +27,11 @@ export struct TermSpan {
     cjk: bool,   // contains CJK chars → render with the CJK-capable font (#54)
 }
 
+export struct TermRowImage {
+    source: image,
+    valid: bool,
+}
+
 // A find-match highlight rectangle on the terminal grid.
 export struct TermMatch {
     row: int,
@@ -92,6 +97,11 @@ export component TerminalView inherits Rectangle {
     in property <string> tab-id;
     in property <string> status-line: @tr("Not connected");
     in property <[TermSpan]> spans;     // coloured runs of the visible screen
+    in property <[TermRowImage]> row-images; // cached raster rows (fast path)
+    in property <bool> row-images-ready;
+    in property <int> row-image-columns;
+    in property <float> row-image-cell-width;
+    in property <float> row-image-cell-height;
     in property <int> render-revision;  // changes while the spans model stays stable
     in property <int> cursor-row;       // cursor cell (grid coords)
     in property <int> cursor-col;
@@ -171,7 +181,7 @@ export component TerminalView inherits Rectangle {
     callback search-history(string /* query */);   // filter the history dropdown (#101)
 
     callback send-key(string, bool, bool, bool);
-    callback terminal-resize(float, float);
+    callback terminal-resize(float, float, float, float);
     callback sftp-navigate(string);
     callback sftp-download(string);
     callback sftp-upload-clicked(string, bool);
@@ -277,24 +287,34 @@ export component TerminalView inherits Rectangle {
     // font the spans below are actually rendered with.  (Forcing a hard-coded
     // minimum here is dangerous: if the spans fall back to a system font, a
     // mismatched cell-w garbles the grid.  Keep them derived from one source.)
-    property <length> cell-w: max(1px, cell-probe.preferred-width / 50);
-    property <length> cell-h: max(1px, cell-probe.preferred-height);
+    property <length> measured-cell-w: max(1px, cell-probe.preferred-width / 50);
+    property <length> measured-cell-h: max(1px, cell-probe.preferred-height);
+    // While row images are active, every overlay and pointer calculation uses
+    // the exact logical geometry carried by that same raster frame. This avoids
+    // mixing a stale image frame with a newly measured cursor grid during DPI or
+    // font changes.
+    property <length> cell-w: root.row-images-ready && root.row-image-cell-width > 0
+        ? root.row-image-cell-width * 1px : root.measured-cell-w;
+    property <length> cell-h: root.row-images-ready && root.row-image-cell-height > 0
+        ? root.row-image-cell-height * 1px : root.measured-cell-h;
     // Usable text box = root.width minus the 10px left/right padding of
     // output-text; usable height = key-capture height minus the 8px top pad
     // and the 16px bottom focus-recovery strip.
-    property <float> term-cols: max(10, floor((root.width - 20px) / cell-w));
-    property <float> term-rows: max(5,  floor((key-capture.height - 24px) / cell-h));
+    property <float> term-cols: max(10, floor((root.width - 20px) / measured-cell-w));
+    property <float> term-rows: max(5,  floor((key-capture.height - 24px) / measured-cell-h));
     // Only resize the PTY while this tab is visible.  Inactive tabs are laid
     // out at width 0 (→ term-cols collapses to 10); resizing the remote to 10
     // columns reflows the vt100 screen and destroys the scrollback, so when you
     // switch back the output is gone.  Guarding on `visible` keeps each hidden
     // session frozen at its real size; `changed visible` re-syncs on return.
     property <bool> has-real-size: root.width >= 80px && key-capture.height >= 80px;
-    changed term-cols => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
-    changed term-rows => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
-    changed has-real-size => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    changed term-cols => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
+    changed term-rows => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
+    changed measured-cell-w => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
+    changed measured-cell-h => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
+    changed has-real-size => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
 
-    init => { if (root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    init => { if (root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
 
     changed render-revision => {
         // Bash: keep the latest output pinned to the bottom.
@@ -329,7 +349,7 @@ export component TerminalView inherits Rectangle {
             root.focus-pending = true;
             // Re-sync the PTY size on return (it was frozen while hidden).
             if (root.has-real-size) {
-                root.terminal-resize(root.term-cols, root.term-rows);
+                root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px);
             }
         }
     }
@@ -670,11 +690,32 @@ export component TerminalView inherits Rectangle {
                             border-radius: 2px;
                         }
 
+                        // Fast path: one cached image per visible terminal row.
+                        // Images are rasterized off the UI thread at physical
+                        // DPI; selection/cursor/input remain native overlays.
+                        if root.row-images-ready : Rectangle {
+                            x: 0px; y: 0px;
+                            width: parent.width; height: parent.height;
+                            for row[i] in root.row-images : Image {
+                                x: 0px;
+                                y: i * root.cell-h;
+                                width: root.row-image-columns * root.cell-w;
+                                height: root.cell-h;
+                                source: row.source;
+                                image-fit: fill;
+                            }
+                        }
+
+                        // Compatibility path and instant fallback while the first
+                        // row-image frame is still being rasterized.
                         // Each span = a background fill (transparent for the
                         // default bg) with its text on top.  Wrapping the Text in
                         // the bg Rectangle keeps one element per span and renders
                         // btop/htop/mc panels, meter bars and graph fills.
-                        for span in root.spans : Rectangle {
+                        if !root.row-images-ready : Rectangle {
+                            x: 0px; y: 0px;
+                            width: parent.width; height: parent.height;
+                            for span in root.spans : Rectangle {
                             x: span.col * root.cell-w;
                             y: span.row * root.cell-h;
                             width: span.cells * root.cell-w;
@@ -697,6 +738,7 @@ export component TerminalView inherits Rectangle {
                                 font-family: span.cjk ? Theme.ui-font-family : Theme.term-font-family;
                                 font-size: Theme.term-font-size;
                                 font-weight: (Theme.term-font-bold || span.bold) ? 700 : 400;
+                            }
                             }
                         }
 

@@ -25,6 +25,7 @@ mod ssh;
 mod ssh_config;
 mod system;
 mod telnet;
+mod terminal_raster;
 mod wallpaper;
 mod zmodem;
 
@@ -33,8 +34,6 @@ fn main() -> anyhow::Result<()> {
         println!("meatshell {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-
-    prefer_windows_software_renderer();
 
     // macOS renderer is left at Slint's default (femtovg) and is NOT forced.
     //
@@ -71,22 +70,6 @@ fn main() -> anyhow::Result<()> {
 
     app::run()
 }
-
-#[cfg(windows)]
-fn prefer_windows_software_renderer() {
-    // Windows users reported blurry text on 2K/4K displays with fractional
-    // scaling (#224). Skia would be the usual sharper renderer, but the current
-    // Windows/MSVC dependency graph links two ICU libraries with duplicate
-    // symbols. Prefer Slint's software renderer instead: it avoids the OpenGL
-    // texture path that tends to look soft at 125%/150% scaling, while keeping
-    // SLINT_BACKEND as an explicit escape hatch for diagnostics.
-    if std::env::var_os("SLINT_BACKEND").is_none() {
-        std::env::set_var("SLINT_BACKEND", "winit-software");
-    }
-}
-
-#[cfg(not(windows))]
-fn prefer_windows_software_renderer() {}
 
 /// Set up tracing: stderr (honours RUST_LOG, default info) **plus** a capped
 /// `error.log` file at WARN and above so users can send diagnostics — e.g. a

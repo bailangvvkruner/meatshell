@@ -613,6 +613,10 @@ pub struct ConfigFile {
     /// Force regular terminal text to render with a bold face (#262).
     #[serde(default)]
     pub terminal_bold: bool,
+    /// Opt out of the GPU renderer. Stored inverted so existing and fresh
+    /// configurations both default to hardware acceleration enabled.
+    #[serde(default)]
+    pub hardware_acceleration_disabled: bool,
     /// Global UI scale in percent (#100). 0 = default (100%).
     #[serde(default)]
     pub ui_scale: u32,
@@ -1041,6 +1045,14 @@ impl ConfigStore {
 
     pub fn set_terminal_bold(&mut self, bold: bool) {
         self.cache.terminal_bold = bold;
+    }
+
+    pub fn hardware_acceleration(&self) -> bool {
+        !self.cache.hardware_acceleration_disabled
+    }
+
+    pub fn set_hardware_acceleration(&mut self, enabled: bool) {
+        self.cache.hardware_acceleration_disabled = !enabled;
     }
 
     /// Global UI scale in percent (#100). Defaults to 100.
@@ -1898,6 +1910,24 @@ mod tests {
             .debug_api_token
             .as_str()
             .starts_with(ConfigStore::ENC_PREFIX));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hardware_acceleration_defaults_on_and_round_trips() {
+        let old: ConfigFile = serde_json::from_str("{}").unwrap();
+        assert!(!old.hardware_acceleration_disabled);
+
+        let store = temp_store();
+        let path = store.path.clone();
+        let mut store = store;
+        assert!(store.hardware_acceleration());
+        store.set_hardware_acceleration(false);
+        store.save().unwrap();
+
+        let disk: ConfigFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(disk.hardware_acceleration_disabled);
         let _ = std::fs::remove_file(path);
     }
 

@@ -30,12 +30,14 @@ component StatRow inherits HorizontalLayout {
         overflow: elide;
     }
 
-    // Progress bar — stretches to fill the row, with a floor so it stays usable.
+    // Keep the percentage and used/total text inside one full-width track. If
+    // the detail is a separate layout child, stretch allocation makes a 100%
+    // fill occupy only part of the visible row and the bar looks incorrect.
     Rectangle {
         background: Theme.bg-root;
         border-radius: 2px;
-        horizontal-stretch: 2;
-        min-width: 60px;
+        horizontal-stretch: 1;
+        min-width: 124px;
 
         Rectangle {
             x: 0;
@@ -49,23 +51,25 @@ component StatRow inherits HorizontalLayout {
 
         Text {
             x: 6px;
+            width: parent.width - 12px;
             text: Math.round(percent * 100) + "%";
             color: Theme.text-primary;
             font-size: Theme.fs-xs;
             vertical-alignment: center;
             height: parent.height;
         }
-    }
 
-    // Used/total figure, right-aligned; reserve width so it never gets clipped.
-    Text {
-        text: detail;
-        color: Theme.text-muted;
-        font-size: Theme.fs-xs;
-        horizontal-stretch: 1;
-        min-width: 64px;
-        horizontal-alignment: right;
-        vertical-alignment: center;
+        Text {
+            x: 6px;
+            width: parent.width - 12px;
+            text: detail;
+            color: Theme.text-muted;
+            font-size: Theme.fs-xs;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            height: parent.height;
+            overflow: elide;
+        }
     }
 }
 

@@ -12,7 +12,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-
 /// Per-terminal state: vt100 parser drives all rendering for both normal
 /// (bash) and alt-screen (vim/nano/htop) modes.
 ///
@@ -22,6 +21,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// text; vt100 tracks cursor position and overwrites in place correctly.
 struct TermBuffer {
     parser: vt100::Parser,
+    /// Logical cell dimensions measured by Slint's active terminal font probe.
+    raster_cell_width: f32,
+    raster_cell_height: f32,
     /// Active find query for this tab ("" = no search).
     find_query: String,
     /// Current theme mode — propagated from the global dark-mode toggle.
@@ -79,18 +81,52 @@ enum CsiState {
     Csi,
 }
 
-/// Sustained terminal output is expensive with the Windows software renderer.
-/// Keep the existing foreground rate for responsive TUIs, while a visible
-/// background window only needs occasional updates until it regains focus.
-const RENDER_ACTIVE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
-const RENDER_BACKGROUND_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+/// Sustained terminal output is expensive with the Windows software renderer,
+/// but the Skia/D3D path can present terminal row textures at display cadence.
+const RENDER_SOFTWARE_ACTIVE_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(33);
+const RENDER_GPU_ACTIVE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+static ACTIVE_RENDER_INTERVAL: OnceLock<std::time::Duration> = OnceLock::new();
 
-fn terminal_render_interval(window_focused: bool) -> std::time::Duration {
-    if window_focused {
-        RENDER_ACTIVE_MIN_INTERVAL
+fn active_render_interval_for_backend(backend: Option<&str>) -> std::time::Duration {
+    if backend.is_some_and(|backend| {
+        matches!(
+            backend.trim().to_ascii_lowercase().as_str(),
+            "skia" | "skia-d3d" | "winit-skia" | "winit-skia-d3d"
+        )
+    }) {
+        RENDER_GPU_ACTIVE_MIN_INTERVAL
     } else {
-        RENDER_BACKGROUND_MIN_INTERVAL
+        RENDER_SOFTWARE_ACTIVE_MIN_INTERVAL
     }
+}
+
+fn terminal_render_interval(_window_focused: bool) -> std::time::Duration {
+    // Keep model/raster latency identical while unfocused. The window backend
+    // already suppresses presents for occluded/minimized surfaces; slowing the
+    // terminal itself to 200 ms made background input visibly arrive in bursts
+    // and left stale frames waiting when the window was restored.
+    *ACTIVE_RENDER_INTERVAL.get_or_init(|| {
+        active_render_interval_for_backend(std::env::var("SLINT_BACKEND").ok().as_deref())
+    })
+}
+
+fn hardware_acceleration_setting_available() -> bool {
+    cfg!(all(target_os = "windows", target_env = "msvc"))
+        && std::env::var_os("SLINT_BACKEND").is_none()
+}
+
+fn spawn_replacement_process() -> Result<()> {
+    let executable = std::env::current_exe().context("resolve current executable")?;
+    let mut command = std::process::Command::new(executable);
+    command.args(std::env::args_os().skip(1));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    command.spawn().context("start replacement process")?;
+    Ok(())
 }
 
 /// Per-tab terminal buffer — each tab has its own lock so a burst of output on
@@ -113,7 +149,9 @@ impl TabRenderGate {
     fn new() -> Self {
         Self {
             state: AtomicU8::new(0),
-            last_render: Mutex::new(std::time::Instant::now() - RENDER_ACTIVE_MIN_INTERVAL),
+            last_render: Mutex::new(
+                std::time::Instant::now() - RENDER_SOFTWARE_ACTIVE_MIN_INTERVAL,
+            ),
         }
     }
 
@@ -165,14 +203,18 @@ mod render_gate_tests {
     }
 
     #[test]
-    fn terminal_render_rate_backs_off_when_window_is_unfocused() {
+    fn terminal_render_rate_tracks_backend_and_window_focus() {
         assert_eq!(
-            terminal_render_interval(true),
+            active_render_interval_for_backend(Some("winit-software")),
             std::time::Duration::from_millis(33)
         );
         assert_eq!(
+            active_render_interval_for_backend(Some("winit-skia")),
+            std::time::Duration::from_millis(16)
+        );
+        assert_eq!(
             terminal_render_interval(false),
-            std::time::Duration::from_millis(200)
+            terminal_render_interval(true)
         );
     }
 
@@ -266,20 +308,26 @@ fn ingest_terminal_output(bufs: &TermBuffers, tab_id: &str, chunk: &[u8]) {
 
 use anyhow::{Context, Result};
 use i_slint_backend_winit::WinitWindowAccessor;
-use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use slint::{
+    ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel,
+};
 use tokio::runtime::Runtime;
 
 use crate::config::{ssh_username_or_root, AuthMethod, ConfigStore, Secret, Session, SessionKind};
 use crate::debug_api::{
-    DebugApiController, DebugApiState, TerminalMetadata, DEFAULT_PORT as DEBUG_API_PORT,
+    DebugApiController, DebugApiState, ScreenshotFrame, TerminalMetadata,
+    DEFAULT_PORT as DEBUG_API_PORT,
 };
 use crate::i18n::t;
 use crate::sftp::{spawn_sftp, SftpHandle};
 use crate::ssh::{
-    format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent, SessionHandle,
-    SystemDetails,
+    format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent,
+    SessionHandle, SystemDetails,
 };
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
+use crate::terminal_raster::{
+    RasterCompletion, RasterConfig, RasterJob, RasterResult, RasterSpan, TerminalRasterizer,
+};
 
 #[derive(Clone, Default)]
 struct LocalHardwareInfo {
@@ -412,7 +460,7 @@ fn run_coalesced_tab_render(
     let min_interval = weak
         .upgrade()
         .map(|window| terminal_render_interval(window.get_window_focused()))
-        .unwrap_or(RENDER_BACKGROUND_MIN_INTERVAL);
+        .unwrap_or_else(|| terminal_render_interval(false));
     let delay = {
         let last = *gate.last_render.lock().unwrap();
         min_interval.saturating_sub(last.elapsed())
@@ -504,8 +552,12 @@ fn set_window_icon(window: &AppWindow) {
 fn apply_window_chrome(window: &slint::Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     window.with_winit_window(|ww| {
-        let Ok(handle) = ww.window_handle() else { return };
-        let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+        let Ok(handle) = ww.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(h) = handle.as_raw() else {
+            return;
+        };
         let hwnd = h.hwnd.get();
 
         #[link(name = "dwmapi")]
@@ -528,9 +580,7 @@ fn apply_window_chrome(window: &slint::Window) {
                 (&pref as *const u32).cast(),
                 4,
             );
-            tracing::debug!(
-                "window chrome applied: hwnd={hwnd:#x} corner_hr={corner_hr:#x}"
-            );
+            tracing::debug!("window chrome applied: hwnd={hwnd:#x} corner_hr={corner_hr:#x}");
         }
     });
 }
@@ -539,20 +589,42 @@ fn apply_window_chrome(window: &slint::Window) {
 fn apply_window_chrome(_window: &slint::Window) {}
 
 #[cfg(windows)]
-fn setup_windows_platform() {
+fn setup_windows_platform(hardware_acceleration: bool) {
     use i_slint_backend_winit::winit::platform::windows::WindowAttributesExtWindows;
 
     let mut builder = i_slint_backend_winit::Backend::builder();
-    if let Ok(backend) = std::env::var("SLINT_BACKEND") {
-        if let Some(renderer) = backend.strip_prefix("winit-").filter(|s| !s.is_empty()) {
+    let backend = std::env::var("SLINT_BACKEND").unwrap_or_else(|_| {
+        if cfg!(target_env = "msvc") && hardware_acceleration {
+            "winit-skia".to_string()
+        } else {
+            "winit-software".to_string()
+        }
+    });
+    let _ = ACTIVE_RENDER_INTERVAL.set(active_render_interval_for_backend(Some(&backend)));
+    if let Some(renderer) = backend.strip_prefix("winit-").filter(|s| !s.is_empty()) {
+        if matches!(renderer, "skia" | "skia-d3d") {
+            #[cfg(target_env = "msvc")]
+            {
+                builder = builder
+                    .with_renderer_name("skia")
+                    .request_graphics_api(i_slint_core::graphics::RequestedGraphicsAPI::Direct3D);
+            }
+            #[cfg(not(target_env = "msvc"))]
+            {
+                builder = builder.with_renderer_name(renderer.to_owned());
+            }
+        } else {
             builder = builder.with_renderer_name(renderer.to_owned());
         }
     }
+    tracing::info!(
+        renderer = %backend,
+        configured_hardware_acceleration = hardware_acceleration,
+        "initializing Windows renderer"
+    );
     let backend = builder
         .with_window_attributes_hook(|attrs| {
-            attrs
-                .with_transparent(false)
-                .with_undecorated_shadow(false)
+            attrs.with_transparent(false).with_undecorated_shadow(false)
         })
         .build();
 
@@ -686,12 +758,6 @@ fn setup_macos_platform() {
 }
 
 pub fn run() -> Result<()> {
-    // Windows frameless-window attributes must be fixed before the first Slint
-    // window is created; doing it afterwards leaves some Win10 machines with an
-    // invisible frame that shifts mouse hit testing (#193).
-    #[cfg(windows)]
-    setup_windows_platform();
-
     // Immersive native title bar on macOS (must precede the first window).
     #[cfg(target_os = "macos")]
     setup_macos_platform();
@@ -701,6 +767,10 @@ pub fn run() -> Result<()> {
     let store = Rc::new(RefCell::new(
         ConfigStore::load().context("failed to load config")?,
     ));
+    // Renderer selection must happen after loading the persisted preference but
+    // before constructing the first Slint component.
+    #[cfg(windows)]
+    setup_windows_platform(store.borrow().hardware_acceleration());
     // Reachable from the Slint-thread event handler for recording terminal
     // commands into history (#113).
     HISTORY_STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
@@ -752,6 +822,28 @@ pub fn run() -> Result<()> {
     // Windows the icon comes from the embedded .ico, so this is a no-op there.)
     let _ = slint::set_xdg_app_id("meatshell");
     let window = AppWindow::new().context("failed to build Slint window")?;
+
+    // Bridge authenticated Debug API screenshot requests to Slint without
+    // activating the window. Snapshot readback stays on the UI thread; the API
+    // moves scaling and PNG encoding to Tokio's blocking pool.
+    {
+        let weak = window.as_weak();
+        debug_api_state.set_screenshot_requester(move |reply| {
+            weak.upgrade_in_event_loop(move |win| {
+                let frame = win
+                    .window()
+                    .take_snapshot()
+                    .map(|pixels| ScreenshotFrame {
+                        width: pixels.width(),
+                        height: pixels.height(),
+                        rgba: pixels.as_bytes().to_vec(),
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = reply.send(frame);
+            })
+            .map_err(|error| error.to_string())
+        });
+    }
 
     // Show the crate version (from Cargo.toml at compile time) in the sidebar,
     // so the footer never drifts out of sync with the actual build.
@@ -805,12 +897,8 @@ pub fn run() -> Result<()> {
             let Some(win) = weak.upgrade() else { return };
             let token = crate::debug_api::generate_token();
             win.set_debug_api_token(token.clone().into());
-            let applied = configure_debug_api(
-                &win,
-                &controller,
-                win.get_debug_api_enabled(),
-                &token,
-            );
+            let applied =
+                configure_debug_api(&win, &controller, win.get_debug_api_enabled(), &token);
             win.set_debug_api_enabled(applied);
             {
                 let mut config = store.borrow_mut();
@@ -920,7 +1008,6 @@ pub fn run() -> Result<()> {
         });
     }
 
-
     // Apply the saved UI language.  The Rust-side flag drives `i18n::t(...)`;
     // `apply_to_slint` selects the bundled `.po` for the static `@tr(...)` text
     // (must run after the first component exists, which it now does).
@@ -960,6 +1047,8 @@ pub fn run() -> Result<()> {
         }
         window.set_term_font_size(s.font_size() as f32);
         window.set_term_font_bold(s.terminal_bold());
+        window.set_hardware_acceleration_enabled(s.hardware_acceleration());
+        window.set_hardware_acceleration_available(hardware_acceleration_setting_available());
         window.set_ui_scale(s.ui_scale() as f32 / 100.0); // global UI zoom (#100)
         window.set_panel_font(s.panel_font() as f32 / 100.0); // settings-panel font scale
     }
@@ -1247,10 +1336,54 @@ pub fn run() -> Result<()> {
             w.set_webdav_status(msg.into());
         });
     }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_hardware_acceleration(move |enabled: bool| {
+            let available = hardware_acceleration_setting_available();
+            let old = store.borrow().hardware_acceleration();
+            if !available || enabled == old {
+                if let Some(win) = weak.upgrade() {
+                    win.set_hardware_acceleration_enabled(old);
+                }
+                return;
+            }
+
+            let save_result = {
+                let mut config = store.borrow_mut();
+                config.set_hardware_acceleration(enabled);
+                let result = config.save();
+                if result.is_err() {
+                    config.set_hardware_acceleration(old);
+                }
+                result
+            };
+            if let Err(error) = save_result {
+                tracing::warn!("failed to save hardware acceleration setting: {error:#}");
+                if let Some(win) = weak.upgrade() {
+                    win.set_hardware_acceleration_enabled(old);
+                }
+                return;
+            }
+
+            if let Err(error) = spawn_replacement_process() {
+                tracing::warn!("failed to restart after renderer change: {error:#}");
+                let mut config = store.borrow_mut();
+                config.set_hardware_acceleration(old);
+                let _ = config.save();
+                if let Some(win) = weak.upgrade() {
+                    win.set_hardware_acceleration_enabled(old);
+                }
+                return;
+            }
+            let _ = slint::quit_event_loop();
+        });
+    }
     // Interface settings: apply + persist the terminal font family / size.
     {
         let weak = window.as_weak();
         let store = store.clone();
+        let bufs = bufs.clone();
         window.on_set_term_font(move |family: SharedString| {
             {
                 let mut s = store.borrow_mut();
@@ -1259,12 +1392,14 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_family(family);
+                rebuild_all_terminal_displays(&w, &bufs);
             }
         });
     }
     {
         let weak = window.as_weak();
         let store = store.clone();
+        let bufs = bufs.clone();
         window.on_set_term_font_size(move |size: i32| {
             {
                 let mut s = store.borrow_mut();
@@ -1273,12 +1408,14 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_size(size as f32);
+                rebuild_all_terminal_displays(&w, &bufs);
             }
         });
     }
     {
         let weak = window.as_weak();
         let store = store.clone();
+        let bufs = bufs.clone();
         window.on_set_term_font_bold(move |bold: bool| {
             {
                 let mut s = store.borrow_mut();
@@ -1287,6 +1424,7 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_bold(bold);
+                rebuild_all_terminal_displays(&w, &bufs);
             }
         });
     }
@@ -2094,6 +2232,8 @@ pub fn run() -> Result<()> {
         let mut focused = true;
         let mut minimized = false;
         let mut occluded = false;
+        let mut last_terminal_raster_refresh =
+            std::time::Instant::now() - std::time::Duration::from_secs(1);
         // Apply the Win11 rounded-corner hint once, on the first event (the HWND
         // reliably exists by then, unlike a pre-run timer) (#166).
         let mut chrome_done = false;
@@ -2127,7 +2267,7 @@ pub fn run() -> Result<()> {
             }
             // Recompute window activity, push it to the shared cell, and update
             // Theme.window-focused (gates the cursor blink) (#127).
-            let apply_activity = |focused: bool, minimized: bool, occluded: bool| {
+            let mut apply_activity = |focused: bool, minimized: bool, occluded: bool| {
                 let act = if minimized || occluded {
                     WinActivity::Hidden
                 } else if focused {
@@ -2139,6 +2279,22 @@ pub fn run() -> Result<()> {
                 ev_activity.set(act);
                 if let Some(win) = weak.upgrade() {
                     win.set_window_focused(act == WinActivity::Active);
+                    let raster_surface_may_be_stale = terminal_row_images_enabled()
+                        && ((prev == WinActivity::Hidden && act != WinActivity::Hidden)
+                            || (prev != WinActivity::Active && act == WinActivity::Active));
+                    if raster_surface_may_be_stale
+                        && last_terminal_raster_refresh.elapsed()
+                            >= std::time::Duration::from_millis(100)
+                    {
+                        last_terminal_raster_refresh = std::time::Instant::now();
+                        let weak2 = weak.clone();
+                        let bufs = wheel_bufs.clone();
+                        slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                            if let Some(w) = weak2.upgrade() {
+                                refresh_visible_terminal_rasters(&w, &bufs);
+                            }
+                        });
+                    }
                     if prev == WinActivity::Hidden && act != WinActivity::Hidden {
                         win.set_terminal_restore_cover(true);
                         let weak2 = weak.clone();
@@ -2201,6 +2357,15 @@ pub fn run() -> Result<()> {
                 WEvent::Occluded(o) => {
                     occluded = *o;
                     apply_activity(focused, minimized, occluded);
+                }
+                WEvent::ScaleFactorChanged { .. } => {
+                    let weak = weak.clone();
+                    let bufs = wheel_bufs.clone();
+                    slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                        if let Some(win) = weak.upgrade() {
+                            rebuild_all_terminal_displays(&win, &bufs);
+                        }
+                    });
                 }
                 WEvent::Resized(size) => {
                     // A 0-sized resize is how Windows reports a minimize; track it
@@ -2454,7 +2619,14 @@ fn terminal_wheel_hit(
     } else {
         term_state.sftp_panel_height + 4.0
     };
-    shrink_edge(&mut term_x, &mut term_y, &mut term_w, &mut term_h, &sftp_dock, sftp_take);
+    shrink_edge(
+        &mut term_x,
+        &mut term_y,
+        &mut term_w,
+        &mut term_h,
+        &sftp_dock,
+        sftp_take,
+    );
 
     // Leave the command bar to TextInput/history handling; wheel fallback is for
     // terminal output only.
@@ -2950,7 +3122,11 @@ fn builtin_local_sessions() -> Vec<Session> {
     let mut out = Vec::new();
     #[cfg(windows)]
     {
-        out.push(builtin_local_session("system:powershell", "PowerShell", "powershell"));
+        out.push(builtin_local_session(
+            "system:powershell",
+            "PowerShell",
+            "powershell",
+        ));
         out.push(builtin_local_session("system:cmd", "CMD", "cmd"));
         if wsl_available() {
             out.push(builtin_local_session("system:wsl", "WSL", "wsl"));
@@ -3798,6 +3974,11 @@ fn wire_session_callbacks(
                 id: tab_id.clone().into(),
                 status: t("连接中...", "Connecting...").into(),
                 spans: ModelRc::from(std::rc::Rc::new(VecModel::<TermSpan>::default())),
+                row_images: ModelRc::from(std::rc::Rc::new(VecModel::<TermRowImage>::default())),
+                row_images_ready: false,
+                row_image_columns: 0,
+                row_image_cell_width: 0.0,
+                row_image_cell_height: 0.0,
                 render_revision: 0,
                 cursor_row: 0,
                 cursor_col: 0,
@@ -3840,6 +4021,8 @@ fn wire_session_callbacks(
                 tab_id.clone(),
                 Arc::new(Mutex::new(TermBuffer {
                     parser: vt100::Parser::new(24, 80, 5000),
+                    raster_cell_width: 8.0,
+                    raster_cell_height: 16.0,
                     find_query: String::new(),
                     is_dark: is_dark_now,
                     sel_anchor: None,
@@ -4518,7 +4701,11 @@ fn pairs_to_one_row(pairs: &[(String, String)]) -> Vec<SysInfoRow> {
 fn pairs_to_rows(pairs: &[(String, String)], width: usize) -> Vec<SysInfoRow> {
     pairs
         .chunks(width)
-        .filter(|chunk| chunk.iter().any(|(_, v)| !v.trim().is_empty() && v.trim() != "-"))
+        .filter(|chunk| {
+            chunk
+                .iter()
+                .any(|(_, v)| !v.trim().is_empty() && v.trim() != "-")
+        })
         .map(|chunk| {
             let value = |idx: usize| {
                 chunk
@@ -4641,10 +4828,7 @@ fn fill_local_gpu_info(info: &mut LocalHardwareInfo) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
         return;
     };
-    let registry_values = value
-        .get("Registry")
-        .map(json_values)
-        .unwrap_or_default();
+    let registry_values = value.get("Registry").map(json_values).unwrap_or_default();
     let controller_values = value
         .get("Controllers")
         .map(json_values)
@@ -4687,8 +4871,7 @@ fn fill_local_gpu_info(info: &mut LocalHardwareInfo) {
                 ),
                 memory: nonempty_prefer(
                     matched.map(|item| item.memory.as_str()).unwrap_or_default(),
-                    &gpu
-                        .get("AdapterRAM")
+                    &gpu.get("AdapterRAM")
                         .and_then(|v| v.as_u64())
                         .filter(|bytes| *bytes > 0)
                         .map(format_size)
@@ -4770,20 +4953,44 @@ fn local_system_details(snap: &SystemSnapshot) -> SystemDetails {
     let info = local_hardware_info();
     SystemDetails {
         overview: vec![
-            (t("操作系统", "Operating system").to_string(), nonempty_or_dash(&info.os)),
+            (
+                t("操作系统", "Operating system").to_string(),
+                nonempty_or_dash(&info.os),
+            ),
             (
                 t("内核版本", "Kernel version").to_string(),
                 nonempty_or_dash(&info.kernel_version),
             ),
-            (t("主机名称", "Hostname").to_string(), nonempty_or_dash(&info.hostname)),
-            (t("内核", "Kernel").to_string(), nonempty_or_dash(&info.kernel)),
-            (t("硬件架构", "Architecture").to_string(), nonempty_or_dash(&info.arch)),
-            (t("连接", "Connection").to_string(), t("本机", "Local").to_string()),
+            (
+                t("主机名称", "Hostname").to_string(),
+                nonempty_or_dash(&info.hostname),
+            ),
+            (
+                t("内核", "Kernel").to_string(),
+                nonempty_or_dash(&info.kernel),
+            ),
+            (
+                t("硬件架构", "Architecture").to_string(),
+                nonempty_or_dash(&info.arch),
+            ),
+            (
+                t("连接", "Connection").to_string(),
+                t("本机", "Local").to_string(),
+            ),
         ],
         cpu_info: vec![
-            (t("名称", "Name").to_string(), nonempty_or_dash(&info.cpu_name)),
-            (t("核心数", "Cores").to_string(), nonempty_or_dash(&info.cpu_cores)),
-            (t("频率", "Frequency").to_string(), nonempty_or_dash(&info.cpu_frequency)),
+            (
+                t("名称", "Name").to_string(),
+                nonempty_or_dash(&info.cpu_name),
+            ),
+            (
+                t("核心数", "Cores").to_string(),
+                nonempty_or_dash(&info.cpu_cores),
+            ),
+            (
+                t("频率", "Frequency").to_string(),
+                nonempty_or_dash(&info.cpu_frequency),
+            ),
             (t("缓存", "Cache").to_string(), "-".to_string()),
             ("BogoMips".to_string(), nonempty_or_dash(&info.cpu_vendor)),
         ],
@@ -4793,14 +5000,26 @@ fn local_system_details(snap: &SystemSnapshot) -> SystemDetails {
             .flat_map(|gpu| {
                 [
                     (t("名称", "Name").to_string(), nonempty_or_dash(&gpu.name)),
-                    (t("厂商", "Vendor").to_string(), nonempty_or_dash(&gpu.vendor)),
-                    (t("驱动", "Driver").to_string(), nonempty_or_dash(&gpu.driver)),
-                    (t("内存", "Memory").to_string(), nonempty_or_dash(&gpu.memory)),
+                    (
+                        t("厂商", "Vendor").to_string(),
+                        nonempty_or_dash(&gpu.vendor),
+                    ),
+                    (
+                        t("驱动", "Driver").to_string(),
+                        nonempty_or_dash(&gpu.driver),
+                    ),
+                    (
+                        t("内存", "Memory").to_string(),
+                        nonempty_or_dash(&gpu.memory),
+                    ),
                 ]
             })
             .collect(),
         cpu_usage: vec![
-            (t("用户", "User").to_string(), format!("{:.1}%", snap.cpu_percent * 100.0)),
+            (
+                t("用户", "User").to_string(),
+                format!("{:.1}%", snap.cpu_percent * 100.0),
+            ),
             ("Nice".to_string(), "-".to_string()),
             (t("系统", "System").to_string(), "-".to_string()),
             (t("空闲", "Idle").to_string(), "-".to_string()),
@@ -4812,7 +5031,10 @@ fn local_system_details(snap: &SystemSnapshot) -> SystemDetails {
                 t("剩余", "Free").to_string(),
                 format_size(mem_total.saturating_sub(mem_used)),
             ),
-            (t("已用", "Usage").to_string(), format!("{:.1}%", snap.mem_percent * 100.0)),
+            (
+                t("已用", "Usage").to_string(),
+                format!("{:.1}%", snap.mem_percent * 100.0),
+            ),
             (t("缓存", "Cached").to_string(), "-".to_string()),
         ],
         swap: vec![
@@ -4822,7 +5044,10 @@ fn local_system_details(snap: &SystemSnapshot) -> SystemDetails {
                 t("剩余", "Free").to_string(),
                 format_size(swap_total.saturating_sub(swap_used)),
             ),
-            (t("已用", "Usage").to_string(), format!("{:.1}%", snap.swap_percent * 100.0)),
+            (
+                t("已用", "Usage").to_string(),
+                format!("{:.1}%", snap.swap_percent * 100.0),
+            ),
         ],
         networks: vec![(
             t("本机", "Local").to_string(),
@@ -4871,7 +5096,6 @@ mod process_row_tests {
         assert_eq!(rows[0].mem.as_str(), "-");
         assert_eq!(rows[0].cpu_frac, 0.0);
     }
-
 }
 
 fn sync_system_info_theme(main: &AppWindow, sys: &SystemInfoWindow) {
@@ -5411,41 +5635,385 @@ fn sync_vec_model_rows<T: Clone + 'static>(
     changed
 }
 
+fn terminal_row_images_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("MEATSHELL_TERMINAL_RENDERER") {
+        Ok(value) if matches!(value.trim().to_ascii_lowercase().as_str(), "spans" | "text") => {
+            false
+        }
+        Ok(value)
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "rows" | "images"
+            ) =>
+        {
+            true
+        }
+        _ => cfg!(windows),
+    })
+}
+
+/// Row textures pay off for full-screen TUIs, where hundreds of styled spans
+/// would otherwise become Slint items. A normal shell is sparse and is both
+/// cheaper and more reliable as native spans (especially while readline is
+/// rapidly echoing and erasing the current input line).
+fn terminal_frame_prefers_row_images(is_alt: bool, span_count: usize, rows: u16) -> bool {
+    is_alt || span_count >= (rows as usize).saturating_mul(3).max(96)
+}
+
+fn terminal_rasterizer() -> &'static TerminalRasterizer {
+    static RASTERIZER: OnceLock<TerminalRasterizer> = OnceLock::new();
+    RASTERIZER.get_or_init(TerminalRasterizer::new)
+}
+
+fn raster_color(color: slint::Color) -> [u8; 4] {
+    [color.red(), color.green(), color.blue(), color.alpha()]
+}
+
+fn raster_rows(spans: &[TermSpan], row_count: usize) -> Vec<Vec<RasterSpan>> {
+    let mut rows = vec![Vec::new(); row_count];
+    for span in spans {
+        let Ok(row) = usize::try_from(span.row) else {
+            continue;
+        };
+        let Some(output) = rows.get_mut(row) else {
+            continue;
+        };
+        output.push(RasterSpan {
+            text: span.text.to_string(),
+            foreground: raster_color(span.fg),
+            background: raster_color(span.bg),
+            bold: span.bold,
+            col: span.col.max(0) as u32,
+            cells: span.cells.max(0) as u32,
+            cjk: span.cjk,
+        });
+    }
+    rows
+}
+
+#[derive(Default)]
+struct RasterUiState {
+    pending: HashMap<String, RasterCompletion>,
+    scheduled: HashSet<String>,
+}
+
+fn raster_ui_state() -> &'static Mutex<RasterUiState> {
+    static STATE: OnceLock<Mutex<RasterUiState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(RasterUiState::default()))
+}
+
+fn merge_raster_completion(slot: &mut RasterCompletion, incoming: RasterCompletion) {
+    match (slot, incoming) {
+        (Ok(current), Ok(next)) => current.merge_from(next),
+        (slot, incoming) => *slot = incoming,
+    }
+}
+
+fn forget_terminal_raster_ui(tab_id: &str) {
+    let mut state = raster_ui_state().lock().unwrap();
+    state.pending.remove(tab_id);
+    state.scheduled.remove(tab_id);
+}
+
+fn forget_terminal_raster(tab_id: &str) {
+    terminal_rasterizer().forget(tab_id);
+    forget_terminal_raster_ui(tab_id);
+}
+
+fn apply_terminal_raster_completion(win: &AppWindow, tab_id: &str, completion: RasterCompletion) {
+    match completion {
+        Ok(result) => {
+            let is_latest =
+                terminal_rasterizer().is_latest_generation(&result.tab_id, result.generation);
+            apply_terminal_raster_result(win, result, is_latest);
+        }
+        Err(error) => {
+            tracing::warn!(tab_id, %error, "terminal row raster failed");
+            set_terminal_row(win, tab_id, |row| row.row_images_ready = false);
+            win.window().request_redraw();
+        }
+    }
+}
+
+fn schedule_terminal_raster_ui(weak: slint::Weak<AppWindow>, tab_id: String) {
+    let tab_for_event = tab_id.clone();
+    let invoke = slint::invoke_from_event_loop(move || {
+        let Some(win) = weak.upgrade() else {
+            forget_terminal_raster_ui(&tab_for_event);
+            return;
+        };
+
+        // Results can arrive while this callback is applying an older delta.
+        // Drain them here instead of recursively calling invoke_from_event_loop
+        // from the UI thread (which can drop the final frame on some backends).
+        loop {
+            let completion = raster_ui_state()
+                .lock()
+                .unwrap()
+                .pending
+                .remove(&tab_for_event);
+            if let Some(completion) = completion {
+                apply_terminal_raster_completion(&win, &tab_for_event, completion);
+            }
+
+            let mut state = raster_ui_state().lock().unwrap();
+            if state.pending.contains_key(&tab_for_event) {
+                continue;
+            }
+            state.scheduled.remove(&tab_for_event);
+            break;
+        }
+    });
+    if let Err(error) = invoke {
+        forget_terminal_raster_ui(&tab_id);
+        tracing::debug!(%error, "terminal raster result dropped after event-loop exit");
+    }
+}
+
+fn enqueue_terminal_raster_ui(
+    weak: slint::Weak<AppWindow>,
+    tab_id: String,
+    completion: RasterCompletion,
+) {
+    let should_schedule = {
+        let mut state = raster_ui_state().lock().unwrap();
+        if let Some(pending) = state.pending.get_mut(&tab_id) {
+            merge_raster_completion(pending, completion);
+        } else {
+            state.pending.insert(tab_id.clone(), completion);
+        }
+        state.scheduled.insert(tab_id.clone())
+    };
+    if should_schedule {
+        schedule_terminal_raster_ui(weak, tab_id);
+    }
+}
+
+fn apply_terminal_raster_result(win: &AppWindow, result: RasterResult, is_latest: bool) {
+    let tab_id = result.tab_id.clone();
+    set_terminal_row(win, &tab_id, |row| {
+        let model = row
+            .row_images
+            .as_any()
+            .downcast_ref::<VecModel<TermRowImage>>()
+            .expect("terminal row image model must be a VecModel");
+
+        let columns = result.columns.min(i32::MAX as u32) as i32;
+        let geometry_changed = row.row_image_columns != columns
+            || (row.row_image_cell_width - result.logical_cell_width).abs() > f32::EPSILON
+            || (row.row_image_cell_height - result.logical_cell_height).abs() > f32::EPSILON;
+        if geometry_changed {
+            for index in 0..model.row_count() {
+                model.set_row_data(
+                    index,
+                    TermRowImage {
+                        source: Image::default(),
+                        valid: false,
+                    },
+                );
+            }
+        }
+
+        while model.row_count() > result.row_count {
+            model.remove(model.row_count() - 1);
+        }
+        while model.row_count() < result.row_count {
+            model.push(TermRowImage {
+                source: Image::default(),
+                valid: false,
+            });
+        }
+        for update in &result.updates {
+            if update.row >= result.row_count
+                || update.pixels.len() != update.width as usize * update.height as usize * 4
+            {
+                continue;
+            }
+            let mut pixels = SharedPixelBuffer::<Rgba8Pixel>::new(update.width, update.height);
+            pixels.make_mut_bytes().copy_from_slice(&update.pixels);
+            model.set_row_data(
+                update.row,
+                TermRowImage {
+                    source: Image::from_rgba8_premultiplied(pixels),
+                    valid: true,
+                },
+            );
+        }
+        let all_rows_valid = result.row_count > 0
+            && (0..result.row_count)
+                .all(|index| model.row_data(index).is_some_and(|image| image.valid));
+        row.row_image_columns = columns;
+        row.row_image_cell_width = result.logical_cell_width;
+        row.row_image_cell_height = result.logical_cell_height;
+        // Do not instantiate Skia's row-image subtree for an all-transparent
+        // placeholder frame. The SSH tab is created before its banner/prompt
+        // arrives; caching that empty first frame can otherwise leave later
+        // incremental sources invisible until an alt-screen mode switch.
+        row.row_images_ready = is_latest && all_rows_valid && result.has_content;
+        if is_latest && all_rows_valid {
+            row.cursor_row = result.cursor_row;
+            row.cursor_col = result.cursor_col;
+        }
+    });
+    tracing::trace!(
+        tab_id,
+        generation = result.generation,
+        is_latest,
+        rows = result.row_count,
+        changed_rows = result.updates.len(),
+        "terminal row raster applied"
+    );
+    win.window().request_redraw();
+}
+
+fn submit_terminal_raster(
+    win: &AppWindow,
+    tab_id: &str,
+    spans: &[TermSpan],
+    rows: u16,
+    cols: u16,
+    logical_cell_width: f32,
+    logical_cell_height: f32,
+    cursor_row: i32,
+    cursor_col: i32,
+) {
+    if !terminal_row_images_enabled() {
+        return;
+    }
+    let scale = win.window().scale_factor().max(0.5);
+    let job = RasterJob::new(
+        tab_id.to_string(),
+        RasterConfig {
+            columns: cols as u32,
+            cell_width: logical_cell_width.max(1.0) * scale,
+            cell_height: logical_cell_height.max(1.0) * scale,
+            font_size: win.get_term_font_size().max(1.0) * scale,
+            terminal_family: win.get_term_font_family().to_string(),
+            cjk_family: win.get_ui_font_family().to_string(),
+            force_bold: win.get_term_font_bold(),
+        },
+        raster_rows(spans, rows as usize),
+    )
+    .with_frame_state(
+        logical_cell_width.max(1.0),
+        logical_cell_height.max(1.0),
+        cursor_row,
+        cursor_col,
+    );
+    let weak = win.as_weak();
+    let tab_id = tab_id.to_string();
+    terminal_rasterizer().submit(job, move |completion| {
+        enqueue_terminal_raster_ui(weak, tab_id, completion);
+    });
+}
+
+fn refresh_visible_terminal_rasters(win: &AppWindow, bufs: &TermBuffers) {
+    if !terminal_row_images_enabled() {
+        return;
+    }
+    for tab_id in visible_tab_ids(win) {
+        // A minimized/occluded D3D surface can lose uploaded row textures while
+        // the Rust Image values and worker signatures remain intact. Show the
+        // already-current span model immediately, then force a complete row
+        // upload for the restored surface.
+        forget_terminal_raster(&tab_id);
+        set_terminal_row(win, &tab_id, |row| row.row_images_ready = false);
+        rebuild_tab_display(win, bufs, &tab_id);
+    }
+    win.window().request_redraw();
+}
+
 fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     let data = with_term_buf(bufs, tab_id, |buf| {
-        let cols = buf.parser.screen().size().1;
+        let (rows, cols) = buf.parser.screen().size();
         let b = buf.render(); // also refreshes buf.displayed_text
         let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
         let sel = buf.selection_rects_visible(cols);
-        (b, matches, sel)
+        (
+            b,
+            matches,
+            sel,
+            rows,
+            cols,
+            buf.raster_cell_width,
+            buf.raster_cell_height,
+        )
     });
-    let Some((b, matches, sel)) = data else {
+    let Some((b, matches, sel, rows, cols, cell_width, cell_height)) = data else {
         return;
     };
     let (cr, cc, ru, alt) = (b.cursor_row, b.cursor_col, b.rows_used, b.is_alt);
     let (smax, soff) = (b.scroll_max, b.scroll_offset);
+    let row_images_enabled = terminal_row_images_enabled();
+    let row_images_for_frame =
+        row_images_enabled && terminal_frame_prefers_row_images(alt, b.spans.len(), rows);
     let mut changed = false;
+    let mut forget_sparse_raster = false;
     set_terminal_row(win, tab_id, |row| {
-        let model_changed = sync_term_span_rows(&row.spans, &b.spans)
-            | sync_vec_model_rows(&row.find_matches, &matches, term_match_eq)
+        let span_changed = sync_term_span_rows(&row.spans, &b.spans);
+        let overlay_changed = sync_vec_model_rows(&row.find_matches, &matches, term_match_eq)
             | sync_vec_model_rows(&row.selection, &sel, term_match_eq);
 
-        let scalar_changed = row.cursor_row != cr
-            || row.cursor_col != cc
+        let screen_mode_changed = row.is_alt_screen != alt;
+        let cursor_position_changed = row.cursor_row != cr || row.cursor_col != cc;
+        if !row_images_for_frame {
+            // Release row textures when returning from a TUI to a sparse shell.
+            // Keeping transparent images for every shell row wastes memory and
+            // can cover newer readline text if an old delta arrives late.
+            if row.row_image_columns != 0 || row.row_images_ready {
+                forget_sparse_raster = true;
+                if let Some(model) = row
+                    .row_images
+                    .as_any()
+                    .downcast_ref::<VecModel<TermRowImage>>()
+                {
+                    while model.row_count() > 0 {
+                        model.remove(model.row_count() - 1);
+                    }
+                }
+                row.row_image_columns = 0;
+                row.row_image_cell_width = 0.0;
+                row.row_image_cell_height = 0.0;
+            }
+            row.row_images_ready = false;
+        }
+        // Normal shell screens contain few spans. Show those authoritative
+        // spans immediately whenever text/cursor changes, then switch back to
+        // the cached row images only when the newest generation is complete.
+        // This prevents typed or erased text from being covered by an older
+        // texture if the raster worker is delayed or a completion is coalesced.
+        if row_images_for_frame && !alt && (span_changed || cursor_position_changed) {
+            row.row_images_ready = false;
+        }
+        let immediate_cursor =
+            !row_images_for_frame || !row.row_images_ready || screen_mode_changed;
+        let cursor_changed = immediate_cursor && (row.cursor_row != cr || row.cursor_col != cc);
+        let scalar_changed = cursor_changed
             || row.rows_used != ru
             || row.is_alt_screen != alt
             || row.scroll_max != smax
             || row.scroll_offset != soff;
+        if screen_mode_changed && row_images_for_frame {
+            // Destroy the old image subtree immediately. In particular, leaving
+            // alt-screen can replace opaque btop rows with transparent shell
+            // rows; keeping the old subtree until the worker finishes leaves
+            // stale pixels in a partial-rendered window.
+            forget_terminal_raster(tab_id);
+            row.row_images_ready = false;
+        }
         if scalar_changed {
-            row.cursor_row = cr;
-            row.cursor_col = cc;
+            if immediate_cursor {
+                row.cursor_row = cr;
+                row.cursor_col = cc;
+            }
             row.rows_used = ru;
             row.is_alt_screen = alt;
             row.scroll_max = smax;
             row.scroll_offset = soff;
         }
-        changed = model_changed || scalar_changed;
-        if changed && !alt {
+        changed = scalar_changed || overlay_changed || (span_changed && !row.row_images_ready);
+        if (span_changed || overlay_changed || scalar_changed) && !alt {
             // Normal-screen output must keep the scrollback viewport pinned.
             // Alt-screen TUIs are already fixed at y=0; changing the outer
             // TerminalState there would invalidate far more UI than the nested
@@ -5455,6 +6023,22 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     });
     if changed {
         win.window().request_redraw();
+    }
+    if forget_sparse_raster {
+        forget_terminal_raster(tab_id);
+    }
+    if row_images_for_frame {
+        submit_terminal_raster(
+            win,
+            tab_id,
+            &b.spans,
+            rows,
+            cols,
+            cell_width,
+            cell_height,
+            cr,
+            cc,
+        );
     }
 }
 
@@ -5473,6 +6057,18 @@ mod terminal_model_tests {
             cells: 3,
             cjk: false,
         }
+    }
+
+    #[test]
+    fn sparse_shell_frames_stay_on_the_native_span_path() {
+        assert!(!terminal_frame_prefers_row_images(false, 12, 35));
+        assert!(!terminal_frame_prefers_row_images(false, 95, 24));
+    }
+
+    #[test]
+    fn full_screen_and_dense_frames_use_row_images() {
+        assert!(terminal_frame_prefers_row_images(true, 1, 35));
+        assert!(terminal_frame_prefers_row_images(false, 105, 35));
     }
 
     fn model_matches(model: &VecModel<TermSpan>, expected: &[TermSpan]) -> bool {
@@ -5652,9 +6248,13 @@ fn apply_dark_mode(window: &AppWindow, bufs: &TermBuffers, dark: bool) {
             h.lock().unwrap().is_dark = dark;
         }
     }
+    rebuild_all_terminal_displays(window, bufs);
+}
+
+fn rebuild_all_terminal_displays(window: &AppWindow, bufs: &TermBuffers) {
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
-    for tid in tab_ids {
-        rebuild_tab_display(window, bufs, &tid);
+    for tab_id in tab_ids {
+        rebuild_tab_display(window, bufs, &tab_id);
     }
 }
 
@@ -5792,94 +6392,93 @@ fn refresh_sidebar(
             vm.set_vec(proc_rows(procs));
         }
     };
-    let set_system_models =
-        |win: &AppWindow,
-         cpu: f32,
-         mem: f32,
-         swap: f32,
-         mem_detail: SharedString,
-         swap_detail: SharedString,
-         nets: Vec<SysNetRow>,
-         disks: Vec<DiskInfo>,
-         sys: SystemDetails| {
-            if let Some(vm) = win
-                .get_sys_metrics()
-                .as_any()
-                .downcast_ref::<VecModel<SysMetricRow>>()
-            {
-                vm.set_vec(metric_rows(cpu, mem, swap, mem_detail, swap_detail));
-            }
-            if let Some(vm) = win
-                .get_sys_net_rows()
-                .as_any()
-                .downcast_ref::<VecModel<SysNetRow>>()
-            {
-                vm.set_vec(nets);
-            }
-            if let Some(vm) = win
-                .get_sys_disks()
-                .as_any()
-                .downcast_ref::<VecModel<DiskInfo>>()
-            {
-                vm.set_vec(disks);
-            }
-            if let Some(vm) = win
-                .get_sys_overview_rows()
-                .as_any()
-                .downcast_ref::<VecModel<SysInfoRow>>()
-            {
-                vm.set_vec(pairs_to_overview_rows(&sys.overview));
-            }
-            if let Some(vm) = win
-                .get_sys_cpu_info_rows()
-                .as_any()
-                .downcast_ref::<VecModel<SysInfoRow>>()
-            {
-                vm.set_vec(pairs_to_one_row(&sys.cpu_info));
-            }
-            if let Some(vm) = win
-                .get_sys_gpu_info_rows()
-                .as_any()
-                .downcast_ref::<VecModel<SysInfoRow>>()
-            {
-                vm.set_vec(pairs_to_rows(&sys.gpu_info, 4));
-            }
-            if let Some(vm) = win
-                .get_sys_cpu_usage_rows()
-                .as_any()
-                .downcast_ref::<VecModel<SysInfoRow>>()
-            {
-                vm.set_vec(cpu_usage_detail_rows(&sys.cpu_usage));
-            }
-            if let Some(vm) = win
-                .get_sys_memory_rows()
-                .as_any()
-                .downcast_ref::<VecModel<SysInfoRow>>()
-            {
-                vm.set_vec(pairs_to_one_row(&sys.memory));
-            }
-            if let Some(vm) = win
-                .get_sys_swap_rows()
-                .as_any()
-                .downcast_ref::<VecModel<SysInfoRow>>()
-            {
-                vm.set_vec(pairs_to_one_row(&sys.swap));
-            }
-            if let Some(vm) = win
-                .get_sys_network_rows()
-                .as_any()
-                .downcast_ref::<VecModel<SysInfoRow>>()
-            {
-                vm.set_vec(tuple5_rows(&sys.networks));
-            }
-            if let Some(vm) = win
-                .get_sys_filesystem_rows()
-                .as_any()
-                .downcast_ref::<VecModel<SysInfoRow>>()
-            {
-                vm.set_vec(tuple5_rows(&sys.filesystems));
-            }
-        };
+    let set_system_models = |win: &AppWindow,
+                             cpu: f32,
+                             mem: f32,
+                             swap: f32,
+                             mem_detail: SharedString,
+                             swap_detail: SharedString,
+                             nets: Vec<SysNetRow>,
+                             disks: Vec<DiskInfo>,
+                             sys: SystemDetails| {
+        if let Some(vm) = win
+            .get_sys_metrics()
+            .as_any()
+            .downcast_ref::<VecModel<SysMetricRow>>()
+        {
+            vm.set_vec(metric_rows(cpu, mem, swap, mem_detail, swap_detail));
+        }
+        if let Some(vm) = win
+            .get_sys_net_rows()
+            .as_any()
+            .downcast_ref::<VecModel<SysNetRow>>()
+        {
+            vm.set_vec(nets);
+        }
+        if let Some(vm) = win
+            .get_sys_disks()
+            .as_any()
+            .downcast_ref::<VecModel<DiskInfo>>()
+        {
+            vm.set_vec(disks);
+        }
+        if let Some(vm) = win
+            .get_sys_overview_rows()
+            .as_any()
+            .downcast_ref::<VecModel<SysInfoRow>>()
+        {
+            vm.set_vec(pairs_to_overview_rows(&sys.overview));
+        }
+        if let Some(vm) = win
+            .get_sys_cpu_info_rows()
+            .as_any()
+            .downcast_ref::<VecModel<SysInfoRow>>()
+        {
+            vm.set_vec(pairs_to_one_row(&sys.cpu_info));
+        }
+        if let Some(vm) = win
+            .get_sys_gpu_info_rows()
+            .as_any()
+            .downcast_ref::<VecModel<SysInfoRow>>()
+        {
+            vm.set_vec(pairs_to_rows(&sys.gpu_info, 4));
+        }
+        if let Some(vm) = win
+            .get_sys_cpu_usage_rows()
+            .as_any()
+            .downcast_ref::<VecModel<SysInfoRow>>()
+        {
+            vm.set_vec(cpu_usage_detail_rows(&sys.cpu_usage));
+        }
+        if let Some(vm) = win
+            .get_sys_memory_rows()
+            .as_any()
+            .downcast_ref::<VecModel<SysInfoRow>>()
+        {
+            vm.set_vec(pairs_to_one_row(&sys.memory));
+        }
+        if let Some(vm) = win
+            .get_sys_swap_rows()
+            .as_any()
+            .downcast_ref::<VecModel<SysInfoRow>>()
+        {
+            vm.set_vec(pairs_to_one_row(&sys.swap));
+        }
+        if let Some(vm) = win
+            .get_sys_network_rows()
+            .as_any()
+            .downcast_ref::<VecModel<SysInfoRow>>()
+        {
+            vm.set_vec(tuple5_rows(&sys.networks));
+        }
+        if let Some(vm) = win
+            .get_sys_filesystem_rows()
+            .as_any()
+            .downcast_ref::<VecModel<SysInfoRow>>()
+        {
+            vm.set_vec(tuple5_rows(&sys.filesystems));
+        }
+    };
     win.set_proc_available(false);
     set_procs(win, &[]);
 
@@ -7095,6 +7694,9 @@ fn wire_tab_callbacks(
             sftp_last_cwd.lock().unwrap().remove(&id);
             bufs.lock().unwrap().remove(&id);
             render_gates.lock().unwrap().remove(&id);
+            if terminal_row_images_enabled() {
+                forget_terminal_raster(&id);
+            }
             tab_statuses.lock().unwrap().remove(&id);
             debug_api.remove_terminal(&id);
 
@@ -8864,45 +9466,62 @@ fn wire_key_input(
         let pending_size: Rc<RefCell<HashMap<String, (u32, u32)>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let resize_debounce = Rc::new(slint::Timer::default());
-        window.on_terminal_resize(move |tab_id: SharedString, cols_f: f32, rows_f: f32| {
-            // A hidden terminal (inactive tab, or a split sibling not currently
-            // shown) reports 0 width/height. Ignore those: flooring 0 to the 10-col
-            // minimum and applying it would shrink that tab's PTY *and* poison
-            // `last_term_size`, so the next connection (e.g. "Duplicate connection")
-            // would start at 10 cols and wrap its first output to ~10 chars (#v0.5).
-            // Only genuine, visible sizes drive a resize.
-            if cols_f < 1.0 || rows_f < 1.0 {
-                return;
-            }
-            let cols = (cols_f as u32).max(10);
-            let rows = (rows_f as u32).max(5);
-            pending_size
-                .borrow_mut()
-                .insert(tab_id.to_string(), (cols, rows));
-            let pending = pending_size.clone();
-            let handles = handles.clone();
-            let bufs = bufs_resize.clone();
-            let last = last_term_size.clone();
-            let weak = weak_resize.clone();
-            // (Re)arm the single-shot timer; rapid changes keep resetting it so
-            // only the final, settled size is applied.
-            resize_debounce.start(
-                slint::TimerMode::SingleShot,
-                std::time::Duration::from_millis(150),
-                move || {
-                    let settled: Vec<(String, (u32, u32))> = pending.borrow_mut().drain().collect();
-                    for (tab, (cols, rows)) in settled {
-                        tracing::debug!("terminal_resize tab={} cols={} rows={}", tab, cols, rows);
-                        apply_terminal_resize(&handles, &bufs, &last, &tab, cols, rows);
-                        // Re-render so the reflowed (or resized) grid shows at once
-                        // instead of waiting for the next remote output (#169).
-                        if let Some(win) = weak.upgrade() {
-                            rebuild_tab_display(&win, &bufs, &tab);
+        window.on_terminal_resize(
+            move |tab_id: SharedString,
+                  cols_f: f32,
+                  rows_f: f32,
+                  cell_width: f32,
+                  cell_height: f32| {
+                // A hidden terminal (inactive tab, or a split sibling not currently
+                // shown) reports 0 width/height. Ignore those: flooring 0 to the 10-col
+                // minimum and applying it would shrink that tab's PTY *and* poison
+                // `last_term_size`, so the next connection (e.g. "Duplicate connection")
+                // would start at 10 cols and wrap its first output to ~10 chars (#v0.5).
+                // Only genuine, visible sizes drive a resize.
+                if cols_f < 1.0 || rows_f < 1.0 {
+                    return;
+                }
+                if let Some(buffer) = term_buf(&bufs_resize, tab_id.as_str()) {
+                    let mut buffer = buffer.lock().unwrap();
+                    buffer.raster_cell_width = cell_width.max(1.0);
+                    buffer.raster_cell_height = cell_height.max(1.0);
+                }
+                let cols = (cols_f as u32).max(10);
+                let rows = (rows_f as u32).max(5);
+                pending_size
+                    .borrow_mut()
+                    .insert(tab_id.to_string(), (cols, rows));
+                let pending = pending_size.clone();
+                let handles = handles.clone();
+                let bufs = bufs_resize.clone();
+                let last = last_term_size.clone();
+                let weak = weak_resize.clone();
+                // (Re)arm the single-shot timer; rapid changes keep resetting it so
+                // only the final, settled size is applied.
+                resize_debounce.start(
+                    slint::TimerMode::SingleShot,
+                    std::time::Duration::from_millis(150),
+                    move || {
+                        let settled: Vec<(String, (u32, u32))> =
+                            pending.borrow_mut().drain().collect();
+                        for (tab, (cols, rows)) in settled {
+                            tracing::debug!(
+                                "terminal_resize tab={} cols={} rows={}",
+                                tab,
+                                cols,
+                                rows
+                            );
+                            apply_terminal_resize(&handles, &bufs, &last, &tab, cols, rows);
+                            // Re-render so the reflowed (or resized) grid shows at once
+                            // instead of waiting for the next remote output (#169).
+                            if let Some(win) = weak.upgrade() {
+                                rebuild_tab_display(&win, &bufs, &tab);
+                            }
                         }
-                    }
-                },
-            );
-        });
+                    },
+                );
+            },
+        );
     }
 
     // Ctrl+Shift+C: copy current terminal screen to clipboard.
@@ -9009,6 +9628,9 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_clear_terminal(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
+            if terminal_row_images_enabled() {
+                forget_terminal_raster(&tid);
+            }
             if let Some(h) = term_buf(&bufs_clear, &tid) {
                 let mut buf = h.lock().unwrap();
                 let (rows, cols) = buf.parser.screen().size();
@@ -9026,6 +9648,17 @@ fn wire_key_input(
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
                     sync_vec_model_rows(&row.spans, &[], term_span_eq);
+                    if let Some(images) = row
+                        .row_images
+                        .as_any()
+                        .downcast_ref::<VecModel<TermRowImage>>()
+                    {
+                        images.set_vec(Vec::new());
+                    }
+                    row.row_images_ready = false;
+                    row.row_image_columns = 0;
+                    row.row_image_cell_width = 0.0;
+                    row.row_image_cell_height = 0.0;
                     sync_vec_model_rows(&row.find_matches, &[], term_match_eq);
                     sync_vec_model_rows(&row.selection, &[], term_match_eq);
                     row.render_revision = row.render_revision.wrapping_add(1);
@@ -9205,34 +9838,36 @@ fn wire_key_input(
     {
         let bufs_sel = bufs.clone();
         let weak = window.as_weak();
-        window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32, ctrl: bool, shift: bool| {
-            let tid = tab_id.to_string();
-            with_term_buf(&bufs_sel, &tid, |buf| {
-                let (rows, cols) = buf.parser.screen().size();
-                let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
-                let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
-                // Anchor + focus in absolute scrollback coordinates.
-                let abs = buf.vis_to_abs(r);
-                let point = (abs, c);
-                if ctrl && !shift {
-                    buf.sel_ranges.push((point, point));
-                } else if shift && !buf.sel_ranges.is_empty() {
-                    let anchor = buf.sel_ranges.last().map(|range| range.0).unwrap_or(point);
-                    if let Some(range) = buf.sel_ranges.last_mut() {
-                        *range = (anchor, point);
+        window.on_term_select_start(
+            move |tab_id: SharedString, row: i32, col: i32, ctrl: bool, shift: bool| {
+                let tid = tab_id.to_string();
+                with_term_buf(&bufs_sel, &tid, |buf| {
+                    let (rows, cols) = buf.parser.screen().size();
+                    let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
+                    let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
+                    // Anchor + focus in absolute scrollback coordinates.
+                    let abs = buf.vis_to_abs(r);
+                    let point = (abs, c);
+                    if ctrl && !shift {
+                        buf.sel_ranges.push((point, point));
+                    } else if shift && !buf.sel_ranges.is_empty() {
+                        let anchor = buf.sel_ranges.last().map(|range| range.0).unwrap_or(point);
+                        if let Some(range) = buf.sel_ranges.last_mut() {
+                            *range = (anchor, point);
+                        }
+                    } else {
+                        buf.sel_ranges.clear();
+                        buf.sel_ranges.push((point, point));
                     }
-                } else {
-                    buf.sel_ranges.clear();
-                    buf.sel_ranges.push((point, point));
+                    let (anchor, focus) = buf.sel_ranges.last().copied().unwrap_or((point, point));
+                    buf.sel_anchor = Some(anchor);
+                    buf.sel_focus = Some(focus);
+                });
+                if let Some(win) = weak.upgrade() {
+                    rebuild_tab_display(&win, &bufs_sel, &tid);
                 }
-                let (anchor, focus) = buf.sel_ranges.last().copied().unwrap_or((point, point));
-                buf.sel_anchor = Some(anchor);
-                buf.sel_focus = Some(focus);
-            });
-            if let Some(win) = weak.upgrade() {
-                rebuild_tab_display(&win, &bufs_sel, &tid);
-            }
-        });
+            },
+        );
     }
     {
         let bufs_sel = bufs.clone();
@@ -10408,11 +11043,7 @@ impl TermBuffer {
             .join("\n")
     }
 
-    fn extract_range_text(
-        &self,
-        (ar, ac): (usize, u16),
-        (fr, fc): (usize, u16),
-    ) -> String {
+    fn extract_range_text(&self, (ar, ac): (usize, u16), (fr, fc): (usize, u16)) -> String {
         let (lo_r, lo_c, hi_r, hi_c) = if (ar, ac) <= (fr, fc) {
             (ar, ac, fr, fc)
         } else {
@@ -11205,8 +11836,7 @@ mod terminal_mouse_tests {
     fn sgr_double_click_reports_two_complete_left_clicks() {
         let parser = parser_with_mode(b"\x1b[?1000h\x1b[?1006h");
         let report = |kind| {
-            encode_terminal_mouse_event(parser.screen(), kind, 0, 4, 2, false, false)
-                .unwrap()
+            encode_terminal_mouse_event(parser.screen(), kind, 0, 4, 2, false, false).unwrap()
         };
         let actual = [
             report(TerminalMouseEventKind::Press),
@@ -11366,7 +11996,10 @@ mod selection_tests {
             sftp_entry("dir2", true),
         ];
         sort_sftp_entries(&mut entries, "", 0);
-        assert_eq!(sftp_names(&entries), vec!["dir2", "dir10", "file11", "file100"]);
+        assert_eq!(
+            sftp_names(&entries),
+            vec!["dir2", "dir10", "file11", "file100"]
+        );
     }
 
     fn hist_line(s: &str) -> Line {
@@ -11390,6 +12023,8 @@ mod selection_tests {
         parser.process(live_lines.join("\r\n").as_bytes());
         TermBuffer {
             parser,
+            raster_cell_width: 8.0,
+            raster_cell_height: 16.0,
             find_query: String::new(),
             is_dark: false,
             sel_anchor: None,

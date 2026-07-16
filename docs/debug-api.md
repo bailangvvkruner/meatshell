@@ -13,6 +13,7 @@ Authorization: Bearer <token>
 ## Endpoints
 
 - `GET /v1/health`
+- `GET /v1/screenshot?max_width=2048&max_height=2048`
 - `GET /v1/terminals`
 - `GET /v1/terminals/{id}/screen?max_lines=200`
 - `POST /v1/terminals/{id}/input`
@@ -42,6 +43,10 @@ Invoke-RestMethod "http://127.0.0.1:24817/v1/terminals/$id/screen?max_lines=100"
 Invoke-RestMethod "http://127.0.0.1:24817/v1/terminals/$id/input" `
   -Method Post -Headers $headers -ContentType "application/json" `
   -Body '{"text":"pwd","submit":true}'
+
+# Capture the current rendered window without focusing it. The API returns PNG.
+Invoke-WebRequest "http://127.0.0.1:24817/v1/screenshot?max_width=2048&max_height=2048" `
+  -Headers $headers -OutFile meatshell-debug.png
 ```
 
 Only an AI client with local tool or HTTP access can call this interface; a

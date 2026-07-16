@@ -21,7 +21,7 @@ import { Welcome, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton, ToolStrip } from "widgets.slint";
-import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint";
+import { TerminalView, TermSpan, TermRowImage, TermMatch, QuickCmd } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
 
@@ -61,6 +61,11 @@ export struct TerminalState {
     id: string,
     status: string,
     spans: [TermSpan],     // coloured runs of the visible terminal screen
+    row-images: [TermRowImage], // cached raster rows (terminal fast path)
+    row-images-ready: bool,
+    row-image-columns: int,
+    row-image-cell-width: float,
+    row-image-cell-height: float,
     render-revision: int,  // advances when a terminal frame is applied
     cursor-row: int,       // cursor cell on the grid
     cursor-col: int,
@@ -397,6 +402,8 @@ export component AppWindow inherits Window {
     in-out property <string> term-font-family <=> Theme.term-font-family;
     in-out property <length> term-font-size <=> Theme.term-font-size;
     in-out property <bool> term-font-bold <=> Theme.term-font-bold;
+    in-out property <bool> hardware-acceleration-enabled: true;
+    in property <bool> hardware-acceleration-available: false;
     in-out property <float> ui-scale <=> Theme.ui-scale;   // global UI zoom (#100)
     in-out property <float> panel-font <=> Theme.panel-font;  // settings-panel font scale
     callback set-panel-font(int);                          // apply + persist (percent)
@@ -435,6 +442,7 @@ export component AppWindow inherits Window {
     callback set-term-font(string);                // apply + persist font family
     callback set-term-font-size(int);              // apply + persist font size (px)
     callback set-term-font-bold(bool);             // apply + persist bold terminal text
+    callback set-hardware-acceleration(bool);      // save + restart with selected renderer
     callback set-ui-scale(int);                    // apply + persist UI scale (percent) (#100)
     // Immersive wallpaper (set by Rust). The active id + custom file basename
     // feed the Interface → Wallpaper picker.
@@ -713,8 +721,9 @@ export component AppWindow inherits Window {
 
     // Raw keystroke forwarding: Rust converts key+modifiers to PTY bytes.
     callback send-key(string /* tab-id */, string /* key */, bool /* ctrl */, bool /* alt */, bool /* shift */);
-    // Notifies Rust of a PTY resize (pixel dimensions; Rust converts to cols/rows).
-    callback terminal-resize(string /* tab-id */, float /* width-px */, float /* height-px */);
+    // Notifies Rust of the grid and measured logical cell dimensions.
+    callback terminal-resize(string /* tab-id */, float /* cols */, float /* rows */,
+                             float /* cell-width */, float /* cell-height */);
 
     // --- SFTP callbacks ---------------------------------------------------
     // Navigate to a new remote directory (or ".." to go up).
@@ -1334,6 +1343,11 @@ export component AppWindow inherits Window {
                     tab-id: term.id;
                     status-line: term.status;
                     spans: term.spans;
+                    row-images: term.row-images;
+                    row-images-ready: term.row-images-ready;
+                    row-image-columns: term.row-image-columns;
+                    row-image-cell-width: term.row-image-cell-width;
+                    row-image-cell-height: term.row-image-cell-height;
                     render-revision: term.render-revision;
                     cursor-row: term.cursor-row;
                     cursor-col: term.cursor-col;
@@ -1387,7 +1401,9 @@ export component AppWindow inherits Window {
                     rename-quick-group(g) => { root.qcg-orig = g; root.qcg-name = g; root.qcg-open = true; }
                     delete-quick-group(g) => { root.delete-quick-group(g); }
                     send-key(key, ctrl, alt, shift) => { root.send-key(term.id, key, ctrl, alt, shift) }
-                    terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
+                    terminal-resize(cols, rows, cell-w, cell-h) => {
+                        root.terminal-resize(term.id, cols, rows, cell-w, cell-h);
+                    }
                     sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
                     sftp-download(path) => { root.sftp-download(term.id, path); }
                     sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
@@ -3770,6 +3786,8 @@ export component AppWindow inherits Window {
                     term-font-family: root.term-font-family;
                     term-font-size: root.term-font-size;
                     term-font-bold: root.term-font-bold;
+                    hardware-acceleration-enabled: root.hardware-acceleration-enabled;
+                    hardware-acceleration-available: root.hardware-acceleration-available;
                     ui-scale: root.ui-scale;
                     sftp-follow-cd <=> root.sftp-follow-cd;
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
@@ -3798,6 +3816,7 @@ export component AppWindow inherits Window {
                     set-term-font(v) => { root.set-term-font(v); }
                     set-term-font-size(v) => { root.set-term-font-size(v); }
                     set-term-font-bold(v) => { root.set-term-font-bold(v); }
+                    set-hardware-acceleration(v) => { root.set-hardware-acceleration(v); }
                     set-ui-scale(v) => { root.set-ui-scale(v); }
                     set-panel-font(v) => { root.set-panel-font(v); }
                     set-sftp-follow-cd(v) => { root.set-sftp-follow-cd(v); }
