@@ -533,6 +533,7 @@ export component AppWindow inherits Window {
     in-out property <string> cred-host;            // host shown in the dialog title
     in-out property <bool> cred-need-user: false;
     in-out property <bool> cred-need-password: false;
+    in-out property <bool> cred-retry: false;       // saved credentials were rejected
     in-out property <string> cred-user;            // username field value
     in-out property <string> cred-password;        // password field value
     in-out property <bool> cred-remember: false;   // persist to the saved session
@@ -3442,7 +3443,9 @@ export component AppWindow inherits Window {
                 padding: 20px;
                 spacing: 12px;
                 Text {
-                    text: @tr("Login");
+                    text: root.cred-retry
+                        ? (root.lang-en ? "Authentication failed" : "认证失败")
+                        : @tr("Login");
                     color: Theme.text-primary;
                     font-size: Theme.fs-xl;
                     font-weight: 600;
@@ -3452,6 +3455,14 @@ export component AppWindow inherits Window {
                     color: Theme.text-secondary;
                     font-family: Theme.font-mono;
                     font-size: Theme.fs-sm;
+                }
+                if root.cred-retry : Text {
+                    text: root.lang-en
+                        ? "The saved password was rejected. Enter the current password."
+                        : "保存的密码已被服务器拒绝，请输入当前密码。";
+                    color: Theme.warning;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
                 }
                 if root.cred-need-user : LabeledInput {
                     label: @tr("Username");
@@ -3480,7 +3491,9 @@ export component AppWindow inherits Window {
                         clicked => { root.cred-reject(); }
                     }
                     PrimaryButton {
-                        text: @tr("Connect");
+                        text: root.cred-retry
+                            ? (root.lang-en ? "Retry" : "重试")
+                            : @tr("Connect");
                         clicked => { root.cred-accept(); }
                     }
                 }

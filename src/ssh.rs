@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use futures::future::BoxFuture;
 use russh::client::{self, Handle, Handler, Msg};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{decode_secret_key, load_secret_key, PrivateKey};
@@ -597,6 +598,8 @@ pub enum SessionEvent {
         user: String,
         need_user: bool,
         need_password: bool,
+        /// True when saved credentials were explicitly rejected by the server.
+        retry: bool,
         responder: CredentialResponder,
     },
     /// A keyboard-interactive challenge that isn't the account password —
@@ -1183,43 +1186,158 @@ pub(crate) enum AuthResult {
     Failed,
 }
 
-/// Authenticate an already-connected SSH handle using the session's method,
-/// prompting for missing credentials and supporting explicit / fallback
-/// `keyboard-interactive` auth (#86, #249). Shared by the shell, SFTP and
-/// jump-host paths. On the keyboard-interactive fallback it reconnects, updating
-/// both `handle` and `jump_handle` in place so the caller keeps the live tunnel.
-pub(crate) async fn authenticate_session(
-    handle: &mut Handle<ClientHandler>,
+const MAX_CREDENTIAL_REPROMPTS: usize = 3;
+pub(crate) type AuthReconnectFuture<H> =
+    BoxFuture<'static, Result<(Handle<H>, Option<Handle<ClientHandler>>)>>;
+
+async fn reconnect_auth_handle<H, F>(
+    handle: &mut Handle<H>,
+    jump_handle: &mut Option<Handle<ClientHandler>>,
+    reconnect: &mut F,
+) -> Result<()>
+where
+    H: Handler + 'static,
+    H::Error: std::error::Error + Send + Sync + 'static,
+    F: FnMut() -> AuthReconnectFuture<H>,
+{
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+    let (next, next_jump) = reconnect().await?;
+    *handle = next;
+    *jump_handle = next_jump;
+    Ok(())
+}
+
+async fn authenticate_password_with_fallback<H, F>(
+    handle: &mut Handle<H>,
     jump_handle: &mut Option<Handle<ClientHandler>>,
     session: &Session,
-    jump: Option<&Session>,
-    config: Arc<client::Config>,
     events: &UnboundedSender<SessionEvent>,
-) -> Result<AuthResult> {
-    let (user, password) = match resolve_credentials(session, events).await {
+    user: &str,
+    password: &str,
+    reconnect: &mut F,
+) -> Result<bool>
+where
+    H: Handler + 'static,
+    H::Error: std::error::Error + Send + Sync + 'static,
+    F: FnMut() -> AuthReconnectFuture<H>,
+{
+    let ok = handle
+        .authenticate_password(user, password)
+        .await
+        .context("password auth failed")?
+        .success();
+    if ok {
+        return Ok(true);
+    }
+
+    // russh cannot safely switch auth methods after a rejection on the same
+    // handle, so keyboard-interactive always starts on a fresh connection.
+    reconnect_auth_handle(handle, jump_handle, reconnect).await?;
+    keyboard_interactive_auth(handle, user, password, &session.id, &session.host, events)
+        .await
+        .context("keyboard-interactive auth failed")
+}
+
+/// Authenticate any already-connected SSH handle and replace it through
+/// `reconnect` after a rejected method. Shared by shell, SFTP and jump-host
+/// paths so all of them get the same bounded password re-prompt behavior.
+pub(crate) async fn authenticate_connected_session<H, F>(
+    handle: &mut Handle<H>,
+    jump_handle: &mut Option<Handle<ClientHandler>>,
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+    mut reconnect: F,
+) -> Result<AuthResult>
+where
+    H: Handler + 'static,
+    H::Error: std::error::Error + Send + Sync + 'static,
+    F: FnMut() -> AuthReconnectFuture<H>,
+{
+    let (mut user, mut password) = match resolve_credentials(session, events).await {
         Some(c) => c,
         None => return Ok(AuthResult::Cancelled),
     };
 
     let authed = match session.auth {
         AuthMethod::Password => {
-            let mut ok = handle
-                .authenticate_password(&user, password.as_str())
+            let mut ok = authenticate_password_with_fallback(
+                handle,
+                jump_handle,
+                session,
+                events,
+                &user,
+                &password,
+                &mut reconnect,
+            )
+            .await?;
+            for _ in 0..MAX_CREDENTIAL_REPROMPTS {
+                if ok {
+                    break;
+                }
+                let Some((next_user, next_password, _remember)) = request_credential_prompt(
+                    &session.id,
+                    &session.host,
+                    &user,
+                    false,
+                    true,
+                    true,
+                    events,
+                )
                 .await
-                .context("password auth failed")?
-                .success();
-            if !ok {
-                // russh can't switch auth methods on a handle whose first attempt
-                // already failed (it hangs), so reconnect on a fresh handle before
-                // trying keyboard-interactive (#86).
-                let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-                let (h, jh) = Box::pin(connect_ssh(session, jump, config.clone(), events)).await?;
-                *handle = h;
-                *jump_handle = jh;
+                else {
+                    return Ok(AuthResult::Cancelled);
+                };
+                user = ssh_username_or_root(&next_user).to_string();
+                password = next_password;
+                reconnect_auth_handle(handle, jump_handle, &mut reconnect).await?;
+                ok = authenticate_password_with_fallback(
+                    handle,
+                    jump_handle,
+                    session,
+                    events,
+                    &user,
+                    &password,
+                    &mut reconnect,
+                )
+                .await?;
+            }
+            ok
+        }
+        AuthMethod::KeyboardInteractive => {
+            let mut ok = keyboard_interactive_auth(
+                handle,
+                &user,
+                &password,
+                &session.id,
+                &session.host,
+                events,
+            )
+            .await
+            .context("keyboard-interactive auth failed")?;
+            for _ in 0..MAX_CREDENTIAL_REPROMPTS {
+                if ok {
+                    break;
+                }
+                let Some((next_user, next_password, _remember)) = request_credential_prompt(
+                    &session.id,
+                    &session.host,
+                    &user,
+                    false,
+                    true,
+                    true,
+                    events,
+                )
+                .await
+                else {
+                    return Ok(AuthResult::Cancelled);
+                };
+                user = ssh_username_or_root(&next_user).to_string();
+                password = next_password;
+                reconnect_auth_handle(handle, jump_handle, &mut reconnect).await?;
                 ok = keyboard_interactive_auth(
                     handle,
                     &user,
-                    password.as_str(),
+                    &password,
                     &session.id,
                     &session.host,
                     events,
@@ -1229,16 +1347,6 @@ pub(crate) async fn authenticate_session(
             }
             ok
         }
-        AuthMethod::KeyboardInteractive => keyboard_interactive_auth(
-            handle,
-            &user,
-            password.as_str(),
-            &session.id,
-            &session.host,
-            events,
-        )
-        .await
-        .context("keyboard-interactive auth failed")?,
         AuthMethod::Key => {
             // An encrypted private key needs its passphrase; we reuse the
             // session's password field for it (empty = unencrypted key) (#90).
@@ -1261,6 +1369,31 @@ pub(crate) async fn authenticate_session(
     } else {
         Ok(AuthResult::Failed)
     }
+}
+
+/// Shell/jump-host wrapper around the generic authentication flow.
+pub(crate) fn authenticate_session<'a>(
+    handle: &'a mut Handle<ClientHandler>,
+    jump_handle: &'a mut Option<Handle<ClientHandler>>,
+    session: &'a Session,
+    jump: Option<&'a Session>,
+    config: Arc<client::Config>,
+    events: &'a UnboundedSender<SessionEvent>,
+) -> BoxFuture<'a, Result<AuthResult>> {
+    Box::pin(async move {
+        let reconnect_session = session.clone();
+        let reconnect_jump = jump.cloned();
+        let reconnect_config = config.clone();
+        let reconnect_events = events.clone();
+        authenticate_connected_session(handle, jump_handle, session, events, move || {
+            let session = reconnect_session.clone();
+            let jump = reconnect_jump.clone();
+            let config = reconnect_config.clone();
+            let events = reconnect_events.clone();
+            Box::pin(async move { connect_ssh(&session, jump.as_ref(), config, &events).await })
+        })
+        .await
+    })
 }
 
 /// Connect + authenticate a jump/bastion session, open a `direct-tcpip` channel
@@ -3030,12 +3163,45 @@ pub(crate) async fn verify_host_key(
     }
 }
 
+/// Ask the UI for connection credentials. `retry` marks a password previously
+/// rejected by the server so the UI does not replay its de-duplication cache.
+pub(crate) async fn request_credential_prompt(
+    session_id: &str,
+    host: &str,
+    user: &str,
+    need_user: bool,
+    need_password: bool,
+    retry: bool,
+    events: &UnboundedSender<SessionEvent>,
+) -> Option<CredentialReply> {
+    if retry {
+        let _ = events.send(SessionEvent::Status(
+            t(
+                "认证失败，请重新输入密码",
+                "Authentication failed; re-enter password",
+            )
+            .into(),
+        ));
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    events
+        .send(SessionEvent::CredentialPrompt {
+            session_id: session_id.to_string(),
+            host: host.to_string(),
+            user: user.to_string(),
+            need_user,
+            need_password,
+            retry,
+            responder: CredentialResponder::new(tx),
+        })
+        .ok()?;
+    rx.await.ok().flatten()
+}
+
 /// Resolve a session's username/password, defaulting a blank username to root
 /// and prompting the UI for a missing password. Returns the effective
-/// `(user, password)`, or `None` if the user cancelled. Both the shell and SFTP
-/// connections call this; the UI
-/// de-duplicates by session id so a single dialog serves both. A dropped reply
-/// channel (no UI) falls through with the stored values so auth fails normally.
+/// `(user, password)`, or `None` if the user cancelled. Both shell and SFTP
+/// connections call this; the UI de-duplicates simultaneous prompts by session.
 pub(crate) async fn resolve_credentials(
     session: &Session,
     events: &UnboundedSender<SessionEvent>,
@@ -3046,20 +3212,18 @@ pub(crate) async fn resolve_credentials(
     if !need_password {
         return Some((user, password));
     }
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let sent = events.send(SessionEvent::CredentialPrompt {
-        session_id: session.id.clone(),
-        host: session.host.clone(),
-        user: user.clone(),
-        need_user: false,
+    match request_credential_prompt(
+        &session.id,
+        &session.host,
+        &user,
+        false,
         need_password,
-        responder: CredentialResponder::new(tx),
-    });
-    if sent.is_err() {
-        return Some((user, password));
-    }
-    match rx.await {
-        Ok(Some((_user, p, _remember))) => {
+        false,
+        events,
+    )
+    .await
+    {
+        Some((_user, p, _remember)) => {
             if need_password {
                 password = p;
             }
@@ -3612,5 +3776,124 @@ mod mfa_tests {
         ] {
             assert!(looks_like_mfa(p), "missed an MFA prompt: {p:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_prompt_tests {
+    use super::{request_credential_prompt, SessionEvent, MAX_CREDENTIAL_REPROMPTS};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn rejected_password_requests_and_returns_fresh_credentials() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let prompt = tokio::spawn(async move {
+            request_credential_prompt(
+                "session-1",
+                "host.example",
+                "root",
+                false,
+                true,
+                true,
+                &events,
+            )
+            .await
+        });
+
+        let status = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("status event timed out")
+            .expect("status channel closed");
+        assert!(matches!(status, SessionEvent::Status(_)));
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("credential event timed out")
+            .expect("credential channel closed");
+        match event {
+            SessionEvent::CredentialPrompt {
+                session_id,
+                host,
+                user,
+                need_user,
+                need_password,
+                retry,
+                responder,
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(host, "host.example");
+                assert_eq!(user, "root");
+                assert!(!need_user);
+                assert!(need_password);
+                assert!(retry);
+                responder.respond(Some(("root".into(), "new-password".into(), true)));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        assert_eq!(
+            prompt.await.expect("prompt task panicked"),
+            Some(("root".into(), "new-password".into(), true))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_credential_prompt_returns_none() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let prompt = tokio::spawn(async move {
+            request_credential_prompt(
+                "session-2",
+                "host.example",
+                "alice",
+                false,
+                true,
+                false,
+                &events,
+            )
+            .await
+        });
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("credential event timed out")
+            .expect("credential channel closed");
+        match event {
+            SessionEvent::CredentialPrompt {
+                retry, responder, ..
+            } => {
+                assert!(!retry);
+                responder.respond(None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(prompt.await.expect("prompt task panicked"), None);
+    }
+
+    #[tokio::test]
+    async fn closed_ui_channel_does_not_wait_for_credentials() {
+        let (events, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let result = timeout(
+            Duration::from_secs(1),
+            request_credential_prompt(
+                "session-3",
+                "host.example",
+                "root",
+                false,
+                true,
+                true,
+                &events,
+            ),
+        )
+        .await
+        .expect("closed channel must not block");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn password_reprompts_are_bounded() {
+        assert_eq!(MAX_CREDENTIAL_REPROMPTS, 3);
     }
 }

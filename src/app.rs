@@ -7522,16 +7522,20 @@ fn apply_session_event_to_window(
             user,
             need_user,
             need_password,
+            retry,
             responder,
         } => {
             enqueue_cred_prompt(
                 win,
-                session_id,
-                host,
-                user,
-                need_user,
-                need_password,
-                responder,
+                PendingCred {
+                    session_id,
+                    host,
+                    user,
+                    need_user,
+                    need_password,
+                    retry,
+                    responders: vec![responder],
+                },
             );
         }
         SessionEvent::MfaPrompt {
@@ -7731,6 +7735,7 @@ struct PendingCred {
     user: String,
     need_user: bool,
     need_password: bool,
+    retry: bool,
     responders: Vec<crate::ssh::CredentialResponder>,
 }
 
@@ -7745,23 +7750,36 @@ thread_local! {
 /// Queue a credential prompt: answer immediately if already decided this run,
 /// merge into an existing pending entry for the same session, otherwise enqueue
 /// (and show it now if nothing else is up).
-fn enqueue_cred_prompt(
-    win: &AppWindow,
-    session_id: String,
-    host: String,
-    user: String,
-    need_user: bool,
-    need_password: bool,
-    responder: crate::ssh::CredentialResponder,
-) {
+fn enqueue_cred_prompt(win: &AppWindow, pending: PendingCred) {
+    let PendingCred {
+        session_id,
+        host,
+        user,
+        need_user,
+        need_password,
+        retry,
+        mut responders,
+    } = pending;
+    if retry {
+        // A previous answer was explicitly rejected by the server. Never replay
+        // it from the shell/SFTP de-duplication cache.
+        CRED_DECIDED.with(|d| {
+            d.borrow_mut().remove(&session_id);
+        });
+    }
     if let Some(reply) = CRED_DECIDED.with(|d| d.borrow().get(&session_id).cloned()) {
-        responder.respond(reply);
+        for responder in responders {
+            responder.respond(reply.clone());
+        }
         return;
     }
     let show_now = CRED_QUEUE.with(|q| {
         let mut q = q.borrow_mut();
         if let Some(p) = q.iter_mut().find(|p| p.session_id == session_id) {
-            p.responders.push(responder);
+            p.need_user |= need_user;
+            p.need_password |= need_password;
+            p.retry |= retry;
+            p.responders.append(&mut responders);
             return false;
         }
         let was_empty = q.is_empty();
@@ -7771,7 +7789,8 @@ fn enqueue_cred_prompt(
             user,
             need_user,
             need_password,
-            responders: vec![responder],
+            retry,
+            responders,
         });
         was_empty
     });
@@ -7787,9 +7806,10 @@ fn show_front_cred(win: &AppWindow) {
             win.set_cred_host(p.host.clone().into());
             win.set_cred_need_user(p.need_user);
             win.set_cred_need_password(p.need_password);
+            win.set_cred_retry(p.retry);
             win.set_cred_user(p.user.clone().into());
             win.set_cred_password("".into());
-            win.set_cred_remember(false);
+            win.set_cred_remember(p.retry);
             win.set_cred_prompt_open(true);
         }
     });
