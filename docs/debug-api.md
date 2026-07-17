@@ -24,7 +24,11 @@ peak process memory, selected renderer, whether it is GPU-backed, whether the
 bundled ANGLE EGL runtime is actually loaded, and the active terminal render
 interval. These fields let automated checks catch an accidental debug binary,
 track memory growth, and distinguish the D3D11 path from a software or
-native-OpenGL fallback.
+native-OpenGL fallback. `working_set_bytes` is total resident memory,
+`private_working_set_bytes` is resident memory private to MeatShell, and
+`private_commit_bytes` includes committed pages that are not currently
+resident. The memory-trim object reports idle heap/working-set reclamation and
+whether ANGLE's D3D11 device accepted `IDXGIDevice3::Trim`.
 
 The input request body is JSON:
 
@@ -55,6 +59,19 @@ debug click from becoming shell input. `kind` is `click`, `press`, `release`, or
   "clicks": 2
 }
 ```
+
+A double click is dispatched as two complete press/release batches separated
+by at least 120 ms. The SSH transport also paces consecutive presses while it
+continues reading remote output. This prevents Linux TUIs such as btop from
+reading both presses in one input poll and treating them as text selection.
+Local, serial, and Telnet sessions keep their normal pointer pass-through; this
+is not a Windows btop compatibility mode.
+
+The screenshot endpoint captures the currently rendered MeatShell window
+without focusing it and returns `image/png`. Dimensions are aspect-ratio
+preserving and capped by both query limits and the server pixel limit. Only one
+capture/encode operation may run at a time; an overlapping request receives
+`429 screenshot_busy` instead of building an unbounded image queue.
 
 ## PowerShell Example
 

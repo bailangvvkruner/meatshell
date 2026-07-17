@@ -21,7 +21,7 @@ jobs:
     # Only run once the AUR SSH key is configured.
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.release != null && !github.event.release.prerelease) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Resolve version + set pkgver
         run: |
@@ -43,7 +43,7 @@ jobs:
       - name: Publish meatshell-bin to the AUR
         # Skips cleanly until the AUR SSH key secret is configured.
         if: ${{ env.AUR_SSH_PRIVATE_KEY != '' }}
-        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
         with:
           pkgname: meatshell-bin
           pkgbuild: packaging/aur/PKGBUILD

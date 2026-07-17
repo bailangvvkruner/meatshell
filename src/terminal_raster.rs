@@ -734,15 +734,9 @@ fn render_row(
 
     let metrics = Metrics::new(config.font_size, config.cell_height);
     let mut buffer = Buffer::new(font_system, metrics);
-    buffer.set_size(font_system, Some(width as f32), Some(height as f32));
-    buffer.set_wrap(font_system, Wrap::None);
-    buffer.set_rich_text(
-        font_system,
-        rich_text,
-        &default_attrs,
-        Shaping::Advanced,
-        None,
-    );
+    buffer.set_size(Some(width as f32), Some(height as f32));
+    buffer.set_wrap(Wrap::None);
+    buffer.set_rich_text(rich_text, &default_attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(font_system, false);
 
     // Cosmic Text chooses fonts and shapes clusters, but its natural advances

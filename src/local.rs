@@ -151,6 +151,14 @@ async fn run_local(
                     break;
                 }
             }
+            SessionCommand::PointerInput { bytes, .. } => {
+                tracing::debug!("local pty pointer write len={} bytes", bytes.len());
+                let mut guard = writer.lock().unwrap();
+                if guard.write_all(&bytes).and_then(|_| guard.flush()).is_err() {
+                    let _ = events.send(SessionEvent::Closed(t("写入失败", "write failed").into()));
+                    break;
+                }
+            }
             SessionCommand::DebugInput { bytes, ack } => {
                 tracing::debug!("local pty debug input len={} bytes", bytes.len());
                 let result = {

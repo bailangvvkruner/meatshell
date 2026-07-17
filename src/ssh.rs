@@ -8,11 +8,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
 use russh::client::{self, Handle, Handler, Msg};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{decode_secret_key, load_secret_key, PrivateKey};
-use russh::{Channel, ChannelId, ChannelMsg, Disconnect};
+use russh::{Channel, ChannelId, ChannelMsg, ChannelOpenFailure, Disconnect};
 use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
@@ -317,6 +316,32 @@ fn url_decode(s: &str) -> String {
     result
 }
 
+/// Some terminal applications read all currently available bytes as one mouse
+/// report. Keep consecutive presses in separate input polls so a double click
+/// is not collapsed into a single selection.
+pub(crate) const MIN_POINTER_PRESS_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(120);
+
+fn pointer_press_deadline(
+    kind: PointerInputKind,
+    last_press: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    if kind != PointerInputKind::Press {
+        return None;
+    }
+    last_press
+        .map(|last| last + MIN_POINTER_PRESS_INTERVAL)
+        .filter(|deadline| *deadline > now)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PointerInputKind {
+    Press,
+    Release,
+    Motion,
+}
+
 /// Commands posted to the worker task by the UI.
 #[derive(Debug)]
 pub enum SessionCommand {
@@ -327,6 +352,12 @@ pub enum SessionCommand {
     DebugInput {
         bytes: Vec<u8>,
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Encoded xterm pointer input. The SSH worker paces consecutive presses;
+    /// other transports preserve normal pass-through ordering.
+    PointerInput {
+        bytes: Vec<u8>,
+        kind: PointerInputKind,
     },
     /// Notify the remote PTY of a terminal resize.
     Resize(u32, u32),
@@ -661,6 +692,12 @@ impl SessionHandle {
 
     pub fn resize(&self, cols: u32, rows: u32) {
         let _ = self.commands.send(SessionCommand::Resize(cols, rows));
+    }
+
+    pub fn send_pointer(&self, bytes: Vec<u8>, kind: PointerInputKind) {
+        let _ = self
+            .commands
+            .send(SessionCommand::PointerInput { bytes, kind });
     }
 
     pub fn add_tunnel(&self, id: String, forward: PortForward) {
@@ -1169,7 +1206,8 @@ pub(crate) async fn authenticate_session(
             let mut ok = handle
                 .authenticate_password(&user, password.as_str())
                 .await
-                .context("password auth failed")?;
+                .context("password auth failed")?
+                .success();
             if !ok {
                 // russh can't switch auth methods on a handle whose first attempt
                 // already failed (it hangs), so reconnect on a fresh handle before
@@ -1209,12 +1247,12 @@ pub(crate) async fn authenticate_session(
             // RSA keys must be signed with an explicit SHA-2 hash; every other
             // key type carries its own algorithm, so no override is needed.
             let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
-                .context("invalid private key / hash algorithm combination")?;
+            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash);
             handle
                 .authenticate_publickey(&user, key_with_hash)
                 .await
                 .context("publickey auth failed")?
+                .success()
         }
     };
 
@@ -1463,6 +1501,15 @@ async fn close_resource_monitor(channel: &mut Option<Channel<Msg>>) {
             tracing::warn!("monitor channel close failed: {error}");
         }
     }
+}
+
+async fn write_ssh_pointer(
+    channel: &Channel<Msg>,
+    bytes: &[u8],
+    kind: PointerInputKind,
+) -> Result<(), String> {
+    tracing::debug!("ssh pointer input kind={kind:?} len={} bytes", bytes.len());
+    channel.data(bytes).await.map_err(|error| error.to_string())
 }
 
 async fn run_session(
@@ -1748,9 +1795,12 @@ async fn run_session(
     emit_tunnel_update(&runtime_forwards, &events);
 
     // --- Main pump ------------------------------------------------------
+    let mut last_pointer_press: Option<tokio::time::Instant> = None;
+    let mut pending_pointer: Option<(Vec<u8>, PointerInputKind)> = None;
+    let mut pending_pointer_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
-            cmd = commands.recv() => {
+            cmd = commands.recv(), if pending_pointer.is_none() => {
                 match cmd {
                     Some(SessionCommand::RawInput(bytes)) => {
                         // Only log the byte count — never the bytes themselves,
@@ -1773,6 +1823,24 @@ async fn run_session(
                                 let _ = events.send(SessionEvent::Closed(reason));
                                 break;
                             }
+                        }
+                    }
+                    Some(SessionCommand::PointerInput { bytes, kind }) => {
+                        let now = tokio::time::Instant::now();
+                        if let Some(deadline) = pointer_press_deadline(kind, last_pointer_press, now) {
+                            pending_pointer = Some((bytes, kind));
+                            pending_pointer_at = Some(deadline);
+                            continue;
+                        }
+                        if let Err(err) = write_ssh_pointer(&channel, &bytes, kind).await {
+                            let _ = events.send(SessionEvent::Closed(format!(
+                                "{}: {err}",
+                                t("写入失败", "write failed")
+                            )));
+                            break;
+                        }
+                        if kind == PointerInputKind::Press {
+                            last_pointer_press = Some(tokio::time::Instant::now());
                         }
                     }
                     Some(SessionCommand::Resize(cols, rows)) => {
@@ -1813,6 +1881,24 @@ async fn run_session(
                         let _ = channel.eof().await;
                         break;
                     }
+                }
+            }
+            _ = tokio::time::sleep_until(
+                pending_pointer_at.unwrap_or_else(tokio::time::Instant::now)
+            ), if pending_pointer.is_some() => {
+                pending_pointer_at = None;
+                let (bytes, kind) = pending_pointer
+                    .take()
+                    .expect("pending pointer exists while its timer is enabled");
+                if let Err(err) = write_ssh_pointer(&channel, &bytes, kind).await {
+                    let _ = events.send(SessionEvent::Closed(format!(
+                        "{}: {err}",
+                        t("写入失败", "write failed")
+                    )));
+                    break;
+                }
+                if kind == PointerInputKind::Press {
+                    last_pointer_press = Some(tokio::time::Instant::now());
                 }
             }
             // Suppression safety net: if the injected hook hasn't echoed its OSC 7
@@ -2844,7 +2930,7 @@ where
     for _ in 0..16 {
         match res {
             Kb::Success => return Ok(true),
-            Kb::Failure => return Ok(false),
+            Kb::Failure { .. } => return Ok(false),
             Kb::InfoRequest { prompts, .. } => {
                 let mut responses = Vec::with_capacity(prompts.len());
                 for p in &prompts {
@@ -2983,7 +3069,6 @@ pub(crate) async fn resolve_credentials(
     }
 }
 
-#[async_trait]
 impl Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -3013,16 +3098,21 @@ impl Handler for ClientHandler {
         connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        let target = self.remote_forwards.get(&connected_port).cloned();
+        let Some((host, port)) = self.remote_forwards.get(&connected_port).cloned() else {
+            tracing::warn!(
+                "forwarded-tcpip on {connected_address}:{connected_port} with no mapping"
+            );
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        reply.accept().await;
         let events = self.events.clone();
-        let bind = connected_address.to_string();
         tokio::spawn(async move {
-            let Some((host, port)) = target else {
-                tracing::warn!("forwarded-tcpip on {bind}:{connected_port} with no mapping");
-                return;
-            };
             match tokio::net::TcpStream::connect((host.as_str(), port)).await {
                 Ok(mut tcp) => {
                     let mut stream = channel.into_stream();
@@ -3044,6 +3134,35 @@ impl Handler for ClientHandler {
 fn _assert_handle_send() {
     fn takes<T: Send>() {}
     takes::<Handle<ClientHandler>>();
+}
+
+#[cfg(test)]
+mod pointer_pacing_tests {
+    use super::{pointer_press_deadline, PointerInputKind, MIN_POINTER_PRESS_INTERVAL};
+
+    #[test]
+    fn only_consecutive_presses_inside_the_interval_are_delayed() {
+        let first = tokio::time::Instant::now();
+        let soon = first + std::time::Duration::from_millis(35);
+        let deadline = first + MIN_POINTER_PRESS_INTERVAL;
+
+        assert_eq!(
+            pointer_press_deadline(PointerInputKind::Press, Some(first), soon),
+            Some(deadline)
+        );
+        assert_eq!(
+            pointer_press_deadline(PointerInputKind::Press, Some(first), deadline),
+            None
+        );
+        assert_eq!(
+            pointer_press_deadline(PointerInputKind::Release, Some(first), soon),
+            None
+        );
+        assert_eq!(
+            pointer_press_deadline(PointerInputKind::Motion, Some(first), soon),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

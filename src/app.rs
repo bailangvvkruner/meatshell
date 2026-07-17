@@ -6,6 +6,7 @@
 //!   * Manage the tab list + per-tab `SessionHandle` map.
 //!   * Route Slint callbacks to the right domain module.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -55,7 +56,7 @@ struct TermBuffer {
     /// Plain text of the rows currently displayed (drives find + selection).
     displayed_text: Vec<String>,
     /// CSI-scanner state for rewriting HVP (`ESC [ … f`) into CUP (`ESC [ … H`).
-    /// vt100 0.15 only implements the `H` final byte, not the equivalent `f`
+    /// vt100 only implements the `H` final byte, not the equivalent `f`
     /// that btop/htop use for cursor positioning — without this rewrite their
     /// absolute-positioned full-screen output collapses into a scrolling mess.
     /// Kept here so a sequence split across read chunks is still translated.
@@ -403,8 +404,8 @@ use crate::debug_api::{
 use crate::i18n::t;
 use crate::sftp::{spawn_sftp, SftpHandle};
 use crate::ssh::{
-    format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent,
-    SessionHandle, SystemDetails,
+    format_mtime, format_size, spawn_session, PointerInputKind, ProcInfo, SessionCommand,
+    SessionEvent, SessionHandle, SystemDetails,
 };
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
 use crate::terminal_raster::{
@@ -2821,7 +2822,7 @@ pub fn run() -> Result<()> {
                                 (weak.upgrade(), ev_pending_window_size_restore.get())
                             {
                                 if let Some(target) =
-                                    clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                    clamp_window_size_to_monitor(win.window(), Some(preferred))
                                 {
                                     tracing::info!(
                                         "[WINDOW_SIZE] focus retry saved={:.0}x{:.0} \
@@ -2885,7 +2886,7 @@ pub fn run() -> Result<()> {
                                 let actual =
                                     (size.width as f32 / scale, size.height as f32 / scale);
                                 if let Some(target) =
-                                    clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                    clamp_window_size_to_monitor(win.window(), Some(preferred))
                                 {
                                     tracing::info!(
                                         "[WINDOW_SIZE] restore requested saved={:.0}x{:.0} \
@@ -5923,7 +5924,7 @@ fn apply_terminal_resize(
             if buf.parser.screen().alternate_screen() {
                 // Alt-screen (tmux/vim/btop): the remote redraws the whole screen
                 // on SIGWINCH, so just resize the grid and let that redraw fill it.
-                buf.parser.set_size(new_rows, new_cols);
+                buf.parser.screen_mut().set_size(new_rows, new_cols);
             } else {
                 // Reflow already-printed output to the new width by replaying the
                 // byte stream — vt100's set_size only truncates/pads (#169).
@@ -10383,7 +10384,12 @@ fn wire_key_input(
                     return false;
                 };
                 if !bytes.is_empty() {
-                    handle.send_raw(bytes);
+                    let input_kind = match kind {
+                        TerminalMouseEventKind::Press => PointerInputKind::Press,
+                        TerminalMouseEventKind::Release => PointerInputKind::Release,
+                        TerminalMouseEventKind::Motion => PointerInputKind::Motion,
+                    };
+                    handle.send_pointer(bytes, input_kind);
                 }
                 true
             },
@@ -11243,10 +11249,8 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
     // available (#274).
     if let Some(c) = key.chars().next() {
         let cp = c as u32;
-        if key.chars().count() == 1 {
-            if !ctrl && (0x10..=0x18).contains(&cp) {
-                return vec![];
-            }
+        if key.chars().count() == 1 && !ctrl && (0x10..=0x18).contains(&cp) {
+            return vec![];
         }
     }
 
@@ -11388,11 +11392,11 @@ const MAX_HISTORY: usize = 100_000;
 /// char per cell (space for blanks) so a char index equals the grid column.
 /// Raw (contents, fg, bg, bold, wide, inverse) for one grid cell.
 /// `contents` is always one display string (" " for a blank cell).
-fn cell_attrs(
-    screen: &vt100::Screen,
+fn cell_attrs<'a>(
+    screen: &'a vt100::Screen,
     r: u16,
     c: u16,
-) -> (String, vt100::Color, vt100::Color, bool, bool, bool) {
+) -> (Cow<'a, str>, vt100::Color, vt100::Color, bool, bool, bool) {
     match screen.cell(r, c) {
         Some(cell) => {
             let (fg, bg, inverse) = (cell.fgcolor(), cell.bgcolor(), cell.inverse());
@@ -11403,16 +11407,16 @@ fn cell_attrs(
             // the line (and the cursor) out of alignment (#60). Genuinely empty
             // cells still become a space.
             let s = if cell.is_wide_continuation() {
-                String::new()
+                Cow::Borrowed("")
             } else if s.is_empty() {
-                " ".to_string()
+                Cow::Borrowed(" ")
             } else {
-                s
+                Cow::Borrowed(s)
             };
             (s, fg, bg, cell.bold(), cell.is_wide(), inverse)
         }
         None => (
-            " ".to_string(),
+            Cow::Borrowed(" "),
             vt100::Color::Default,
             vt100::Color::Default,
             false,
@@ -11434,9 +11438,9 @@ fn build_row(screen: &vt100::Screen, r: u16, cols: u16) -> Line {
         // the grid — the trailing `/`, `$` or cursor overlaps or gaps the glyph
         // (CJK advance != 2×the Latin cell width).
         if wide {
-            plain.push_str(&s);
+            plain.push_str(s.as_ref());
             runs.push(HistSpan {
-                text: s,
+                text: s.into_owned(),
                 fg,
                 bg,
                 bold,
@@ -11452,16 +11456,16 @@ fn build_row(screen: &vt100::Screen, r: u16, cols: u16) -> Line {
         // still gets a background fill) and break on attribute change or a wide
         // cell (which starts its own span above).
         let start_col = c;
-        let mut text = s.clone();
-        plain.push_str(&s);
+        plain.push_str(s.as_ref());
+        let mut text = s.into_owned();
         c += 1;
         while c < cols {
             let (cs, cfg, cbg, cbold, cwide, cinverse) = cell_attrs(screen, r, c);
             if cwide || cfg != fg || cbg != bg || cbold != bold || cinverse != inverse {
                 break;
             }
-            plain.push_str(&cs);
-            text.push_str(&cs);
+            plain.push_str(cs.as_ref());
+            text.push_str(cs.as_ref());
             c += 1;
         }
         let cells = (c - start_col) as i32;
@@ -12985,7 +12989,7 @@ mod key_tests {
         assert!(!paste_requires_large_review("short prompt\nsecond line"));
         assert!(!paste_requires_large_review(&"a".repeat(600)));
         assert!(paste_requires_large_review(&"a".repeat(601)));
-        assert!(!paste_requires_large_review(&vec!["line"; 12].join("\r\n")));
+        assert!(!paste_requires_large_review(&["line"; 12].join("\r\n")));
         assert!(paste_requires_large_review(&vec!["line"; 13].join("\r\n")));
     }
 
@@ -13288,7 +13292,6 @@ mod selection_tests {
 
         let screen = buf.parser.screen();
         assert!(screen.alternate_screen());
-        assert_eq!(screen.errors(), 0);
         assert_eq!(build_row(screen, 0, 8).0, "─".repeat(8));
         assert!(build_row(screen, 1, 8).0.trim().is_empty());
         assert_eq!(screen.cursor_position().0, 0);

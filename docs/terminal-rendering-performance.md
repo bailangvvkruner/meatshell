@@ -1,31 +1,33 @@
 # Terminal rendering performance
 
-This document records the Windows terminal-rendering baseline, the current
-bottleneck, and the migration path. It is intended to prevent small local
-optimizations from turning into an unmaintainable renderer fork.
+This document records the Windows terminal-rendering baseline, the production
+architecture, and the acceptance gates. It exists to keep performance changes
+measurable and to avoid an unmaintainable renderer fork.
 
-## Goal
+## Goals
 
 For a continuously updating full-screen TUI such as `btop`:
 
-- focused: stay below 25% of one logical CPU core at 30 FPS;
-- unfocused: stay below 10% of one logical CPU core;
-- do not build an unlimited frame queue;
+- keep median CPU below 25% of one logical core;
+- use the same low-latency terminal scheduling interval while focused and
+  unfocused, so changing applications cannot leave a stale frame queued;
+- use the GPU for composition when hardware acceleration is enabled;
+- keep at most one pending raster job per tab and discard obsolete results;
 - preserve CJK, ANSI colors, cursor, selection, search, scrollback, mouse
-  reporting, and alternate-screen behavior;
-- keep platform-specific rendering behind a small backend boundary.
+  reporting, themes, and alternate-screen behavior;
+- release dense-terminal and graphics working sets after returning to an idle
+  shell.
 
-Idle terminals should consume effectively no CPU. Latency from receiving output
-to displaying it should remain below one focused-frame interval.
+Idle terminals should consume effectively no CPU. Input-to-display latency
+should remain below one scheduling interval: 16 ms on the Windows GPU path and
+33 ms on the software fallback.
 
-## Reproducible baseline
+## Historical baseline
 
 Measurements below were taken on 2026-07-15 on Windows 10 22H2 (build 19045),
 an Intel i5-10400 (6 cores, 12 logical processors), and Intel UHD 630 graphics.
-The workload was a Release build connected to `PVE-Alpine`, running `btop` at a
-stable terminal size. The window stayed focused, UI Automation polling was
-disabled, samples were taken only after the display had settled, and `q` was
-sent after each run.
+The workload was a Release build connected to a Linux host running `btop` in a
+stable terminal size.
 
 Windows reports process CPU as a percentage of total machine capacity. The
 "one core" column multiplies that number by 12 so results can be compared with
@@ -33,134 +35,152 @@ profilers that report 100% for one saturated logical processor.
 
 | Build/path | Machine CPU | One-core CPU | GPU | Working set |
 | --- | ---: | ---: | ---: | ---: |
-| Original installed Meatshell, software | 6.3%-7.4% | 76%-88% | ~0% | not recorded |
-| Stable-model + keyed span synchronization, software | 6.05%-6.34% | 72.6%-76.1% | ~0% | 72-93 MiB |
-| Keyed spans + nested-only alt-screen invalidation, software | 5.61%-5.63% | 67.4%-67.6% | 0% | 75.8 MiB |
-| Same workload, `winit-femtovg` | 10.34% | 124.1% | 20.6% | 216 MiB |
+| Original installed MeatShell, software | 6.3%-7.4% | 76%-88% | ~0% | not recorded |
+| Keyed span synchronization, software | 6.05%-6.34% | 72.6%-76.1% | ~0% | 72-93 MiB |
+| Nested-only alt-screen invalidation, software | 5.61%-5.63% | 67.4%-67.6% | 0% | 75.8 MiB |
+| Span model with `winit-femtovg` | 10.34% | 124.1% | 20.6% | 216 MiB |
 | RustDesk displaying the changing screen | 0.13% | 1.6% | 33.7% | not recorded |
 
-The RustDesk row is useful as an architectural reference, not as a direct
-terminal benchmark. RustDesk receives already-rasterized video frames and
-submits textures. Meatshell currently shapes and lays out hundreds of separate
-text runs for every changed terminal frame.
+The RustDesk row is an architectural reference, not a direct terminal
+comparison. RustDesk receives decoded image frames, whereas MeatShell must
+parse ANSI state, shape text, and rasterize terminal cells.
 
-A CPU profile of Meatshell showed a UI/render thread near 94% of one logical
-core while the SSH ingest and vt100 parsing threads together remained around
-0.4%. The primary problem is therefore Slint text-node layout/rasterization,
-not SSH throughput or ANSI parsing.
+Profiling the old path put roughly 94% of one logical core in UI text layout
+and rendering while SSH ingest and vt100 parsing together used about 0.4%.
+The primary bottleneck was hundreds of Slint text nodes per TUI frame, not SSH
+throughput.
 
-## Current low-risk optimizations
+## Production architecture
 
-The existing Slint renderer remains the supported backend. The following
-changes reduce work without introducing another text engine:
+### Bounded terminal updates
 
-1. Coalesce terminal output and cap focused rendering at about 30 FPS.
-2. Back off to about 5 FPS while the window is unfocused.
-3. Do not publish or redraw an identical terminal frame.
-4. Keep the `VecModel<TermSpan>` identity stable.
-5. Synchronize spans by `(row, column)`, so a split or merged ANSI run does not
-   rewrite every later model element.
-6. On alternate screens, update the nested span model without replacing the
-   outer `TerminalState`; the viewport is already pinned to `y = 0`.
+Terminal output is coalesced per tab. A render gate allows one queued or active
+flush, remembers output that arrived during that flush, and schedules at most
+one follow-up. GPU and software intervals are 16 ms and 33 ms respectively.
+Focus does not change these values; an earlier 5 FPS background policy caused
+visible stalls and stale frames when switching applications.
 
-These changes help model churn, but they cannot reach the target by themselves.
-Slint still creates one `Rectangle` and one `Text` for every colored run. A
-typical `btop` frame can contain hundreds of such nodes.
+Normal shell screens keep the keyed `TermSpan` model. This is the lower-memory
+path for sparse text and lets readline input, erase operations, cursor updates,
+selection, and search remain immediately authoritative.
 
-## What leading implementations do
+### Cached row images
 
-The common design is damage tracking plus reusable raster/GPU resources:
+Dense and alternate-screen frames use cached row images on the Windows GPU
+path. The worker:
+
+1. hashes each row together with its font and cell geometry;
+2. shapes and rasterizes only rows whose signatures changed;
+3. keeps only the newest pending frame for each tab;
+4. rejects results from an old tab epoch or generation;
+5. merges pending UI deltas by row before applying them;
+6. bounds the reusable pixel pool to 4 MiB, the glyph image cache to 2,048
+   entries, and periodically trims Cosmic Text's shape-run cache.
+
+Cursor, selection, search highlights, and pointer handling stay as lightweight
+Slint overlays. Returning from a TUI to a sparse shell destroys row images,
+clears the pixel pool, and restores the native span path. The implementation is
+cross-platform Rust and Cosmic Text; no private Slint renderer API is used.
+
+This is not end-to-end zero-copy: ANSI parsing and glyph rasterization are CPU
+work, and changed rows must be uploaded to the GPU. It does remove repeated
+per-span UI layout and bounds the copies and queues that remain.
+
+### Windows GPU path
+
+Windows x86-64 defaults to Slint FemtoVG backed by the bundled ANGLE EGL
+runtime and D3D11. The setting at **Settings > Interface > Hardware
+acceleration** is enabled for new and existing configurations unless explicitly
+disabled. Changing it saves the preference and immediately restarts MeatShell
+without creating a console window. Software rendering remains available as a
+recovery path and `SLINT_BACKEND` remains an expert override.
+
+The authenticated Debug API reports the selected backend, whether it is
+GPU-backed, whether the bundled ANGLE runtime is actually loaded, and the
+terminal scheduling interval. Checking only the backend name is insufficient:
+`angle_runtime_loaded` confirms the packaged DLL path is in use.
+
+### Idle memory reclamation
+
+Ten seconds after the last dense terminal becomes sparse or closes, the
+Windows memory worker:
+
+- clears reusable terminal pixel buffers;
+- calls `IDXGIDevice3::Trim` for ANGLE's D3D11 device;
+- asks the Windows heap to optimize unused resources;
+- trims the process working set when it is at least 24 MiB.
+
+This is intentionally idle-only. Trimming during a changing TUI would trade a
+smaller Task Manager number for page faults and visible stutter.
+
+## Current measurements
+
+The production-path run below was taken on 2026-07-17 on the same 12-logical-
+processor Windows machine. A Release build used bundled ANGLE/D3D11 and a
+1440x900 window connected over SSH to Linux `btop --force-utf` at a 100 ms btop
+update interval. MeatShell stayed unfocused and visible; Debug API sampling did
+not take focus.
+
+| Metric | Result |
+| --- | ---: |
+| 30 s machine CPU median | 1.169% |
+| 30 s machine CPU p95 | 1.661% |
+| 30 s one-core CPU median | 14.02% |
+| D3D11 3D engine median, 10 samples | 25.023% |
+| Active btop private working set | 55.5-60.9 MiB |
+| Active btop private commit | 144.7-149.1 MiB |
+| Private commit growth during CPU run | -0.71 MiB |
+| Idle private working set after trim and diagnostics | about 17 MiB |
+| Idle total working set after trim and diagnostics | about 25 MiB |
+
+Immediately after the ten-second trim, total working set reached 8.6 MiB. It
+then settled near 25 MiB because the test continued polling health and loading
+diagnostic code pages. GPU mode reserves more virtual/private commit in ANGLE
+and the display driver than software mode; that commit is not the same as
+resident private working set.
+
+The screenshot endpoint was also exercised for 80 full-window PNG captures
+while btop kept redrawing. The first pass established the PNG worker and
+allocator high-water mark; the second pass increased peak private commit by
+only about 1.5 MiB rather than growing linearly. After btop exited, the normal
+idle trim reclaimed the resident row and graphics working set.
+
+## Industry references
+
+The implementation follows the same damage-and-cache principles used by
+leading terminals:
 
 - [Alacritty](https://github.com/alacritty/alacritty/blob/852e971cddfabe222d2d5bcda466e130f53af207/alacritty_terminal/src/term/mod.rs#L137)
-  tracks left/right damage bounds independently for every terminal line.
+  tracks damage bounds per line.
 - [foot](https://codeberg.org/dnkl/foot/src/commit/3c5b584b0eafa772eb4376fb6eaf6643399e190e/render.c#L1580)
-  skips clean rows, groups consecutive dirty rows, and submits corresponding
-  Wayland surface damage.
+  skips clean rows and groups dirty-row surface damage.
 - [WezTerm](https://github.com/wezterm/wezterm/blob/d96ba57121761cbafda4c08179fe45f8e4cf8212/wezterm-gui/src/termwindow/render/pane.rs#L446)
-  caches complete per-line GPU quad allocations in addition to shaping and
-  glyph caches.
+  caches per-line GPU allocations and shaped data.
 - [kitty](https://github.com/kovidgoyal/kitty/blob/f47590533d7177daf0b74963f9d1b7581467af20/kitty/fonts.c#L63)
-  rasterizes glyphs into a sprite map and renders terminal cells through GPU
-  shaders.
+  uses a glyph sprite map and GPU cell rendering.
 - [Windows Terminal AtlasEngine](https://github.com/microsoft/terminal/blob/922beefb83764646331662d6d15d70107d556402/src/renderer/atlas/AtlasEngine.cpp#L89)
-  tracks invalidated rows, caches shaped rows/glyphs, and passes dirty regions
-  to `Present1`.
+  tracks invalid rows and presents dirty regions.
 - [RustDesk](https://github.com/rustdesk/rustdesk/blob/cf2b28faf934fedb498c33b9746cd289426d8645/src/client/io_loop.rs#L1171)
-  adapts FPS to decoder capacity and queue pressure, while its Windows Flutter
-  path can submit decoded GPU textures directly.
+  bounds its latest-frame queue and adapts to queue pressure.
 
 The transferable RustDesk ideas are a bounded latest-frame queue, dropping
-obsolete work, adaptive pacing, and texture submission. Its video codec and
-capture pipeline are not useful for rendering a local terminal grid.
+obsolete work, pacing, and texture submission. Its video codec and capture
+pipeline are not applicable to a local terminal grid.
 
-## Recommended architecture
+## Future work
 
-### Phase 1: explicit row damage
-
-Introduce a renderer-neutral snapshot boundary:
-
-```rust
-struct TerminalFrame {
-    generation: u64,
-    rows: Vec<TerminalRow>,
-    dirty_rows: Vec<usize>,
-    cursor: CursorState,
-}
-
-struct TerminalRow {
-    hash: u64,
-    cells: Vec<StyledCell>,
-}
-```
-
-Compare row hashes after vt100 ingestion and rebuild only changed rows. Moving
-the cursor damages both its old and new rows. Resize, font, DPI, palette, theme,
-and renderer changes invalidate all rows. Selection and search remain separate
-overlays and damage only intersecting rows.
-
-Keep this model independent of Slint so parser, damage, and rendering tests can
-run headlessly.
-
-### Phase 2: cached row images
-
-Replace hundreds of Slint `Text` instances with roughly one `Image` per visible
-row. Raster dirty rows on a worker using Cosmic Text/Swash into reusable RGBA
-buffers, then update only those row images on the UI thread.
-
-The worker queue must have capacity one. A newer generation replaces an older
-pending frame; completed rows whose session/generation no longer matches are
-discarded. This prevents latency and memory growth during output bursts.
-
-Keep cursor, selection, search highlights, and mouse handling as lightweight
-Slint overlays. This preserves interaction behavior while removing text layout
-from the hot UI path. A 960 x 20 RGBA row is about 75 KiB; 50 rows require about
-3.7 MiB and buffers should be reused.
-
-Cosmic Text/Swash is preferred over a Windows-only DirectWrite implementation
-because it keeps shaping, fallback, CJK, and raster behavior shared across
-platforms. Font discovery can remain platform-specific behind the backend.
-
-### Phase 3: optional GPU cell renderer
-
-Only start this phase if Phase 2 misses the focused CPU target or high-DPI/large
-terminal targets. Use a glyph atlas plus instanced cell quads, update atlas
-entries lazily, upload only dirty cell ranges, and retain the same
-`TerminalFrame`/damage contract.
-
-On Windows, Direct3D 11/12 plus DirectWrite and dirty-rectangle presentation is
-the proven path. A cross-platform `wgpu` backend is possible but has a larger
-maintenance surface. Do not depend on Slint private renderer APIs; either use a
-documented custom-render hook or host the terminal surface behind an isolated
-native component.
+A glyph atlas with instanced cell quads and dirty-range uploads could reduce
+CPU and upload bandwidth further. It should be considered only if cached row
+images miss the acceptance target on additional hardware or high-DPI displays.
+Any such backend must retain the current parser/damage boundary and software
+fallback rather than spreading D3D-specific logic through terminal behavior.
 
 ## Acceptance gates
 
-Each phase must pass the existing test suite and scripted interactive checks for
-shell output, `btop`, `vim`/`nano`, `tmux`, CJK, selection, find, scrollback,
-resize, split panes, and mouse reporting. Performance runs use the protocol
-above and report median CPU over at least 30 seconds plus memory and GPU use.
-
-Do not replace the software renderer with femtovg by default: on the measured
-Windows system it consumed more CPU, GPU, and memory. Do not disable advanced
-text shaping globally without visual regression coverage; the measured gain was
-modest and the text-quality risk is real.
+Renderer changes must pass the full Rust test and lint suite plus scripted
+checks for shell input and erase, `btop`, `vim`/`nano`, `tmux`, CJK, selection,
+find, scrollback, resize, split panes, mouse reporting, first-frame rendering,
+and hardware/software restart. Performance runs report median CPU over at least
+30 seconds, GPU engine activity, active and idle memory, and repeated screenshot
+behavior. Advanced shaping must not be disabled without visual regression
+coverage.

@@ -7,7 +7,7 @@ name: Release
 
 on:
   push:
-    branches: ["main", "codex/angle-production"]
+    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -16,14 +16,29 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write   # needed to create / update the GitHub Release
+  contents: read
 
 jobs:
+  security-audit:
+    name: Dependency security audit
+    permissions:
+      contents: read
+      checks: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Scan Cargo.lock with RustSec
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0194,RUSTSEC-2026-0195
+
   check-version:
     name: Check tag version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Ensure tag matches Cargo package version
         if: startsWith(github.ref, 'refs/tags/')
@@ -53,7 +68,9 @@ jobs:
 
   build:
     name: ${{ matrix.name }}
-    needs: check-version
+    needs: [check-version, security-audit]
+    permissions:
+      contents: write
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -67,7 +84,7 @@ jobs:
           # Restore their matrix entries from git history when needed.
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Slint (winit + femtovg) + rfd (GTK) + arboard need these system libs.
       # Build-time only — no GPU/display required to compile.
@@ -84,12 +101,12 @@ jobs:
             libudev-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
 
@@ -226,6 +243,7 @@ jobs:
             $VERSION = "$env:GITHUB_REF_NAME"
             if (-not $VERSION) { $VERSION = "dev" }
           }
+          $VERSION = $VERSION -replace '[\\/]', '-'
           # WiX 3 toolset (candle/light) that cargo-wix drives.
           choco install wixtoolset -y --no-progress
           $candle = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*\bin\candle.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -235,14 +253,14 @@ jobs:
           echo "MSI=meatshell-$VERSION-windows-x86_64.msi" >> $env:GITHUB_ENV
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.name }}
           path: ${{ env.ASSET }}
 
       - name: Upload AppImage artifact
         if: matrix.name == 'linux-x86_64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-x86_64-appimage
           path: ${{ env.APPIMAGE }}
@@ -250,7 +268,7 @@ jobs:
       - name: Upload MSI artifact
         if: matrix.name == 'windows-x86_64' && env.MSI != ''
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-x86_64-msi
           path: ${{ env.MSI }}
@@ -265,7 +283,7 @@ jobs:
 
       - name: Publish rolling Windows x64 nightly release
         if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: nightly
           name: Windows x64 nightly
@@ -277,7 +295,7 @@ jobs:
       - name: Attach MSI to nightly release
         if: github.ref == 'refs/heads/main' && env.MSI != ''
         continue-on-error: true
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: nightly
           prerelease: true
@@ -287,14 +305,14 @@ jobs:
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true
 
       - name: Attach AppImage to GitHub Release
         if: matrix.name == 'linux-x86_64' && startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: ${{ env.APPIMAGE }}
           fail_on_unmatched_files: true
@@ -302,7 +320,7 @@ jobs:
       - name: Attach MSI to GitHub Release
         if: matrix.name == 'windows-x86_64' && env.MSI != '' && startsWith(github.ref, 'refs/tags/')
         continue-on-error: true
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: ${{ env.MSI }}
           fail_on_unmatched_files: false
@@ -311,7 +329,9 @@ jobs:
     name: linux-aarch64-glibc228
     # Temporarily disabled. Set ENABLE_NON_WINDOWS_RELEASES=true to restore it.
     if: ${{ vars.ENABLE_NON_WINDOWS_RELEASES == 'true' }}
-    needs: check-version
+    needs: [check-version, security-audit]
+    permissions:
+      contents: write
     runs-on: ubuntu-22.04-arm
     container: debian:10
 
@@ -337,7 +357,7 @@ jobs:
             libgl1-mesa-dev libegl1-mesa-dev libgtk-3-dev \
             libudev-dev
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
         shell: bash
@@ -348,7 +368,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: aarch64-unknown-linux-gnu-glibc228
 
@@ -387,14 +407,14 @@ jobs:
           echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-aarch64-glibc228
           path: ${{ env.ASSET }}
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true
@@ -403,7 +423,9 @@ jobs:
     name: linux-x86_64-glibc228
     # Temporarily disabled. Set ENABLE_NON_WINDOWS_RELEASES=true to restore it.
     if: ${{ vars.ENABLE_NON_WINDOWS_RELEASES == 'true' }}
-    needs: check-version
+    needs: [check-version, security-audit]
+    permissions:
+      contents: write
     runs-on: ubuntu-22.04
     container: debian:10
 
@@ -429,7 +451,7 @@ jobs:
             libgl1-mesa-dev libegl1-mesa-dev libgtk-3-dev \
             libudev-dev
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
         shell: bash
@@ -440,7 +462,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: x86_64-unknown-linux-gnu-glibc228
 
@@ -479,14 +501,14 @@ jobs:
           echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-x86_64-glibc228
           path: ${{ env.ASSET }}
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true

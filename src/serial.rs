@@ -192,6 +192,22 @@ async fn run_serial(
                     break;
                 }
             }
+            SessionCommand::PointerInput { bytes, .. } => {
+                tracing::debug!("serial pointer write len={} bytes", bytes.len());
+                let w = writer.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    let mut guard = w.lock().unwrap();
+                    guard.write_all(&bytes).and_then(|_| guard.flush())
+                })
+                .await;
+                if let Ok(Err(e)) = res {
+                    let _ = events.send(SessionEvent::Closed(format!(
+                        "{}: {e}",
+                        t("串口写入失败", "serial write failed")
+                    )));
+                    break;
+                }
+            }
             SessionCommand::DebugInput { bytes, ack } => {
                 tracing::debug!("serial debug input len={} bytes", bytes.len());
                 let w = writer.clone();

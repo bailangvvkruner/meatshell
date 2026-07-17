@@ -3,6 +3,11 @@
 /artifacts/
 /config/
 /log/
+# Local copies produced while reproducing the release-packaging workflow.
+/meatshell-*/
+/meatshell-*.zip
+/meatshell-*.tar.gz
+*.dmp
 *.rs.bk
 *.profraw
 .DS_Store

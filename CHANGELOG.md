@@ -5,6 +5,21 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
+### 新增 / Added
+
+- **Windows 默认启用可切换的 D3D11 硬件加速。** Windows x86-64 现在优先使用随包分发的 ANGLE EGL/FemtoVG GPU 路径；设置 → 界面新增默认开启的“硬件加速”开关，切换后会保存设置并无控制台窗口地立即重启，软件渲染仍作为兼容回退。调试接口会分别报告渲染器、GPU 状态、ANGLE 是否实际加载及当前终端调度间隔。
+- **为密集终端加入有界行图像缓存。** btop 等全屏 TUI 会在后台线程中仅重绘签名变化的行，并以行纹理交给 GPU 合成；每个标签最多保留一个待处理帧，过期代次会被丢弃，像素池、字形缓存和 shaping 缓存均有上限。普通 shell 继续使用低内存文本路径，离开 TUI 后释放行纹理，并在空闲 10 秒后回收堆、工作集与 D3D11 缓存。
+- **完善本地鉴权调试接口。** 新增无需切换前台即可获取当前渲染窗口 PNG 的截图接口，并在健康信息中公开构建类型、可执行文件大小、工作集/私有提交量、GPU 后端及空闲内存回收诊断；截图、输入和屏幕读取均有限流或大小上限，接口仍只监听回环地址且必须使用 Bearer token。
+
+### 修复 / Fixed
+
+- **修复远程 Linux SSH 中 btop 双击只选中进程而不打开详情。** SSH 鼠标按下事件现在至少间隔 120 ms，等待期间仍持续读取远端输出；调试接口的双击也拆成两组完整 press/release 发送。该节流仅位于 SSH 传输路径，本地终端、串口和 Telnet 保持原样，不包含 Windows btop 适配。
+- **修复密集终端切换与输入擦除后的旧帧残留。** 新输入、退格、光标移动及从全屏 TUI 返回 shell 时会先显示当前权威文本帧，旧的异步行图像不能覆盖较新的稀疏终端状态；窗口恢复、字体/DPI 与尺寸变化会使旧纹理代次失效并完整重建。
+
+### 安全 / Security
+
+- **升级 SSH 栈并阻断已知远程拒绝服务路径。** `russh` 升级到 0.62.2 的 Ring 后端并保留 RSA、压缩与旧服务器兼容算法，移除旧 `russh-keys`；发布工作流在上传任何 nightly/release 产物前运行 RustSec，Dependabot 每周检查 Cargo 与 GitHub Actions，例外及可达性记录在 `docs/security-audit.md`。
+
 ### 构建 / Build
 
 - **升级并固定最新编译链。** 仓库与 GitHub Actions 统一使用 Rust 1.97.0，Slint 全组件升级到 1.17.1，Windows Skia 升级到 0.99.0，并刷新锁文件内所有兼容版本依赖；项目实际最低 Rust 版本同步为 1.92。
@@ -12,10 +27,26 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ---
 
+### Added
+
+- **Enable switchable D3D11 acceleration by default on Windows.** Windows x86-64 now prefers the bundled ANGLE EGL/FemtoVG GPU path. Settings > Interface exposes a default-on Hardware Acceleration toggle; changing it persists the setting and immediately restarts without a console window, while software rendering remains the compatibility fallback. Debug health reports the renderer, GPU status, actual ANGLE loading, and terminal scheduling interval separately.
+- **Add a bounded row-image cache for dense terminals.** Full-screen TUIs such as btop rasterize only rows whose signatures changed on a worker and submit row textures for GPU composition. Each tab retains at most one pending frame, obsolete generations are discarded, and pixel, glyph, and shaping caches are bounded. Sparse shells retain the lower-memory text path; leaving a TUI releases row textures and a ten-second idle pass reclaims heap, working-set, and D3D11 caches.
+- **Expand the authenticated local Debug API.** Tools can capture the currently rendered window as PNG without taking focus, while health now exposes build type, executable size, working/private memory, renderer state, and idle-trim diagnostics. Screenshot, input, and screen routes are bounded or rate-limited; the server remains loopback-only and requires a Bearer token.
+
+### Fixed
+
+- **Fix btop double-click selecting a process instead of opening details over Linux SSH.** SSH pointer presses are now at least 120 ms apart while remote output continues to be read, and Debug API double clicks are split into two complete press/release batches. Pacing is confined to SSH transport; local terminals, serial, and Telnet remain pass-through, with no Windows btop compatibility layer.
+- **Fix stale dense-terminal frames covering input and erase updates.** New text, backspace, cursor movement, and the transition from a full-screen TUI to a shell expose the authoritative text frame before asynchronous row images; an old image generation cannot cover newer sparse state. Restore, font/DPI, and resize transitions invalidate and rebuild old textures.
+
+### Security
+
+- **Upgrade the SSH stack and block known remote denial-of-service paths.** `russh` is upgraded to 0.62.2 with the Ring backend while retaining RSA, compression, and legacy-server algorithms, and the old `russh-keys` dependency is removed. Release workflows run RustSec before uploading nightly or release artifacts, Dependabot checks Cargo and GitHub Actions weekly, and narrowly scoped exceptions are documented in `docs/security-audit.md`.
+
 ### Build
 
 - **Update and pin the current build toolchain.** The repository and GitHub Actions now use Rust 1.97.0, all Slint components use 1.17.1, Windows Skia uses 0.99.0, and the lockfile contains the latest compatible dependency versions. The effective MSRV is now 1.92.
 - **Fix packaging for cloud builds from branches.** Workflow runs now replace `/` in branch names with `-` before creating Windows, Linux, or macOS artifact paths. Non-Windows version checks read the Cargo package version instead of treating the branch name as a version.
+
 ## [0.6.4] - 2026-07-17
 
 ### 新增 / Added

@@ -26,7 +26,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use zeroize::Zeroize;
 
-use crate::ssh::SessionCommand;
+use crate::ssh::{SessionCommand, MIN_POINTER_PRESS_INTERVAL};
 
 /// Stable default port shown in settings. Passing port 0 to [`DebugApiController::start`]
 /// asks the OS for an ephemeral port, which is useful in tests.
@@ -1141,8 +1141,16 @@ async fn pointer(
         PointerRequestKind::Motion => vec![event(DebugPointerEventKind::Motion)],
     };
 
-    let mut bytes = Vec::with_capacity(events.len() * 16);
-    for event in &events {
+    let events_per_batch = if matches!(request.kind, PointerRequestKind::Click) {
+        2
+    } else {
+        events.len().max(1)
+    };
+    let mut batches = Vec::<Vec<u8>>::with_capacity(usize::from(clicks));
+    for (index, event) in events.iter().enumerate() {
+        if index % events_per_batch == 0 {
+            batches.push(Vec::with_capacity(events_per_batch * 16));
+        }
         let Some(encoded) = encoder(&id, *event) else {
             return api_error(
                 StatusCode::CONFLICT,
@@ -1150,17 +1158,24 @@ async fn pointer(
                 "terminal application has not enabled mouse tracking",
             );
         };
-        bytes.extend_from_slice(&encoded);
+        batches
+            .last_mut()
+            .expect("pointer batch exists")
+            .extend_from_slice(&encoded);
     }
 
-    let byte_count = if bytes.is_empty() {
-        0
-    } else {
-        match dispatch_debug_bytes(&context.state, &id, target, bytes).await {
-            Ok(byte_count) => byte_count,
-            Err(response) => return response,
+    let mut byte_count = 0;
+    for (index, bytes) in batches.into_iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(MIN_POINTER_PRESS_INTERVAL).await;
         }
-    };
+        if !bytes.is_empty() {
+            match dispatch_debug_bytes(&context.state, &id, target.clone(), bytes).await {
+                Ok(sent) => byte_count += sent,
+                Err(response) => return response,
+            }
+        }
+    }
     Json(PointerResponse {
         accepted: true,
         events: events.len(),
@@ -1344,11 +1359,13 @@ mod tests {
         state.set_input_sender("term-1", tx);
         let (observed_tx, observed_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let command = rx.blocking_recv().unwrap();
                 match command {
                     SessionCommand::DebugInput { bytes, ack } => {
-                        observed_tx.send(bytes).unwrap();
+                        observed_tx
+                            .send((bytes, std::time::Instant::now()))
+                            .unwrap();
                         let _ = ack.send(Ok(()));
                     }
                     other => panic!("unexpected command: {other:?}"),
@@ -1415,7 +1432,7 @@ mod tests {
             ),
         );
         assert!(input.starts_with("HTTP/1.1 200"));
-        assert_eq!(observed_rx.recv().unwrap(), b"pwd\r");
+        assert_eq!(observed_rx.recv().unwrap().0, b"pwd\r");
 
         let body = r#"{"kind":"click","button":"left","col":4,"row":5,"clicks":2}"#;
         let pointer = request(
@@ -1427,7 +1444,13 @@ mod tests {
         );
         assert!(pointer.starts_with("HTTP/1.1 200"));
         assert!(pointer.contains("\"events\":4"));
-        assert_eq!(observed_rx.recv().unwrap(), b"P4:5;R4:5;P4:5;R4:5;");
+        let (first_click, first_at) = observed_rx.recv().unwrap();
+        let (second_click, second_at) = observed_rx.recv().unwrap();
+        assert_eq!(
+            [first_click, second_click].concat(),
+            b"P4:5;R4:5;P4:5;R4:5;"
+        );
+        assert!(second_at.duration_since(first_at) >= MIN_POINTER_PRESS_INTERVAL);
 
         controller.start(address.port(), ROTATED_TOKEN).unwrap();
         let old_token = request(
