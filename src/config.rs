@@ -328,6 +328,14 @@ pub const DEFAULTS_REV: u32 = 2;
 const DEFAULT_WALLPAPER_TRANSPARENCY: f32 = 0.38;
 const DEFAULT_WALLPAPER_OVERLAY: f32 = 1.0 - DEFAULT_WALLPAPER_TRANSPARENCY;
 
+fn normalize_hex_color(value: &str) -> Option<String> {
+    let digits = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("#{}", digits.to_ascii_uppercase()))
+}
+
 /// A brand-new config (no file yet, or the old one was corrupt). Seeds the
 /// new-user default layout (#new-user-defaults): ms wallpaper, welcome page as
 /// a left sidebar, resource panel docked right, 38% wallpaper transparency, and
@@ -645,6 +653,12 @@ pub struct ConfigFile {
     /// configurations both default to hardware acceleration enabled.
     #[serde(default)]
     pub hardware_acceleration_disabled: bool,
+    /// Terminal insertion cursor shape: block (default), bar, or underline (#275).
+    #[serde(default)]
+    pub terminal_cursor_style: String,
+    /// Custom terminal cursor colour as #RRGGBB. Empty follows the theme (#275).
+    #[serde(default)]
+    pub terminal_cursor_color: String,
     /// Stored inverted so missing/legacy config keeps the automatic plain-text
     /// output highlighter enabled by default.
     #[serde(default)]
@@ -1091,6 +1105,40 @@ impl ConfigStore {
 
     pub fn set_hardware_acceleration(&mut self, enabled: bool) {
         self.cache.hardware_acceleration_disabled = !enabled;
+    }
+
+    /// Selected terminal insertion cursor shape. Legacy and invalid values use
+    /// the existing block cursor so upgrades preserve the current appearance.
+    pub fn terminal_cursor_style(&self) -> &str {
+        match self.cache.terminal_cursor_style.as_str() {
+            "bar" => "bar",
+            "underline" => "underline",
+            _ => "block",
+        }
+    }
+
+    pub fn set_terminal_cursor_style(&mut self, style: String) {
+        self.cache.terminal_cursor_style = match style.as_str() {
+            "bar" => "bar".into(),
+            "underline" => "underline".into(),
+            _ => "block".into(),
+        };
+    }
+
+    pub fn terminal_cursor_color(&self) -> &str {
+        if normalize_hex_color(&self.cache.terminal_cursor_color).is_some() {
+            &self.cache.terminal_cursor_color
+        } else {
+            ""
+        }
+    }
+
+    pub fn set_terminal_cursor_color(&mut self, color: &str) -> bool {
+        let Some(normalized) = normalize_hex_color(color) else {
+            return false;
+        };
+        self.cache.terminal_cursor_color = normalized;
+        true
     }
 
     /// Whether client-side highlighting of otherwise unstyled output is active.
@@ -1888,6 +1936,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_cursor_style_defaults_and_validates() {
+        let mut store = temp_store();
+        assert_eq!(store.terminal_cursor_style(), "block");
+
+        store.set_terminal_cursor_style("bar".into());
+        assert_eq!(store.terminal_cursor_style(), "bar");
+        store.set_terminal_cursor_style("underline".into());
+        assert_eq!(store.terminal_cursor_style(), "underline");
+        store.set_terminal_cursor_style("unexpected".into());
+        assert_eq!(store.terminal_cursor_style(), "block");
+
+        store.cache = serde_json::from_str("{}").expect("legacy config must deserialize");
+        assert_eq!(store.terminal_cursor_style(), "block");
+    }
+
+    #[test]
+    fn terminal_cursor_color_normalizes_and_rejects_invalid_values() {
+        let mut store = temp_store();
+        assert_eq!(store.terminal_cursor_color(), "");
+
+        assert!(store.set_terminal_cursor_color("#1a2B3c"));
+        assert_eq!(store.terminal_cursor_color(), "#1A2B3C");
+        assert!(store.set_terminal_cursor_color("abcdef"));
+        assert_eq!(store.terminal_cursor_color(), "#ABCDEF");
+
+        assert!(!store.set_terminal_cursor_color("#12345"));
+        assert_eq!(store.terminal_cursor_color(), "#ABCDEF");
+        assert!(!store.set_terminal_cursor_color("#GG0000"));
+        assert_eq!(store.terminal_cursor_color(), "#ABCDEF");
+    }
+
     fn sample_session(name: &str) -> Session {
         Session {
             name: name.into(),
@@ -2073,6 +2153,33 @@ mod tests {
         store.cache = legacy;
         assert!(store.output_highlight_enabled());
         assert_eq!(store.output_highlight_preset(), "log");
+    }
+
+    #[test]
+    fn saved_password_encrypts_and_decrypts_without_changes() {
+        let mut store = temp_store();
+        let password = "p@ss word!^&*中文";
+        store.cache.sessions.push(Session {
+            name: "windows-password".into(),
+            host: "192.168.100.2".into(),
+            port: 22,
+            user: "root".into(),
+            password: Secret::new(password),
+            ..Session::new_empty()
+        });
+
+        store.save().unwrap();
+        let raw = std::fs::read_to_string(&store.path).unwrap();
+        assert!(!raw.contains(password));
+        let disk: ConfigFile = serde_json::from_str(&raw).unwrap();
+        let encrypted = disk.sessions[0].password.as_str();
+        assert!(encrypted.starts_with(ConfigStore::ENC_PREFIX));
+        assert_eq!(
+            ConfigStore::try_decrypt(&store.key, encrypted).as_deref(),
+            Some(password)
+        );
+
+        let _ = std::fs::remove_file(&store.path);
     }
 
     #[test]

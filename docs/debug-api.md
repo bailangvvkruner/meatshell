@@ -10,6 +10,9 @@ request requires:
 Authorization: Bearer <token>
 ```
 
+JSON responses explicitly declare UTF-8 so terminal box drawing and CJK text
+decode correctly in Windows PowerShell 5 as well as modern HTTP clients.
+
 ## Endpoints
 
 - `GET /v1/health`

@@ -404,8 +404,8 @@ use crate::debug_api::{
 use crate::i18n::t;
 use crate::sftp::{spawn_sftp, SftpHandle};
 use crate::ssh::{
-    format_mtime, format_size, spawn_session, PointerInputKind, ProcInfo, SessionCommand,
-    SessionEvent, SessionHandle, SystemDetails,
+    format_mtime, format_size, spawn_session, test_session_auth, PointerInputKind, ProcInfo,
+    SessionCommand, SessionEvent, SessionHandle, SystemDetails,
 };
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
 use crate::terminal_raster::{
@@ -1323,6 +1323,11 @@ pub fn run() -> Result<()> {
         window.set_term_font_bold(s.terminal_bold());
         window.set_hardware_acceleration_enabled(s.hardware_acceleration());
         window.set_hardware_acceleration_available(hardware_acceleration_setting_available());
+        window.set_term_cursor_style(s.terminal_cursor_style().into());
+        if let Some(color) = parse_hex_color(s.terminal_cursor_color()) {
+            window.set_term_cursor_color_hex(s.terminal_cursor_color().into());
+            window.set_term_cursor_color(color);
+        }
         window.set_output_highlight_enabled(s.output_highlight_enabled());
         window.set_output_highlight_preset(s.output_highlight_preset().into());
         window.set_output_highlight_rules(output_highlight_rule_model(&s));
@@ -1654,6 +1659,26 @@ pub fn run() -> Result<()> {
     {
         let weak = window.as_weak();
         let store = store.clone();
+        window.on_set_term_cursor_color(move |value: SharedString| {
+            let Some(color) = parse_hex_color(value.as_str()) else {
+                return false;
+            };
+            {
+                let mut s = store.borrow_mut();
+                if !s.set_terminal_cursor_color(value.as_str()) {
+                    return false;
+                }
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_term_cursor_color(color);
+            }
+            true
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
         let bufs = bufs.clone();
         window.on_add_output_highlight_rule(
             move |pattern: SharedString,
@@ -1787,6 +1812,22 @@ pub fn run() -> Result<()> {
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_bold(bold);
                 rebuild_all_terminal_displays(&w, &bufs);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_term_cursor_style(move |style: SharedString| {
+            let normalized = {
+                let mut s = store.borrow_mut();
+                s.set_terminal_cursor_style(style.to_string());
+                let normalized = s.terminal_cursor_style().to_string();
+                let _ = s.save();
+                normalized
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_term_cursor_style(normalized.into());
             }
         });
     }
@@ -3764,6 +3805,82 @@ fn wsl_available() -> bool {
 // Session callbacks (welcome page + dialog)
 // ---------------------------------------------------------------------------
 
+/// Build the effective session represented by the dialog. When editing, blank
+/// secret fields retain their saved values because real passwords and pasted
+/// private keys are deliberately never echoed back into the UI (#10, #276).
+fn session_from_draft(
+    draft: &SessionDraft,
+    existing: Option<&Session>,
+    forwards: Vec<crate::config::PortForward>,
+) -> Session {
+    let password = if draft.password.is_empty() {
+        existing.map(|s| s.password.clone()).unwrap_or_default()
+    } else {
+        Secret::new(draft.password.to_string())
+    };
+    let private_key_inline = if draft.private_key_inline_mode {
+        if draft.private_key_inline.is_empty() {
+            existing
+                .map(|s| s.private_key_inline.clone())
+                .unwrap_or_default()
+        } else {
+            Secret::new(draft.private_key_inline.to_string())
+        }
+    } else {
+        Secret::default()
+    };
+    let private_key_path = if draft.private_key_inline_mode {
+        String::new()
+    } else {
+        draft.private_key_path.to_string().replace('\\', "/")
+    };
+    let kind = SessionKind::from_str(draft.kind.as_ref());
+    let auto_name = match kind {
+        SessionKind::Serial => format!("{} @{}", draft.serial_port, draft.baud_rate),
+        _ if draft.user.trim().is_empty() => draft.host.to_string(),
+        _ => format!("{}@{}", draft.user, draft.host),
+    };
+    let default_port = if kind == SessionKind::Telnet { 23 } else { 22 };
+
+    Session {
+        id: draft.id.to_string(),
+        name: if draft.name.is_empty() {
+            auto_name
+        } else {
+            draft.name.to_string()
+        },
+        host: draft.host.to_string(),
+        port: if draft.port <= 0 {
+            default_port
+        } else {
+            draft.port as u16
+        },
+        user: draft.user.to_string(),
+        auth: AuthMethod::from_str(draft.auth.as_ref()),
+        password,
+        private_key_path,
+        private_key_inline,
+        proxy: draft.proxy.to_string(),
+        last_used: None,
+        group: draft.group.to_string(),
+        kind,
+        serial_port: draft.serial_port.to_string(),
+        baud_rate: if draft.baud_rate <= 0 {
+            115_200
+        } else {
+            draft.baud_rate as u32
+        },
+        data_bits: draft.data_bits as u8,
+        stop_bits: draft.stop_bits as u8,
+        parity: draft.parity.to_string(),
+        flow_control: draft.flow_control.to_string(),
+        forwards,
+        disable_shell_integration: draft.disable_shell_integration,
+        note: draft.note.to_string(),
+        jump_session_id: draft.jump_session_id.to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wire_session_callbacks(
     window: &AppWindow,
@@ -4316,12 +4433,14 @@ fn wire_session_callbacks(
         });
     }
 
-    // Test connection from the session dialog. This is intentionally lightweight:
-    // it checks network reachability for the current host/port without saving the
-    // draft or opening a terminal tab.
+    // Test connection from the session dialog. SSH tests use the same handshake,
+    // host-key verification, proxy/jump routing, and authentication as a real
+    // terminal connection (#276). Telnet and serial retain reachability tests.
     {
         let weak = window.as_weak();
         let runtime = runtime.clone();
+        let store = store.clone();
+        let edit_forwards = edit_forwards.clone();
         window.on_session_dialog_test(move |draft: SessionDraft| {
             let kind = draft.kind.to_string();
             if kind == "serial" {
@@ -4352,14 +4471,104 @@ fn wire_session_callbacks(
                 });
                 return;
             }
-            let host = draft.host.to_string();
-            let default_port = if kind == "telnet" { 23 } else { 22 };
-            let port = if draft.port <= 0 {
-                default_port
-            } else {
-                draft.port as u16
-            };
+
+            let existing = store.borrow().get(draft.id.as_str()).cloned();
+            let session =
+                session_from_draft(&draft, existing.as_ref(), edit_forwards.borrow().clone());
             let weak_done = weak.clone();
+
+            if kind == "ssh" {
+                let jump = resolve_jump(&store, &session);
+                let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+                runtime.spawn(async move {
+                    let mut test = Box::pin(test_session_auth(session, jump, events_tx));
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut test => break result,
+                            event = events_rx.recv() => {
+                                let Some(event) = event else { continue };
+                                if matches!(
+                                    event,
+                                    SessionEvent::HostKeyPrompt { .. }
+                                        | SessionEvent::CredentialPrompt { .. }
+                                        | SessionEvent::MfaPrompt { .. }
+                                ) {
+                                    let weak_prompt = weak_done.clone();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        let Some(w) = weak_prompt.upgrade() else { return };
+                                        match event {
+                                            SessionEvent::HostKeyPrompt {
+                                                host,
+                                                port,
+                                                key_type,
+                                                fingerprint,
+                                                changed,
+                                                responder,
+                                            } => enqueue_hostkey_prompt(
+                                                &w,
+                                                host,
+                                                port,
+                                                key_type,
+                                                fingerprint,
+                                                changed,
+                                                responder,
+                                            ),
+                                            SessionEvent::CredentialPrompt {
+                                                session_id,
+                                                host,
+                                                user,
+                                                need_user,
+                                                need_password,
+                                                retry,
+                                                responder,
+                                            } => enqueue_cred_prompt(
+                                                &w,
+                                                PendingCred {
+                                                    session_id,
+                                                    host,
+                                                    user,
+                                                    need_user,
+                                                    need_password,
+                                                    retry,
+                                                    responders: vec![responder],
+                                                },
+                                            ),
+                                            SessionEvent::MfaPrompt {
+                                                session_id,
+                                                host,
+                                                prompt,
+                                                echo,
+                                                responder,
+                                            } => enqueue_mfa_prompt(
+                                                &w,
+                                                session_id,
+                                                host,
+                                                prompt,
+                                                echo,
+                                                responder,
+                                            ),
+                                            _ => {}
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    };
+                    let message = match result {
+                        Ok(()) => t("连接正常", "Connection OK").to_string(),
+                        Err(e) => format!("{}: {e:#}", t("连接失败", "Connection failed")),
+                    };
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = weak_done.upgrade() {
+                            w.set_dialog_test_status(message.into());
+                        }
+                    });
+                });
+                return;
+            }
+
+            let host = session.host;
+            let port = session.port;
             runtime.spawn(async move {
                 let target = format!("{host}:{port}");
                 let result = tokio::time::timeout(
@@ -4796,17 +5005,29 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         .set_input_sender(tab_id.to_string(), handle.commands.clone());
     ctx.handles.borrow_mut().insert(tab_id.to_string(), handle);
 
-    // Separate SFTP connection for the same session (SSH only).
-    let sftp_evt_tx = if has_sftp {
+    // Separate SFTP connection for the same session (SSH only). It waits for
+    // the interactive PTY to report Connected so a second SSH handshake cannot
+    // contend with terminal startup on the same host/network path.
+    let (sftp_evt_tx, sftp_ready_tx) = if has_sftp {
         let (sftp_tx, sftp_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
-        let sftp_handle = spawn_sftp(ctx.runtime.handle(), session, jump, sftp_tx);
-        ctx.sftp_handles
-            .lock()
-            .unwrap()
-            .insert(tab_id.to_string(), sftp_handle);
-        Some(sftp_rx)
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let sftp_runtime = ctx.runtime.clone();
+        let sftp_task_runtime = sftp_runtime.clone();
+        let sftp_handles = ctx.sftp_handles.clone();
+        let sftp_tab_id = tab_id.to_string();
+        sftp_runtime.spawn(async move {
+            if ready_rx.await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+            let sftp_handle = spawn_sftp(sftp_task_runtime.handle(), session, jump, sftp_tx);
+            if let Ok(mut handles) = sftp_handles.lock() {
+                handles.insert(sftp_tab_id, sftp_handle);
+            }
+        });
+        (Some(sftp_rx), Some(ready_tx))
     } else {
-        None
+        (None, None)
     };
 
     // --- Shell event pump (dedicated thread) ---
@@ -4825,6 +5046,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let debug_api_pump = ctx.debug_api.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
+            let mut sftp_ready_tx = sftp_ready_tx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
             // Reusable scratch so a fast firehose doesn't reallocate every batch.
             let mut drained: Vec<SessionEvent> = Vec::new();
@@ -4854,6 +5076,12 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 let mut ui_batch: Vec<SessionEvent> = Vec::with_capacity(drained.len());
                 for evt in drained.drain(..) {
                     match evt {
+                        SessionEvent::Connected => {
+                            if let Some(ready) = sftp_ready_tx.take() {
+                                let _ = ready.send(());
+                            }
+                            ui_batch.push(SessionEvent::Connected);
+                        }
                         SessionEvent::CwdChanged(cwd) => {
                             // Shared map (not a thread-local) so manual SFTP
                             // navigation can clear the entry — then the very next
@@ -5771,6 +5999,17 @@ fn output_highlight_rule_model(store: &ConfigStore) -> ModelRc<OutputRuleItem> {
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+fn parse_hex_color(value: &str) -> Option<slint::Color> {
+    let digits = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let red = u8::from_str_radix(&digits[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&digits[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&digits[4..6], 16).ok()?;
+    Some(slint::Color::from_rgb_u8(red, green, blue))
 }
 
 fn validate_output_highlight_rule(
@@ -7295,8 +7534,12 @@ fn apply_session_event_to_window(
                 if !current_user.is_empty() {
                     st.user = current_user;
                 }
-                st.procs = procs;
-                st.sys = *sys;
+                if !procs.is_empty() {
+                    st.procs = procs;
+                }
+                if let Some(sys) = sys {
+                    st.sys = *sys;
+                }
                 st.has_remote_stats = true;
                 // A sample means the channel is alive → treat as connected.
                 if st.state != 1 {
@@ -7305,6 +7548,20 @@ fn apply_session_event_to_window(
                 // Append the selected interface's total rate to its sparkline.
                 let (_, rx, tx) = selected_iface(st);
                 push_ring(&mut st.net_hist, (rx + tx) as f32);
+            }
+            if sidebar_source_tab_id(win) == tab_id {
+                refresh_sidebar(win, statuses, local, local_net_hist);
+            }
+        }
+        SessionEvent::ProcessStats {
+            current_user,
+            procs,
+        } => {
+            if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
+                if !current_user.is_empty() {
+                    st.user = current_user;
+                }
+                st.procs = procs;
             }
             if sidebar_source_tab_id(win) == tab_id {
                 refresh_sidebar(win, statuses, local, local_net_hist);
@@ -10149,6 +10406,7 @@ fn wire_key_input(
     // Middle-click / Ctrl+Shift+V: paste clipboard text into PTY.
     {
         let handles = handles.clone();
+        let bufs = bufs.clone();
         let weak = window.as_weak();
         window.on_paste_from_clipboard(move |tab_id: SharedString| {
             // Clone the (Send) command sender for this tab so the clipboard read
@@ -10160,6 +10418,7 @@ fn wire_key_input(
                 .get(tab_id.as_str())
                 .map(|h| h.commands.clone());
             let Some(sender) = sender else { return };
+            let bracketed = terminal_uses_bracketed_paste(&bufs, tab_id.as_str());
             let weak = weak.clone();
             let tab_id = tab_id.to_string();
             std::thread::spawn(move || {
@@ -10178,9 +10437,7 @@ fn wire_key_input(
                                 }
                             });
                         } else {
-                            // Normalise line endings to a single CR so the
-                            // terminal receives the same input on every OS.
-                            let bytes = normalize_pasted_newlines(&text).into_bytes();
+                            let bytes = encode_pasted_text(&text, bracketed);
                             let _ = sender.send(SessionCommand::RawInput(bytes));
                         }
                     }
@@ -10193,6 +10450,7 @@ fn wire_key_input(
     // Accept a previously reviewed multi-line paste (#262).
     {
         let handles_paste = handles.clone();
+        let bufs_paste = bufs.clone();
         let weak = window.as_weak();
         window.on_paste_confirmed(move |tab_id: SharedString| {
             let Some(sender) = handles_paste
@@ -10204,9 +10462,10 @@ fn wire_key_input(
             };
             let Some(w) = weak.upgrade() else { return };
             let text = w.get_paste_confirm_text().to_string();
-            let _ = sender.send(SessionCommand::RawInput(
-                normalize_pasted_newlines(&text).into_bytes(),
-            ));
+            let bracketed = terminal_uses_bracketed_paste(&bufs_paste, tab_id.as_str());
+            let _ = sender.send(SessionCommand::RawInput(encode_pasted_text(
+                &text, bracketed,
+            )));
             w.set_paste_confirm_open(false);
         });
     }
@@ -11158,6 +11417,40 @@ fn split_proxy(url: &str) -> (String, String) {
 /// package and drop the rest. Collapsing every CRLF/LF to one CR fixes it.
 fn normalize_pasted_newlines(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
+}
+
+/// Encode clipboard text according to the mode requested by the remote
+/// application. Bracketed paste lets shells and editors distinguish pasted
+/// text from typed keystrokes, preserving multi-line layout and indentation.
+fn encode_pasted_text(text: &str, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return normalize_pasted_newlines(text).into_bytes();
+    }
+
+    // A pasted ESC could forge the end marker; Ctrl+C also terminates bracketed
+    // paste in some shells. Match established terminal-emulator behaviour by
+    // filtering both before wrapping the payload.
+    let filtered = text.replace(['\x1b', '\x03'], "");
+    let mut bytes = Vec::with_capacity(filtered.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(filtered.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
+fn terminal_uses_bracketed_paste(bufs: &TermBuffers, tab_id: &str) -> bool {
+    let buffer = bufs
+        .lock()
+        .ok()
+        .and_then(|buffers| buffers.get(tab_id).cloned());
+    buffer
+        .and_then(|buffer| {
+            buffer
+                .lock()
+                .ok()
+                .map(|buffer| buffer.parser.screen().bracketed_paste())
+        })
+        .unwrap_or(false)
 }
 
 fn should_drop_debian_bare_ctrl_marker(key: &str, ctrl: bool, workaround: bool) -> bool {
@@ -13005,6 +13298,22 @@ mod key_tests {
     }
 
     #[test]
+    fn paste_uses_remote_bracketed_paste_mode() {
+        assert_eq!(
+            encode_pasted_text("first\r\n  second", true),
+            b"\x1b[200~first\r\n  second\x1b[201~"
+        );
+        assert_eq!(
+            encode_pasted_text("safe\x1b[201~\x03text", true),
+            b"\x1b[200~safe[201~text\x1b[201~"
+        );
+        assert_eq!(
+            encode_pasted_text("first\r\nsecond", false),
+            b"first\rsecond"
+        );
+    }
+
+    #[test]
     fn long_pastes_switch_to_large_review() {
         assert!(!paste_requires_large_review("short prompt\nsecond line"));
         assert!(!paste_requires_large_review(&"a".repeat(600)));
@@ -13315,6 +13624,23 @@ mod selection_tests {
         assert_eq!(build_row(screen, 0, 8).0, "─".repeat(8));
         assert!(build_row(screen, 1, 8).0.trim().is_empty());
         assert_eq!(screen.cursor_position().0, 0);
+    }
+
+    #[test]
+    fn paste_tracks_remote_bracketed_paste_state() {
+        let bufs = TermBuffers::default();
+        let mut buffer = make_buf(2, 20, &[], &[], 0);
+        buffer.parser.process(b"\x1b[?2004h");
+        bufs.lock()
+            .unwrap()
+            .insert("tab".into(), Arc::new(Mutex::new(buffer)));
+
+        assert!(terminal_uses_bracketed_paste(&bufs, "tab"));
+        assert!(!terminal_uses_bracketed_paste(&bufs, "missing"));
+
+        let buffer = term_buf(&bufs, "tab").unwrap();
+        buffer.lock().unwrap().parser.process(b"\x1b[?2004l");
+        assert!(!terminal_uses_bracketed_paste(&bufs, "tab"));
     }
 
     #[test]

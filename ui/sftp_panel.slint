@@ -106,6 +106,9 @@ export component SftpPanel inherits Rectangle {
     property <string> tunnel-bind-port: "1080";
     property <string> tunnel-host: "127.0.0.1";
     property <string> tunnel-host-port: "80";
+    // Side-docked panels use icon tabs and keep only primary actions when the
+    // width cannot accommodate the full horizontal toolbar (#285).
+    property <bool> narrow-toolbar: !root.show-tree && root.width < 360px;
 
     // --- Callbacks ---------------------------------------------------------
     callback toggle-collapsed();    // minimise / restore the panel
@@ -142,10 +145,15 @@ export component SftpPanel inherits Rectangle {
 
     // -----------------------------------------------------------------------
     background: Theme.bg-panel;
+    clip: true;
 
     // Keep the editable path bar in sync when the directory changes elsewhere
     // (tree click, file double-click, terminal cd) (#54).
-    changed current-path => { path-input.text = root.current-path; root.selected-row = -1; }
+    changed current-path => {
+        path-input.text = root.current-path;
+        compact-path-input.text = root.current-path;
+        root.selected-row = -1;
+    }
 
     // Drag empty space to re-dock; interactive widgets (file list, tree, toolbar
     // buttons) sit in front and capture their own events (#dock).
@@ -170,10 +178,11 @@ export component SftpPanel inherits Rectangle {
 
         // --- Toolbar (full width) ------------------------------------------
         Rectangle {
-            height: 34px;
+            height: root.narrow-toolbar && root.panel-mode == "files" ? 62px : 34px;
             background: Theme.bg-panel-alt;
 
             HorizontalLayout {
+                height: 34px;
                 padding-left: 6px;
                 padding-right: 6px;
                 padding-top: 6px;
@@ -210,7 +219,7 @@ export component SftpPanel inherits Rectangle {
                 }
 
                 Rectangle {
-                    width: 48px;
+                    width: root.narrow-toolbar ? 28px : 48px;
                     height: 22px;
                     border-radius: Theme.radius-sm;
                     background: root.panel-mode == "files" ? Theme.accent : (files-tab-ta.has-hover ? Theme.bg-hover : transparent);
@@ -219,7 +228,8 @@ export component SftpPanel inherits Rectangle {
                         clicked => { root.panel-mode = "files"; }
                     }
                     Text {
-                        text: @tr("Files");
+                        text: root.narrow-toolbar ? "\u{E2C7}" : @tr("Files");
+                        font-family: root.narrow-toolbar ? "Material Icons" : Theme.ui-font-family;
                         color: root.panel-mode == "files" ? #ffffff : Theme.text-secondary;
                         font-size: Theme.fs-xs;
                         horizontal-alignment: center;
@@ -227,7 +237,7 @@ export component SftpPanel inherits Rectangle {
                     }
                 }
                 Rectangle {
-                    width: 58px;
+                    width: root.narrow-toolbar ? 28px : 58px;
                     height: 22px;
                     border-radius: Theme.radius-sm;
                     background: root.panel-mode == "tunnels" ? Theme.accent : (tunnels-tab-ta.has-hover ? Theme.bg-hover : transparent);
@@ -236,7 +246,8 @@ export component SftpPanel inherits Rectangle {
                         clicked => { root.panel-mode = "tunnels"; }
                     }
                     Text {
-                        text: @tr("Tunnels");
+                        text: root.narrow-toolbar ? "\u{E0B6}" : @tr("Tunnels");
+                        font-family: root.narrow-toolbar ? "Material Icons" : Theme.ui-font-family;
                         color: root.panel-mode == "tunnels" ? #ffffff : Theme.text-secondary;
                         font-size: Theme.fs-xs;
                         horizontal-alignment: center;
@@ -247,7 +258,7 @@ export component SftpPanel inherits Rectangle {
                 // Editable path bar: type or paste a path and press Enter to
                 // jump there; copy / paste-jump buttons sit right after it (#54).
                 Rectangle {
-                    visible: root.panel-mode == "files";
+                    visible: root.panel-mode == "files" && !root.narrow-toolbar;
                     horizontal-stretch: 1;
                     height: 22px;
                     border-radius: Theme.radius-sm;
@@ -271,7 +282,7 @@ export component SftpPanel inherits Rectangle {
 
                 // Copy the current path to the clipboard.
                 Rectangle {
-                    visible: root.panel-mode == "files";
+                    visible: root.panel-mode == "files" && !root.narrow-toolbar;
                     width: 24px; height: 22px;
                     border-radius: Theme.radius-sm;
                     background: copy-ta.has-hover ? Theme.bg-hover : transparent;
@@ -290,7 +301,7 @@ export component SftpPanel inherits Rectangle {
 
                 // Paste a path from the clipboard and jump straight to it.
                 Rectangle {
-                    visible: root.panel-mode == "files";
+                    visible: root.panel-mode == "files" && !root.narrow-toolbar;
                     width: 24px; height: 22px;
                     border-radius: Theme.radius-sm;
                     background: pj-ta.has-hover ? Theme.bg-hover : transparent;
@@ -308,7 +319,7 @@ export component SftpPanel inherits Rectangle {
                 }
 
                 up-btn := Rectangle {
-                    visible: root.panel-mode == "files";
+                    visible: root.panel-mode == "files" && !root.narrow-toolbar;
                     width: 24px; height: 22px;
                     border-radius: Theme.radius-sm;
                     background: up-ta.has-hover ? Theme.bg-hover : transparent;
@@ -324,14 +335,14 @@ export component SftpPanel inherits Rectangle {
                 // SFTP upload handles both — only the local picker differs.
                 ul-btn := Rectangle {
                     visible: root.panel-mode == "files";
-                    width: 52px; height: 22px;
+                    width: root.narrow-toolbar ? 24px : 52px; height: 22px;
                     border-radius: Theme.radius-sm;
                     background: ul-ta.has-hover ? Theme.accent-hover : Theme.accent;
                     ul-ta := TouchArea {
                         mouse-cursor: pointer;
                         clicked => { ul-menu.show(); }
                     }
-                    Text { text: @tr("Upload"); color: #ffffff; font-size: Theme.fs-sm;
+                    Text { text: root.narrow-toolbar ? "↑" : @tr("Upload"); color: #ffffff; font-size: Theme.fs-sm;
                            horizontal-alignment: center; vertical-alignment: center; }
                     ul-menu := PopupWindow {
                         x: 0; y: parent.height + 2px;
@@ -361,13 +372,13 @@ export component SftpPanel inherits Rectangle {
                 }
 
                 // Batch actions on checked entries — only when something's checked (#100).
-                if root.panel-mode == "files" && root.selected-count > 0 : Text {
+                if root.panel-mode == "files" && root.selected-count > 0 && !root.narrow-toolbar : Text {
                     text: "✓" + root.selected-count;
                     color: Theme.accent;
                     font-size: Theme.fs-sm;
                     vertical-alignment: center;
                 }
-                if root.panel-mode == "files" && root.selected-count > 0 : Rectangle {
+                if root.panel-mode == "files" && root.selected-count > 0 && !root.narrow-toolbar : Rectangle {
                     width: 24px; height: 22px;
                     border-radius: Theme.radius-sm;
                     background: dls-ta.has-hover ? Theme.bg-hover : transparent;
@@ -375,7 +386,7 @@ export component SftpPanel inherits Rectangle {
                     Text { text: "\u{E2C4}"; font-family: "Material Icons"; color: Theme.text-secondary;
                            font-size: Theme.fs-md; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                if root.panel-mode == "files" && root.selected-count > 0 : Rectangle {
+                if root.panel-mode == "files" && root.selected-count > 0 && !root.narrow-toolbar : Rectangle {
                     width: 24px; height: 22px;
                     border-radius: Theme.radius-sm;
                     background: dels-ta.has-hover ? Theme.danger.with-alpha(0.18) : transparent;
@@ -385,7 +396,7 @@ export component SftpPanel inherits Rectangle {
                 }
 
                 Rectangle {
-                    visible: root.panel-mode == "files";
+                    visible: root.panel-mode == "files" && !root.narrow-toolbar;
                     width: 24px; height: 22px;
                     border-radius: Theme.radius-sm;
                     background: ref-ta.has-hover ? Theme.bg-hover : transparent;
@@ -411,6 +422,33 @@ export component SftpPanel inherits Rectangle {
                     Text { text: root.collapsed ? "\u{E5CE}" : "\u{E5CF}"; font-family: "Material Icons";
                            color: Theme.text-secondary; font-size: Theme.fs-md;
                            horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+
+            // Preserve path navigation in the side-docked compact layout by
+            // moving it to its own row instead of squeezing every control into
+            // one horizontal line (#285).
+            Rectangle {
+                visible: root.narrow-toolbar && root.panel-mode == "files";
+                x: 6px;
+                y: 34px;
+                width: parent.width - 12px;
+                height: 22px;
+                border-radius: Theme.radius-sm;
+                background: Theme.bg-root;
+                border-width: 1px;
+                border-color: compact-path-input.has-focus ? Theme.accent : Theme.border-subtle;
+                compact-path-input := TextInput {
+                    x: 6px;
+                    width: parent.width - 12px;
+                    height: parent.height;
+                    text: root.current-path;
+                    color: Theme.text-primary;
+                    font-family: Theme.ui-font-family;
+                    font-size: Theme.fs-sm;
+                    vertical-alignment: center;
+                    single-line: true;
+                    accepted => { root.navigate(self.text); }
                 }
             }
         }

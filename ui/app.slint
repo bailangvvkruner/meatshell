@@ -397,6 +397,9 @@ export component AppWindow inherits Window {
     in-out property <bool> term-font-bold <=> Theme.term-font-bold;
     in-out property <bool> hardware-acceleration-enabled: true;
     in property <bool> hardware-acceleration-available: false;
+    in-out property <string> term-cursor-style: "block";
+    in-out property <string> term-cursor-color-hex: root.dark-mode ? "#D4D4D4" : "#2D2D2F";
+    in-out property <color> term-cursor-color: Theme.term-fg;
     in-out property <bool> output-highlight-enabled: true;
     in-out property <string> output-highlight-preset: "log";
     in property <[OutputRuleItem]> output-highlight-rules;
@@ -454,6 +457,8 @@ export component AppWindow inherits Window {
     callback set-term-font-size(int);              // apply + persist font size (px)
     callback set-term-font-bold(bool);             // apply + persist bold terminal text
     callback set-hardware-acceleration(bool);      // save + restart with selected renderer
+    callback set-term-cursor-style(string);        // apply + persist cursor shape (#275)
+    callback set-term-cursor-color(string) -> bool;// validate + persist cursor colour (#275)
     callback set-output-highlight(bool, string);   // enable + built-in preset
     callback add-output-highlight-rule(string, bool, bool, bool, string) -> bool;
     callback remove-output-highlight-rule(int);
@@ -1360,6 +1365,8 @@ export component AppWindow inherits Window {
                     render-revision: term.render-revision;
                     cursor-row: term.cursor-row;
                     cursor-col: term.cursor-col;
+                    cursor-style: root.term-cursor-style;
+                    cursor-color: root.term-cursor-color;
                     rows-used: term.rows-used;
                     scroll-max: term.scroll-max;
                     scroll-offset: term.scroll-offset;
@@ -3680,6 +3687,9 @@ export component AppWindow inherits Window {
                     term-font-bold: root.term-font-bold;
                     hardware-acceleration-enabled: root.hardware-acceleration-enabled;
                     hardware-acceleration-available: root.hardware-acceleration-available;
+                    term-cursor-style <=> root.term-cursor-style;
+                    term-cursor-color-hex <=> root.term-cursor-color-hex;
+                    term-cursor-color: root.term-cursor-color;
                     output-highlight-enabled <=> root.output-highlight-enabled;
                     output-highlight-preset <=> root.output-highlight-preset;
                     output-highlight-rules: root.output-highlight-rules;
@@ -3713,6 +3723,8 @@ export component AppWindow inherits Window {
                     set-term-font-size(v) => { root.set-term-font-size(v); }
                     set-term-font-bold(v) => { root.set-term-font-bold(v); }
                     set-hardware-acceleration(v) => { root.set-hardware-acceleration(v); }
+                    set-term-cursor-style(v) => { root.set-term-cursor-style(v); }
+                    set-term-cursor-color(v) => { root.set-term-cursor-color(v) }
                     set-output-highlight(enabled, preset) => {
                         root.set-output-highlight(enabled, preset);
                     }

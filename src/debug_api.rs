@@ -450,6 +450,20 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn mark_sensitive(response: &mut Response) {
+    // Axum's JSON extractor emits `application/json` without a charset. JSON is
+    // UTF-8 by specification, but Windows PowerShell 5 falls back to the local
+    // code page unless this is explicit, corrupting terminal box characters.
+    if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
+    {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+    }
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),
@@ -1327,7 +1341,7 @@ mod tests {
     fn live_server_authenticates_and_routes_terminal_io() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let state = DebugApiState::new(|id, _max_lines| {
-            (id == "term-1").then(|| vec!["old".into(), "new".into()])
+            (id == "term-1").then(|| vec!["old".into(), "╭─".into()])
         });
         state.set_pointer_encoder(|id, event| {
             if id != "term-1" {
@@ -1392,6 +1406,7 @@ mod tests {
             ),
         );
         assert!(health.starts_with("HTTP/1.1 200"));
+        assert!(health.contains("content-type: application/json; charset=utf-8"));
         assert!(health.contains("\"status\":\"ok\""));
         assert!(health.contains("\"build_profile\":"));
         assert!(health.contains("\"executable_bytes\":"));
@@ -1404,7 +1419,8 @@ mod tests {
             ),
         );
         assert!(screen.starts_with("HTTP/1.1 200"));
-        assert!(screen.contains("\"text\":\"new\""));
+        assert!(screen.contains("content-type: application/json; charset=utf-8"));
+        assert!(screen.contains("\"text\":\"╭─\""));
 
         let screenshot = request_bytes(
             address,
