@@ -679,6 +679,7 @@ export component AppWindow inherits Window {
     in-out property <string> paste-confirm-tab;
     in-out property <string> paste-confirm-text;
     in-out property <string> paste-confirm-preview;
+    in-out property <bool> paste-confirm-large: false;
     callback paste-confirmed(string /* tab-id */);
     callback paste-confirm-cancelled();
     callback connect-session(string /* session-id */);
@@ -3297,12 +3298,14 @@ export component AppWindow inherits Window {
         width: parent.width;
         height: parent.height;
         is-open <=> root.paste-confirm-open;
+        covered: root.confirm-close-open;
         dismiss-on-backdrop: false;
         title: root.lang-en ? "Confirm multi-line paste" : "确认多行粘贴";
         message: root.lang-en
             ? "The clipboard contains line breaks and may execute multiple commands. Review it before pasting."
             : "剪贴板内容包含换行，粘贴后可能连续执行多个命令，请确认内容后再继续。";
         detail: root.paste-confirm-preview;
+        large-detail: root.paste-confirm-large;
         confirm-label: root.lang-en ? "Paste" : "粘贴";
         confirm => {
             root.paste-confirmed(root.paste-confirm-tab);

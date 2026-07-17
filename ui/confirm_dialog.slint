@@ -1,5 +1,6 @@
 import { Theme } from "theme.slint";
 import { GhostButton } from "widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 
 // A destructive (red) action button, matching PrimaryButton's shape.
 component DangerButton inherits Rectangle {
@@ -38,6 +39,12 @@ export component ConfirmDialog inherits Rectangle {
     in property <string> message;
     in property <string> detail;                  // optional, e.g. the file path
     in property <string> confirm-label: @tr("Confirm");
+    // Long AI prompts and other large multi-line pastes need a review surface
+    // comparable to the system-information window, with fixed footer actions.
+    in property <bool> large-detail: false;
+    // Temporarily hide this modal behind a higher-priority prompt without
+    // discarding its state (for example, app-exit confirmation).
+    in property <bool> covered: false;
     // Whether clicking the dimmed backdrop dismisses (cancels) the dialog. Off for
     // security prompts (e.g. host-key trust) so an accidental click outside the card
     // doesn't count as "reject" and abort the connection (#152).
@@ -45,7 +52,7 @@ export component ConfirmDialog inherits Rectangle {
     callback confirm();
     callback cancel();
 
-    visible: is-open;
+    visible: is-open && !covered;
     background: #000000aa;
 
     // Backdrop click cancels — unless disabled for a must-decide prompt.
@@ -56,8 +63,8 @@ export component ConfirmDialog inherits Rectangle {
     }
 
     Rectangle {
-        width: 380px;
-        height: card.preferred-height;
+        width: root.large-detail ? min(parent.width - 40px, 1160px) : 380px;
+        height: root.large-detail ? min(parent.height - 40px, 760px) : card.preferred-height;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: Theme.bg-panel;
@@ -98,12 +105,42 @@ export component ConfirmDialog inherits Rectangle {
                 wrap: word-wrap;
             }
 
-            if root.detail != "" : Text {
+            if root.detail != "" && !root.large-detail : Text {
                 text: root.detail;
                 color: Theme.text-primary;
                 font-family: Theme.font-mono;
                 font-size: Theme.fs-sm;
                 wrap: word-wrap;
+            }
+
+            if root.detail != "" && root.large-detail : Rectangle {
+                vertical-stretch: 1;
+                min-height: 220px;
+                background: Theme.bg-root;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+                border-radius: Theme.radius-sm;
+                clip: true;
+
+                detail-scroll := ScrollView {
+                    x: 1px;
+                    y: 1px;
+                    width: parent.width - 2px;
+                    height: parent.height - 2px;
+                    viewport-width: self.visible-width;
+                    viewport-height: max(self.visible-height, detail-text.preferred-height + 16px);
+
+                    detail-text := Text {
+                        x: 8px;
+                        y: 8px;
+                        width: max(1px, detail-scroll.visible-width - 16px);
+                        text: root.detail;
+                        color: Theme.text-primary;
+                        font-family: Theme.font-mono;
+                        font-size: Theme.fs-sm;
+                        wrap: word-wrap;
+                    }
+                }
             }
 
             HorizontalLayout {

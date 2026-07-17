@@ -19,6 +19,7 @@ mod known_hosts;
 mod local;
 mod memory_trim;
 mod panes;
+mod ppk;
 mod proxy;
 mod serial;
 mod sftp;

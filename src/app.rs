@@ -513,6 +513,10 @@ mod session_resource_mode_tests {
     }
 }
 
+fn should_block_close(exit_confirmed: bool, has_live_sessions: bool) -> bool {
+    !exit_confirmed && has_live_sessions
+}
+
 // Slint generates types into this scope.
 slint::include_modules!();
 
@@ -749,7 +753,10 @@ fn clamp_window_size_to_monitor(
 
     window.with_winit_window(|ww| {
         let scale = ww.scale_factor().max(0.01);
-        let monitor = ww.current_monitor()?;
+        // Before `Window::run()` makes the native window visible, winit often
+        // has no current monitor yet. Falling back to the primary monitor lets
+        // the persisted size actually apply during startup (#278).
+        let monitor = ww.current_monitor().or_else(|| ww.primary_monitor())?;
         let monitor_size = monitor.size();
         let monitor_pos = monitor.position();
         let max_w = (monitor_size.width as f64 / scale - 16.0).max(1.0) as f32;
@@ -1030,6 +1037,11 @@ pub fn run() -> Result<()> {
     // Windows the icon comes from the embedded .ico, so this is a no-op there.)
     let _ = slint::set_xdg_app_id("meatshell");
     let window = AppWindow::new().context("failed to build Slint window")?;
+    // Slint applies preferred-width/height while the native window is being
+    // created. Do not treat those startup Resized events as user adjustments;
+    // otherwise they overwrite the persisted size before restoration (#278).
+    let window_size_tracking_ready = Rc::new(Cell::new(false));
+    let pending_window_size_restore = Rc::new(Cell::new(None::<(f32, f32)>));
 
     // Bridge authenticated Debug API screenshot requests to Slint without
     // activating the window. Snapshot readback stays on the UI thread; the API
@@ -1386,7 +1398,7 @@ pub fn run() -> Result<()> {
 
     // Interface setting: collapse the sidebars by default (#78). Seed the
     // checkboxes, apply the collapsed state once at startup, and persist toggles.
-    let (saved_window_size, restore_window_maximized) = {
+    {
         let s = store.borrow();
         let collapse_sidebar = s.collapse_sidebar_default();
         let collapse_sftp = s.collapse_sftp_default();
@@ -1422,18 +1434,13 @@ pub fn run() -> Result<()> {
             window.set_sftp_collapsed(true);
             window.set_sftp_saved_height(s.sftp_panel_height());
         }
-        // Seed the saved logical size before the native window is shown. The
-        // deferred startup callback below clamps it once a monitor is available.
+        // Capture the user's preferred size. The first native Resized event
+        // drives restoration below; this is deterministic and avoids guessing
+        // how long Slint/window-manager initialization takes (#278).
         let (ww, wh) = s.window_size();
-        let saved_size = valid_windowed_size(ww, wh);
-        if let Some((ww, wh)) = saved_size {
-            window.window().set_size(slint::LogicalSize::new(ww, wh));
-        }
-        (saved_size, s.window_maximized())
-    };
-    // Updated by native resize events only while windowed. This preserves the
-    // restore size when the application exits maximized or minimized.
-    let last_windowed_size = Rc::new(Cell::new(saved_window_size));
+        let preferred = valid_windowed_size(ww, wh);
+        pending_window_size_restore.set(preferred);
+    }
     {
         let store = store.clone();
         window.on_set_collapse_sidebar_default(move |v| {
@@ -2573,6 +2580,11 @@ pub fn run() -> Result<()> {
         Hidden,     // minimized / occluded → paused
     }
     let activity = Rc::new(std::cell::Cell::new(WinActivity::Active));
+    // Once the user confirms shutdown, every subsequent native/custom close
+    // request must pass through without reopening the modal. Windows Installer
+    // and Restart Manager may issue more than one close request while replacing
+    // the executable (#267).
+    let exit_confirmed = Rc::new(Cell::new(false));
 
     // --- Configurable local system sampler -------------------------------
     let sampler = Rc::new(Mutex::new(SystemSampler::new()));
@@ -2689,7 +2701,9 @@ pub fn run() -> Result<()> {
         let close_handles = handles.clone();
         let ev_store = store.clone();
         let ev_activity = activity.clone();
-        let ev_windowed_size = last_windowed_size.clone();
+        let ev_exit_confirmed = exit_confirmed.clone();
+        let ev_window_size_tracking_ready = window_size_tracking_ready.clone();
+        let ev_pending_window_size_restore = pending_window_size_restore.clone();
         let mut last_cursor_logical: Option<(f32, f32)> = None;
         let mut macos_wheel_accum = 0.0_f32;
         // Track the inputs that make up WinActivity; recompute on each change.
@@ -2701,32 +2715,11 @@ pub fn run() -> Result<()> {
         // Apply the Win11 rounded-corner hint once, on the first event (the HWND
         // reliably exists by then, unlike a pre-run timer) (#166).
         let mut chrome_done = false;
-        let mut startup_geometry_done = false;
         window.window().on_winit_window_event(move |ew, event| {
             if !chrome_done {
                 chrome_done = true;
                 if let Some(win) = weak.upgrade() {
                     apply_window_chrome(win.window());
-                }
-            }
-            // Monitor information is not guaranteed before the event loop
-            // starts. Retry on subsequent native events until it is
-            // available, then clamp the windowed geometry before restoring
-            // maximized state.
-            if !startup_geometry_done {
-                if let Some(win) = weak.upgrade() {
-                    if let Some(size) =
-                        clamp_window_size_to_monitor(win.window(), ev_windowed_size.get())
-                    {
-                        ev_windowed_size.set(Some(size));
-                        if restore_window_maximized {
-                            ew.set_maximized(true);
-                            win.set_window_maximized(true);
-                        } else {
-                            center_window(&win);
-                        }
-                        startup_geometry_done = true;
-                    }
                 }
             }
             // Recompute window activity, push it to the shared cell, and update
@@ -2818,6 +2811,29 @@ pub fn run() -> Result<()> {
                     focused = *f;
                     apply_activity(focused, minimized, occluded);
                     if *f {
+                        // Some window managers deliver the first Resized event
+                        // before the native window belongs to a monitor. Focus
+                        // is a reliable second opportunity to seed restoration;
+                        // request_inner_size will produce the Resized event that
+                        // verifies the native window actually reached the target.
+                        if !ev_window_size_tracking_ready.get() {
+                            if let (Some(win), Some(preferred)) =
+                                (weak.upgrade(), ev_pending_window_size_restore.get())
+                            {
+                                if let Some(target) =
+                                    clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                {
+                                    tracing::info!(
+                                        "[WINDOW_SIZE] focus retry saved={:.0}x{:.0} \
+                                         target={:.0}x{:.0}",
+                                        preferred.0,
+                                        preferred.1,
+                                        target.0,
+                                        target.1,
+                                    );
+                                }
+                            }
+                        }
                         refresh_revealed_main_window(weak.clone());
                     }
                 }
@@ -2863,12 +2879,68 @@ pub fn run() -> Result<()> {
                                 (ew.is_maximized(), ew.is_minimized(), ew.scale_factor())
                             });
                         win.set_window_maximized(maxed);
-                        if !maxed && !native_minimized && size.width > 0 && size.height > 0 {
+                        if !ev_window_size_tracking_ready.get() {
+                            if let Some(preferred) = ev_pending_window_size_restore.get() {
+                                let scale = scale.max(0.01);
+                                let actual =
+                                    (size.width as f32 / scale, size.height as f32 / scale);
+                                if let Some(target) =
+                                    clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                {
+                                    tracing::info!(
+                                        "[WINDOW_SIZE] restore requested saved={:.0}x{:.0} \
+                                         target={:.0}x{:.0} actual={:.0}x{:.0} scale={:.2}",
+                                        preferred.0,
+                                        preferred.1,
+                                        target.0,
+                                        target.1,
+                                        actual.0,
+                                        actual.1,
+                                        scale,
+                                    );
+                                    if (actual.0 - target.0).abs() <= 2.0
+                                        && (actual.1 - target.1).abs() <= 2.0
+                                    {
+                                        ev_pending_window_size_restore.set(None);
+                                        ev_window_size_tracking_ready.set(true);
+                                        tracing::info!(
+                                            "[WINDOW_SIZE] restore settled at {:.0}x{:.0}",
+                                            actual.0,
+                                            actual.1
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "[WINDOW_SIZE] restore deferred: no monitor available \
+                                         saved={:.0}x{:.0}",
+                                        preferred.0,
+                                        preferred.1,
+                                    );
+                                }
+                            } else {
+                                // First run: accept the initialized size as the
+                                // baseline, but do not persist this startup event.
+                                ev_window_size_tracking_ready.set(true);
+                            }
+                            return EventResult::Propagate;
+                        }
+                        // Record the last user-adjusted windowed size while the
+                        // resize event still carries authoritative native
+                        // geometry. Persisting only during CloseRequested can
+                        // observe an installer/minimize transition instead
+                        // (#278). Keep writes in memory here; save_layout flushes
+                        // the config on exit.
+                        if ev_window_size_tracking_ready.get() && !maxed && !native_minimized {
                             let scale = scale.max(0.01);
-                            let w = size.width as f32 / scale;
-                            let h = size.height as f32 / scale;
-                            if let Some(size) = valid_windowed_size(w, h) {
-                                ev_windowed_size.set(Some(size));
+                            let width = size.width as f32 / scale;
+                            let height = size.height as f32 / scale;
+                            if let Some((width, height)) = valid_windowed_size(width, height) {
+                                ev_store.borrow_mut().set_window_size(width, height);
+                                tracing::debug!(
+                                    "[WINDOW_SIZE] recorded user size {:.0}x{:.0}",
+                                    width,
+                                    height
+                                );
                             }
                         }
                     }
@@ -2876,17 +2948,22 @@ pub fn run() -> Result<()> {
                 WEvent::CloseRequested => {
                     // Confirm before closing if there are open session tabs (#88),
                     // so a stray double-click on the title-bar icon / X / Alt+F4
-                    // doesn't silently drop live sessions. The confirm dialog's
-                    // "Close" calls quit_event_loop to actually exit.
-                    if !close_handles.borrow().is_empty() {
+                    // doesn't silently drop live sessions. Installer/Restart
+                    // Manager may send repeated requests, so never intercept
+                    // again after the user has confirmed shutdown (#267).
+                    if should_block_close(
+                        ev_exit_confirmed.get(),
+                        !close_handles.borrow().is_empty(),
+                    ) {
                         if let Some(win) = weak.upgrade() {
                             win.set_confirm_close_open(true);
                         }
                         return EventResult::PreventDefault;
                     }
+                    ev_exit_confirmed.set(true);
                     // No sessions → the window is about to close; persist layout.
                     if let Some(win) = weak.upgrade() {
-                        save_layout(&win, &ev_store, &ev_windowed_size);
+                        save_layout(&win, &ev_store);
                     }
                 }
                 _ => {}
@@ -2897,11 +2974,44 @@ pub fn run() -> Result<()> {
     // Confirm-close dialog "Close" → actually quit the event loop (#88).
     {
         let weak = window.as_weak();
+        let proc_weak = proc_win.as_weak();
+        let sys_weak = sys_win.as_weak();
         let cc_store = store.clone();
-        let cc_windowed_size = last_windowed_size.clone();
+        let close_handles = handles.clone();
+        let close_sftp_handles = sftp_handles.clone();
+        let close_exit_confirmed = exit_confirmed.clone();
         window.on_confirm_close_yes(move || {
+            // Guard against a double click and against another close request
+            // arriving from Windows Installer while shutdown is in progress.
+            if close_exit_confirmed.replace(true) {
+                return;
+            }
             if let Some(w) = weak.upgrade() {
-                save_layout(&w, &cc_store, &cc_windowed_size);
+                w.set_confirm_close_open(false);
+                save_layout(&w, &cc_store);
+                let _ = w.hide();
+            }
+            if let Some(w) = proc_weak.upgrade() {
+                let _ = w.hide();
+            }
+            if let Some(w) = sys_weak.upgrade() {
+                let _ = w.hide();
+            }
+            // Ask every worker to stop before the runtime/event loop is torn
+            // down. Clearing the maps also makes any repeated close request see
+            // no live sessions and pass through immediately.
+            {
+                let mut sessions = close_handles.borrow_mut();
+                for handle in sessions.values() {
+                    handle.close();
+                }
+                sessions.clear();
+            }
+            if let Ok(mut sftp) = close_sftp_handles.lock() {
+                for handle in sftp.values() {
+                    handle.close();
+                }
+                sftp.clear();
             }
             let _ = slint::quit_event_loop();
         });
@@ -2935,12 +3045,14 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let close_handles = handles.clone();
         let wc_store = store.clone();
-        let wc_windowed_size = last_windowed_size.clone();
+        let wc_exit_confirmed = exit_confirmed.clone();
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 // Mirror the native-X behaviour: confirm if sessions are open.
-                if close_handles.borrow().is_empty() {
-                    save_layout(&w, &wc_store, &wc_windowed_size);
+                if !should_block_close(wc_exit_confirmed.get(), !close_handles.borrow().is_empty())
+                {
+                    wc_exit_confirmed.set(true);
+                    save_layout(&w, &wc_store);
                     let _ = slint::quit_event_loop();
                 } else {
                     w.set_confirm_close_open(true);
@@ -3012,7 +3124,7 @@ pub fn run() -> Result<()> {
     let run_result = window.run();
     // Covers programmatic event-loop exits and backend errors in addition to the
     // explicit close callbacks above. A second save after a normal close is safe.
-    save_layout(&window, &store, &last_windowed_size);
+    save_layout(&window, &store);
     run_result.context("event loop exited with error")?;
     Ok(())
 }
@@ -3028,45 +3140,6 @@ fn debug_screen_lines(displayed_text: &[String], max_lines: usize) -> Vec<String
     let start = end.saturating_sub(max_lines);
     displayed_text[start..end].to_vec()
 }
-
-/// Center the window on the primary monitor's work area (Windows).
-#[cfg(windows)]
-fn center_window(win: &AppWindow) {
-    #[repr(C)]
-    struct Rect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    }
-    #[link(name = "user32")]
-    extern "system" {
-        fn SystemParametersInfoW(action: u32, uiparam: u32, pvparam: *mut Rect, winini: u32)
-            -> i32;
-    }
-    const SPI_GETWORKAREA: u32 = 0x0030;
-
-    let size = win.window().size(); // physical pixels
-    let mut wa = Rect {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa, 0) };
-    if ok == 0 {
-        return;
-    }
-    let area_w = (wa.right - wa.left).max(0) as u32;
-    let area_h = (wa.bottom - wa.top).max(0) as u32;
-    let x = wa.left + ((area_w.saturating_sub(size.width)) / 2) as i32;
-    let y = wa.top + ((area_h.saturating_sub(size.height)) / 2) as i32;
-    win.window()
-        .set_position(slint::PhysicalPosition::new(x, y));
-}
-
-#[cfg(not(windows))]
-fn center_window(_win: &AppWindow) {}
 
 /// The active terminal tab's current SFTP directory ("" if unknown).
 fn active_sftp_path(win: &AppWindow, tab_id: &str) -> String {
@@ -4322,8 +4395,9 @@ fn wire_session_callbacks(
     {
         let weak = window.as_weak();
         window.on_session_dialog_pick_key(move || {
-            let mut dialog =
-                rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(t("选择私钥文件", "Choose private key file"))
+                .add_filter(t("SSH 私钥", "SSH private keys"), &["ppk", "pem", "key"]);
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -5440,31 +5514,11 @@ fn place_process_window(main: &AppWindow, process: &ProcWindow) {
 /// Persist the current panel docking layout (both panels' edge + size) and the
 /// window size, so the next launch restores the user's arrangement. Called on
 /// every exit path (#dock).
-fn save_layout(
-    win: &AppWindow,
-    store: &Rc<RefCell<ConfigStore>>,
-    last_windowed_size: &Cell<Option<(f32, f32)>>,
-) {
-    let (native_maximized, native_minimized) = win
-        .window()
-        .with_winit_window(|native| {
-            (
-                native.is_maximized(),
-                native.is_minimized().unwrap_or(false),
-            )
-        })
-        .unwrap_or_else(|| (win.get_window_maximized(), false));
-
-    if !native_maximized && !native_minimized {
-        let scale = win.window().scale_factor().max(0.01);
-        let size = win.window().size();
-        let w = size.width as f32 / scale;
-        let h = size.height as f32 / scale;
-        if let Some(size) = valid_windowed_size(w, h) {
-            last_windowed_size.set(Some(size));
-        }
-    }
-
+fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
+    let scale = win.window().scale_factor().max(0.01);
+    let size = win.window().size();
+    let w = size.width as f32 / scale;
+    let h = size.height as f32 / scale;
     let mut s = store.borrow_mut();
     s.set_sidebar_width(win.get_sidebar_width());
     s.set_sidebar_height(win.get_sidebar_height());
@@ -5476,10 +5530,22 @@ fn save_layout(
     s.set_welcome_sidebar_width(win.get_welcome_sidebar_width());
     s.set_welcome_sidebar_dock(win.get_welcome_sidebar_dock().to_string());
     s.set_welcome_collapsed(win.get_welcome_collapsed());
-    if let Some((w, h)) = last_windowed_size.get() {
-        s.set_window_size(w, h);
+    // A maximized size isn't a useful "preferred" size to restore to, so only
+    // remember the windowed size. Ask the native window too, because the Slint
+    // property can lag during startup/shutdown on frameless Windows (#234).
+    let native_maximized = win
+        .window()
+        .with_winit_window(|ww| ww.is_maximized())
+        .unwrap_or_else(|| win.get_window_maximized());
+    let (saved_w, saved_h) = s.window_size();
+    if !native_maximized && valid_windowed_size(saved_w, saved_h).is_none() {
+        // Normal resize events keep this cache current. Only fall back to the
+        // close-time geometry for a first run where no valid resize was seen;
+        // do not issue a new native resize while the window is shutting down.
+        if let Some((w, h)) = valid_windowed_size(w, h) {
+            s.set_window_size(w, h);
+        }
     }
-    s.set_window_maximized(native_maximized);
     if let Err(err) = s.save() {
         tracing::warn!("failed to save window layout: {err:#}");
     }
@@ -9911,6 +9977,18 @@ fn wire_key_input(
                 tracing::info!("[KEY_DIAG] Backspace PASSED all filters → sent to PTY");
             }
 
+            if should_drop_debian_bare_ctrl_marker(
+                key.as_str(),
+                ctrl,
+                debian_ctrl_marker_workaround_enabled(),
+            ) {
+                tracing::debug!(
+                    "send_key: dropped Debian/Slint bare Ctrl modifier marker {}",
+                    redact_key(key.as_str())
+                );
+                return;
+            }
+
             let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, app_cursor);
             // Log only the length — never the keystroke bytes, which can be
             // password characters (#15).
@@ -10067,18 +10145,14 @@ fn wire_key_input(
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
                         if text.contains(['\r', '\n']) {
-                            let preview: String = text.chars().take(1200).collect();
-                            let truncated = text.chars().count() > 1200;
-                            let preview = if truncated {
-                                format!("{preview}\n…")
-                            } else {
-                                preview
-                            };
+                            let large = paste_requires_large_review(&text);
+                            let preview = text.clone();
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(w) = weak.upgrade() {
                                     w.set_paste_confirm_tab(tab_id.into());
                                     w.set_paste_confirm_text(text.into());
                                     w.set_paste_confirm_preview(preview.into());
+                                    w.set_paste_confirm_large(large);
                                     w.set_paste_confirm_open(true);
                                 }
                             });
@@ -11060,6 +11134,41 @@ fn normalize_pasted_newlines(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
+fn should_drop_debian_bare_ctrl_marker(key: &str, ctrl: bool, workaround: bool) -> bool {
+    workaround
+        && ctrl
+        && matches!(
+            key.chars().collect::<Vec<_>>().as_slice(),
+            ['\u{0011}'] | ['\u{0016}']
+        )
+}
+
+#[cfg(target_os = "linux")]
+fn debian_ctrl_marker_workaround_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Ok(release) = std::fs::read_to_string("/etc/os-release") else {
+            return false;
+        };
+        release.lines().any(|line| {
+            let Some((key, value)) = line.split_once('=') else {
+                return false;
+            };
+            let value = value.trim_matches('"');
+            key == "ID" && value.eq_ignore_ascii_case("debian")
+                || key == "ID_LIKE"
+                    && value
+                        .split_ascii_whitespace()
+                        .any(|item| item.eq_ignore_ascii_case("debian"))
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn debian_ctrl_marker_workaround_enabled() -> bool {
+    false
+}
+
 fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u8> {
     // --- Special keys (Slint PUA code points) ------------------------------
     // Arrow keys: respect DECCKM application-cursor mode.
@@ -11128,15 +11237,14 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
     // Meta and discard the line the user was typing — the "Alt clears the
     // command" bug.
     //
-    // The `!ctrl` guard is deliberate: a real Ctrl+P..Ctrl+X is encoded by some
-    // Linux/macOS builds directly as the same C0 bytes (0x10..0x18) but with
-    // ctrl=true (handled by the Ctrl branch just below), so we must NOT swallow
-    // those. A lone modifier never carries ctrl=true except bare Ctrl/CtrlR
-    // themselves, which are harmless to pass through as today.
-    if !ctrl {
-        if let Some(c) = key.chars().next() {
-            let cp = c as u32;
-            if key.chars().count() == 1 && (0x10..=0x18).contains(&cp) {
+    // Keep ctrl=true C0 values here: some Linux/macOS builds encode real
+    // Ctrl+P..Ctrl+X directly as 0x10..=0x18. Debian's bare Ctrl markers are
+    // filtered at the event boundary, where the distro-specific workaround is
+    // available (#274).
+    if let Some(c) = key.chars().next() {
+        let cp = c as u32;
+        if key.chars().count() == 1 {
+            if !ctrl && (0x10..=0x18).contains(&cp) {
                 return vec![];
             }
         }
@@ -12217,6 +12325,30 @@ impl TermBuffer {
     }
 }
 
+/// Switch long prompts to the large, scrollable paste-review surface before a
+/// compact confirmation card can grow enough to cover its own action buttons.
+fn paste_requires_large_review(text: &str) -> bool {
+    const COMPACT_CHAR_LIMIT: usize = 600;
+    const COMPACT_LINE_LIMIT: usize = 12;
+    let bytes = text.as_bytes();
+    let mut lines = 1usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                lines += 1;
+                if bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+            }
+            b'\n' => lines += 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    text.chars().count() > COMPACT_CHAR_LIMIT || lines > COMPACT_LINE_LIMIT
+}
+
 thread_local! {
     /// Decoded images are retained only for emoji actually seen in terminal
     /// output. A full 72x72 RGBA Twemoji is ~20 KiB; this avoids decoding on
@@ -12783,10 +12915,25 @@ mod key_tests {
     #[test]
     fn ctrl_letter_c0_still_passes() {
         // A real Ctrl+R encoded as the C0 byte 0x12 with ctrl=true must still be
-        // forwarded — the !ctrl guard keeps the #43 fix from breaking it.
+        // forwarded; the #274 fix filters only bare Ctrl/CtrlR markers.
         assert_eq!(key_to_pty_bytes("\u{0012}", true, false, false), vec![0x12]);
         // Ctrl+X as C0 0x18.
         assert_eq!(key_to_pty_bytes("\u{0018}", true, false, false), vec![0x18]);
+    }
+
+    #[test]
+    fn debian_bare_ctrl_markers_do_not_reach_nano() {
+        // Slint on Debian emits these before the actual Ctrl+letter event.
+        assert!(should_drop_debian_bare_ctrl_marker("\u{0011}", true, true));
+        assert!(should_drop_debian_bare_ctrl_marker("\u{0016}", true, true));
+        // Other platforms retain their existing direct-C0 behaviour.
+        assert!(!should_drop_debian_bare_ctrl_marker(
+            "\u{0011}", true, false
+        ));
+        assert!(!should_drop_debian_bare_ctrl_marker("x", true, true));
+        // The following Ctrl+X must still become CAN (0x18), which nano uses
+        // for Exit.
+        assert_eq!(key_to_pty_bytes("x", true, false, false), vec![0x18]);
     }
 
     #[test]
@@ -12831,6 +12978,23 @@ mod key_tests {
         assert_eq!(normalize_pasted_newlines("a\rb"), "a\rb");
         // No newlines → unchanged.
         assert_eq!(normalize_pasted_newlines("echo hi"), "echo hi");
+    }
+
+    #[test]
+    fn long_pastes_switch_to_large_review() {
+        assert!(!paste_requires_large_review("short prompt\nsecond line"));
+        assert!(!paste_requires_large_review(&"a".repeat(600)));
+        assert!(paste_requires_large_review(&"a".repeat(601)));
+        assert!(!paste_requires_large_review(&vec!["line"; 12].join("\r\n")));
+        assert!(paste_requires_large_review(&vec!["line"; 13].join("\r\n")));
+    }
+
+    #[test]
+    fn confirmed_exit_never_reopens_close_prompt() {
+        assert!(should_block_close(false, true));
+        assert!(!should_block_close(false, false));
+        assert!(!should_block_close(true, true));
+        assert!(!should_block_close(true, false));
     }
 }
 

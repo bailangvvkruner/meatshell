@@ -1458,13 +1458,6 @@ impl ConfigStore {
         self.cache.window_width = w;
         self.cache.window_height = h;
     }
-    pub fn window_maximized(&self) -> bool {
-        self.cache.window_maximized
-    }
-    pub fn set_window_maximized(&mut self, maximized: bool) {
-        self.cache.window_maximized = maximized;
-    }
-
     /// Collapse the SFTP panel on startup (default false) (#78).
     pub fn collapse_sftp_default(&self) -> bool {
         self.cache.collapse_sftp_default
