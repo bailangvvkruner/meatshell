@@ -12,7 +12,7 @@ use futures::future::BoxFuture;
 use russh::client::{self, Handle, Handler, Msg};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{decode_secret_key, load_secret_key, PrivateKey};
-use russh::{Channel, ChannelId, ChannelMsg, ChannelOpenFailure, Disconnect};
+use russh::{Channel, ChannelId, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind};
 use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
@@ -1200,6 +1200,30 @@ const MAX_CREDENTIAL_REPROMPTS: usize = 3;
 pub(crate) type AuthReconnectFuture<H> =
     BoxFuture<'static, Result<(Handle<H>, Option<Handle<ClientHandler>>)>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasswordAuthDecision {
+    Success,
+    Rejected,
+    KeyboardInteractive { reconnect: bool },
+}
+
+fn password_auth_decision(result: &client::AuthResult) -> PasswordAuthDecision {
+    match result {
+        client::AuthResult::Success => PasswordAuthDecision::Success,
+        client::AuthResult::Failure {
+            remaining_methods,
+            partial_success,
+        } if remaining_methods.contains(&MethodKind::KeyboardInteractive) => {
+            PasswordAuthDecision::KeyboardInteractive {
+                // A normal rejection starts the fallback on a fresh transport.
+                // Partial success must stay on this handle to complete MFA.
+                reconnect: !partial_success,
+            }
+        }
+        client::AuthResult::Failure { .. } => PasswordAuthDecision::Rejected,
+    }
+}
+
 async fn reconnect_auth_handle<H, F>(
     handle: &mut Handle<H>,
     jump_handle: &mut Option<Handle<ClientHandler>>,
@@ -1231,21 +1255,29 @@ where
     H::Error: std::error::Error + Send + Sync + 'static,
     F: FnMut() -> AuthReconnectFuture<H>,
 {
-    let ok = handle
+    let result = handle
         .authenticate_password(user, password)
         .await
-        .context("password auth failed")?
-        .success();
-    if ok {
-        return Ok(true);
+        .context("password auth failed")?;
+    match password_auth_decision(&result) {
+        PasswordAuthDecision::Success => Ok(true),
+        PasswordAuthDecision::Rejected => {
+            tracing::debug!("password rejected and keyboard-interactive was not advertised");
+            Ok(false)
+        }
+        PasswordAuthDecision::KeyboardInteractive {
+            reconnect: needs_reconnect,
+        } => {
+            if needs_reconnect {
+                // russh cannot safely switch methods after an ordinary rejection
+                // on the same handle, so start the fallback on a fresh transport.
+                reconnect_auth_handle(handle, jump_handle, reconnect).await?;
+            }
+            keyboard_interactive_auth(handle, user, password, &session.id, &session.host, events)
+                .await
+                .context("keyboard-interactive auth failed")
+        }
     }
-
-    // russh cannot safely switch auth methods after a rejection on the same
-    // handle, so keyboard-interactive always starts on a fresh connection.
-    reconnect_auth_handle(handle, jump_handle, reconnect).await?;
-    keyboard_interactive_auth(handle, user, password, &session.id, &session.host, events)
-        .await
-        .context("keyboard-interactive auth failed")
 }
 
 /// Authenticate any already-connected SSH handle and replace it through
@@ -4171,10 +4203,108 @@ mod mfa_tests {
 
 #[cfg(test)]
 mod credential_prompt_tests {
-    use super::{request_credential_prompt, SessionEvent, MAX_CREDENTIAL_REPROMPTS};
+    use super::{
+        authenticate_connected_session, password_auth_decision, request_credential_prompt,
+        AuthReconnectFuture, AuthResult, ClientHandler, PasswordAuthDecision, SessionEvent,
+        MAX_CREDENTIAL_REPROMPTS,
+    };
+    use crate::config::{Secret, Session};
+    use russh::client::{self, AuthResult as RusshAuthResult};
+    use russh::keys::ssh_key::private::Ed25519Keypair;
+    use russh::server;
+    use russh::{MethodKind, MethodSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
+
+    const TEST_OLD_PASSWORD: &str = "rejected-test-password";
+    const TEST_NEW_PASSWORD: &str = "accepted-test-password";
+
+    #[derive(Clone)]
+    struct PasswordOnlyServer {
+        password_attempts: Arc<AtomicUsize>,
+        keyboard_interactive_attempts: Arc<AtomicUsize>,
+    }
+
+    impl server::Handler for PasswordOnlyServer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            user: &str,
+            password: &str,
+        ) -> Result<server::Auth, Self::Error> {
+            self.password_attempts.fetch_add(1, Ordering::SeqCst);
+            if user == "root" && password == TEST_NEW_PASSWORD {
+                Ok(server::Auth::Accept)
+            } else {
+                Ok(server::Auth::reject())
+            }
+        }
+
+        async fn auth_keyboard_interactive<'a>(
+            &'a mut self,
+            _user: &str,
+            _submethods: &str,
+            _response: Option<server::Response<'a>>,
+        ) -> Result<server::Auth, Self::Error> {
+            self.keyboard_interactive_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(server::Auth::reject())
+        }
+    }
+
+    struct AcceptTestServerKey;
+
+    impl client::Handler for AcceptTestServerKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    fn rejected(methods: &[MethodKind], partial_success: bool) -> RusshAuthResult {
+        RusshAuthResult::Failure {
+            remaining_methods: MethodSet::from(methods),
+            partial_success,
+        }
+    }
+
+    #[test]
+    fn password_only_server_does_not_double_count_a_rejected_password() {
+        let result = rejected(&[MethodKind::PublicKey, MethodKind::Password], false);
+        assert_eq!(
+            password_auth_decision(&result),
+            PasswordAuthDecision::Rejected
+        );
+    }
+
+    #[test]
+    fn advertised_keyboard_interactive_uses_a_fresh_connection_after_rejection() {
+        let result = rejected(
+            &[MethodKind::Password, MethodKind::KeyboardInteractive],
+            false,
+        );
+        assert_eq!(
+            password_auth_decision(&result),
+            PasswordAuthDecision::KeyboardInteractive { reconnect: true }
+        );
+    }
+
+    #[test]
+    fn partial_password_success_completes_mfa_on_the_same_connection() {
+        let result = rejected(&[MethodKind::KeyboardInteractive], true);
+        assert_eq!(
+            password_auth_decision(&result),
+            PasswordAuthDecision::KeyboardInteractive { reconnect: false }
+        );
+    }
 
     #[tokio::test]
     async fn rejected_password_requests_and_returns_fresh_credentials() {
@@ -4227,6 +4357,127 @@ mod credential_prompt_tests {
             prompt.await.expect("prompt task panicked"),
             Some(("root".into(), "new-password".into(), true))
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_password_reconnects_with_prompted_password_without_keyboard_interactive() {
+        let password_attempts = Arc::new(AtomicUsize::new(0));
+        let keyboard_interactive_attempts = Arc::new(AtomicUsize::new(0));
+        let handler = PasswordOnlyServer {
+            password_attempts: password_attempts.clone(),
+            keyboard_interactive_attempts: keyboard_interactive_attempts.clone(),
+        };
+
+        let mut server_config = server::Config {
+            inactivity_timeout: None,
+            auth_rejection_time: Duration::from_millis(1),
+            auth_rejection_time_initial: Some(Duration::from_millis(1)),
+            methods: MethodSet::from(&[MethodKind::PublicKey, MethodKind::Password][..]),
+            ..server::Config::default()
+        };
+        server_config
+            .keys
+            .push(russh::keys::PrivateKey::from(Ed25519Keypair::from_seed(
+                &[42; 32],
+            )));
+        let server_config = Arc::new(server_config);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let server_connections = accepted_connections.clone();
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test server should accept a connection");
+                server_connections.fetch_add(1, Ordering::SeqCst);
+                let config = server_config.clone();
+                let connection_handler = handler.clone();
+                tokio::spawn(async move {
+                    let running = server::run_stream(config, socket, connection_handler)
+                        .await
+                        .expect("test SSH server should start");
+                    let _ = running.await;
+                });
+            }
+        });
+
+        let client_config = Arc::new(client::Config::default());
+        let mut handle = client::connect(client_config.clone(), address, AcceptTestServerKey)
+            .await
+            .expect("test SSH client should connect");
+        let mut jump_handle: Option<russh::client::Handle<ClientHandler>> = None;
+        let mut session = Session::new_empty();
+        session.id = "password-retry-integration".into();
+        session.host = address.ip().to_string();
+        session.port = address.port();
+        session.user = "root".into();
+        session.password = Secret::new(TEST_OLD_PASSWORD);
+
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let prompt_task = tokio::spawn(async move {
+            let status = timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("authentication status timed out")
+                .expect("authentication event channel closed");
+            assert!(matches!(status, SessionEvent::Status(_)));
+
+            let prompt = timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("credential prompt timed out")
+                .expect("authentication event channel closed");
+            match prompt {
+                SessionEvent::CredentialPrompt {
+                    retry,
+                    need_password,
+                    responder,
+                    ..
+                } => {
+                    assert!(retry);
+                    assert!(need_password);
+                    responder.respond(Some(("root".into(), TEST_NEW_PASSWORD.into(), false)));
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+
+        let reconnect_config = client_config.clone();
+        let reconnect = move || {
+            let config = reconnect_config.clone();
+            Box::pin(async move {
+                let next = client::connect(config, address, AcceptTestServerKey).await?;
+                Ok((next, None))
+            }) as AuthReconnectFuture<AcceptTestServerKey>
+        };
+        let result = timeout(
+            Duration::from_secs(5),
+            authenticate_connected_session(
+                &mut handle,
+                &mut jump_handle,
+                &session,
+                &events,
+                reconnect,
+            ),
+        )
+        .await
+        .expect("password retry flow timed out")
+        .expect("password retry flow failed");
+
+        assert!(matches!(result, AuthResult::Success));
+        prompt_task.await.expect("prompt task panicked");
+        timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server did not accept both connections")
+            .expect("server task panicked");
+        assert_eq!(accepted_connections.load(Ordering::SeqCst), 2);
+        assert_eq!(password_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(keyboard_interactive_attempts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
