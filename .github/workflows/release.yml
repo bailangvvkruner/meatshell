@@ -230,13 +230,13 @@ jobs:
           fi
 
       # MSI installer with a "choose install location" wizard (WixUI_InstallDir).
-      # Best-effort: if the WiX/cargo-wix tooling hiccups it must not block the
-      # .zip release, hence continue-on-error.
+      # This is a required Windows artifact: a missing/stale installer must fail
+      # the workflow instead of leaving an older MSI attached to nightly.
       - name: Build MSI installer (Windows)
         if: matrix.name == 'windows-x86_64'
-        continue-on-error: true
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           if ($env:GITHUB_REF -eq "refs/heads/main") {
             $VERSION = "nightly"
           } else {
@@ -246,11 +246,17 @@ jobs:
           $VERSION = $VERSION -replace '[\\/]', '-'
           # WiX 3 toolset (candle/light) that cargo-wix drives.
           choco install wixtoolset -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "WiX Toolset installation failed with exit code $LASTEXITCODE" }
           $candle = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*\bin\candle.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($candle) { $env:PATH = "$($candle.DirectoryName);$env:PATH" }
-          cargo install cargo-wix --locked
-          cargo wix --no-build --nocapture --target ${{ matrix.target }} --output "meatshell-$VERSION-windows-x86_64.msi"
-          echo "MSI=meatshell-$VERSION-windows-x86_64.msi" >> $env:GITHUB_ENV
+          if (-not $candle) { throw "candle.exe was not found after installing WiX Toolset" }
+          $env:PATH = "$($candle.DirectoryName);$env:PATH"
+          cargo install cargo-wix --version 0.3.9 --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo-wix installation failed with exit code $LASTEXITCODE" }
+          $msi = "meatshell-$VERSION-windows-x86_64.msi"
+          cargo wix --no-build --nocapture --target ${{ matrix.target }} --output $msi
+          if ($LASTEXITCODE -ne 0) { throw "MSI build failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) { throw "MSI build did not create $msi" }
+          echo "MSI=$msi" >> $env:GITHUB_ENV
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -267,11 +273,11 @@ jobs:
 
       - name: Upload MSI artifact
         if: matrix.name == 'windows-x86_64' && env.MSI != ''
-        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-x86_64-msi
           path: ${{ env.MSI }}
+          if-no-files-found: error
 
       - name: Move rolling nightly tag
         if: github.ref == 'refs/heads/main'
@@ -294,14 +300,13 @@ jobs:
 
       - name: Attach MSI to nightly release
         if: github.ref == 'refs/heads/main' && env.MSI != ''
-        continue-on-error: true
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: nightly
           prerelease: true
           make_latest: false
           files: ${{ env.MSI }}
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -319,11 +324,10 @@ jobs:
 
       - name: Attach MSI to GitHub Release
         if: matrix.name == 'windows-x86_64' && env.MSI != '' && startsWith(github.ref, 'refs/tags/')
-        continue-on-error: true
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: ${{ env.MSI }}
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   build-linux-aarch64-glibc228:
     name: linux-aarch64-glibc228

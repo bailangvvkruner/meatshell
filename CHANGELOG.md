@@ -13,6 +13,7 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ### 修复 / Fixed
 
+- **修复 GPU 启动内存在快速进入 btop 后长期停留在 100 MiB 以上。** Windows GPU 路径现在会在启动约 2 秒后执行一次不可被密集终端推迟的初始化工作集回收；后续回收仍只在所有密集终端退出并空闲 10 秒后进行，避免持续渲染时反复换页。实测同一配置的私有工作集由启动 `120.6 MiB` 在 `3.4 s` 降至 `10.1 MiB`，之后稳定在 `10–12 MiB`，ANGLE/D3D11 GPU 活动保持正常。
 - **修复远程 Linux SSH 中 btop 双击只选中进程而不打开详情。** SSH 鼠标按下事件现在至少间隔 120 ms，等待期间仍持续读取远端输出；调试接口的双击也拆成两组完整 press/release 发送。该节流仅位于 SSH 传输路径，本地终端、串口和 Telnet 保持原样，不包含 Windows btop 适配。
 - **修复密集终端切换与输入擦除后的旧帧残留。** 新输入、退格、光标移动及从全屏 TUI 返回 shell 时会先显示当前权威文本帧，旧的异步行图像不能覆盖较新的稀疏终端状态；窗口恢复、字体/DPI 与尺寸变化会使旧纹理代次失效并完整重建。
 
@@ -22,6 +23,7 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ### 构建 / Build
 
+- **修复 nightly MSI 显示成功却保留旧附件。** ANGLE 安装文件已合并到唯一的 WiX 源，避免 `angle.wxs` 被重复编译；MSI 构建、artifact 上传和 Release 附件现在都是强制门禁，文件缺失或生成失败会直接使工作流失败。
 - **升级并固定最新编译链。** 仓库与 GitHub Actions 统一使用 Rust 1.97.0，Slint 全组件升级到 1.17.1，Windows Skia 升级到 0.99.0，并刷新锁文件内所有兼容版本依赖；项目实际最低 Rust 版本同步为 1.92。
 - **修复分支云构建打包失败。** workflow 手动构建含 `/` 的分支名时会先将路径分隔符转换为 `-`，避免创建 Windows、Linux 或 macOS 产物目录时报错；非 Windows 二进制版本校验改为读取包版本，不再把分支名误当版本号。
 
@@ -35,6 +37,7 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ### Fixed
 
+- **Fix GPU startup memory remaining above 100 MiB when btop is opened quickly.** The Windows GPU path now performs one initialization working-set trim about two seconds after startup that a dense terminal cannot defer. Later trims still wait until all dense terminals have exited and remained idle for ten seconds, avoiding repeated paging during continuous rendering. With the same configuration, private working set fell from `120.6 MiB` at startup to `10.1 MiB` at `3.4 s`, then remained at `10–12 MiB` while ANGLE/D3D11 GPU activity continued normally.
 - **Fix btop double-click selecting a process instead of opening details over Linux SSH.** SSH pointer presses are now at least 120 ms apart while remote output continues to be read, and Debug API double clicks are split into two complete press/release batches. Pacing is confined to SSH transport; local terminals, serial, and Telnet remain pass-through, with no Windows btop compatibility layer.
 - **Fix stale dense-terminal frames covering input and erase updates.** New text, backspace, cursor movement, and the transition from a full-screen TUI to a shell expose the authoritative text frame before asynchronous row images; an old image generation cannot cover newer sparse state. Restore, font/DPI, and resize transitions invalidate and rebuild old textures.
 
@@ -44,6 +47,7 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ### Build
 
+- **Fix nightly MSI jobs succeeding while retaining a stale release asset.** ANGLE installer files now live in the single WiX source instead of compiling `angle.wxs` twice. MSI creation, artifact upload, and Release attachment are required gates, so a missing or failed installer now fails the workflow.
 - **Update and pin the current build toolchain.** The repository and GitHub Actions now use Rust 1.97.0, all Slint components use 1.17.1, Windows Skia uses 0.99.0, and the lockfile contains the latest compatible dependency versions. The effective MSRV is now 1.92.
 - **Fix packaging for cloud builds from branches.** Workflow runs now replace `/` in branch names with `-` before creating Windows, Linux, or macOS artifact paths. Non-Windows version checks read the Cargo package version instead of treating the branch name as a version.
 

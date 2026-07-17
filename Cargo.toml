@@ -142,9 +142,6 @@ glutin-winit = { path = "vendor/glutin-winit" }
 # the last ComboBox/menu popup surface leaks into the Debug API screenshot.
 i-slint-renderer-femtovg = { path = "vendor/i-slint-renderer-femtovg" }
 
-[package.metadata.wix]
-include = ["wix/angle.wxs"]
-
 [profile.release]
 opt-level = 3
 lto = "thin"

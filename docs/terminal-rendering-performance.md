@@ -102,8 +102,11 @@ terminal scheduling interval. Checking only the backend name is insufficient:
 
 ### Idle memory reclamation
 
-Ten seconds after the last dense terminal becomes sparse or closes, the
-Windows memory worker:
+About two seconds after startup, the Windows memory worker performs one initial
+trim even if the user has already opened a dense terminal. This prevents
+renderer initialization pages from remaining resident for the lifetime of a
+quickly opened `btop` session. After that one-time pass, the worker waits until
+ten seconds after the last dense terminal becomes sparse or closes before it:
 
 - clears reusable terminal pixel buffers;
 - calls `IDXGIDevice3::Trim` for ANGLE's D3D11 device;
@@ -111,7 +114,8 @@ Windows memory worker:
 - trims the process working set when it is at least 24 MiB.
 
 This is intentionally idle-only. Trimming during a changing TUI would trade a
-smaller Task Manager number for page faults and visible stutter.
+smaller Task Manager number for page faults and visible stutter. The startup
+pass is the sole exception and cannot repeat during a changing TUI.
 
 ## Current measurements
 
@@ -138,6 +142,14 @@ then settled near 25 MiB because the test continued polling health and loading
 diagnostic code pages. GPU mode reserves more virtual/private commit in ANGLE
 and the display driver than software mode; that commit is not the same as
 resident private working set.
+
+A startup regression check on 2026-07-17 used the production ANGLE build with
+the existing 1854x1006 user configuration. Private working set was 120.6 MiB at
+1.8 seconds, fell to 10.1 MiB by 3.4 seconds, and remained between 10 and 12 MiB
+through 14.9 seconds. D3D11 GPU-engine activity continued after the trim. The
+private commit remained about 107 MiB because ANGLE and the display driver keep
+address space and pageable allocations reserved; Task Manager's Memory column
+reports the resident private working set, not that commit value.
 
 The screenshot endpoint was also exercised for 80 full-window PNG captures
 while btop kept redrawing. The first pass established the PNG worker and

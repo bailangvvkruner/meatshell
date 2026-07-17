@@ -50,6 +50,24 @@
                               Source="$(var.CargoTargetBinDir)\meatshell.exe"
                               KeyPath="yes"/>
                     </Component>
+                    <Component Id="AngleEglRuntime" Guid="*">
+                        <File Id="AngleEglDll"
+                              Name="libEGL.dll"
+                              Source="$(var.CargoTargetBinDir)\libEGL.dll"
+                              KeyPath="yes"/>
+                    </Component>
+                    <Component Id="AngleGlesRuntime" Guid="*">
+                        <File Id="AngleGlesDll"
+                              Name="libGLESv2.dll"
+                              Source="$(var.CargoTargetBinDir)\libGLESv2.dll"
+                              KeyPath="yes"/>
+                    </Component>
+                    <Component Id="AngleLicense" Guid="*">
+                        <File Id="AngleLicenseFile"
+                              Name="ANGLE_LICENSE.txt"
+                              Source="vendor\angle\windows-x86_64\LICENSE.txt"
+                              KeyPath="yes"/>
+                    </Component>
                     <Component Id="ThirdPartyNotices" Guid="*">
                         <File Id="thirdPartyNoticesFile"
                               Name="THIRD_PARTY_NOTICES.md"
@@ -79,6 +97,9 @@
 
         <Feature Id="MainProgram" Title="meatshell" Level="1">
             <ComponentRef Id="MainExecutable"/>
+            <ComponentRef Id="AngleEglRuntime"/>
+            <ComponentRef Id="AngleGlesRuntime"/>
+            <ComponentRef Id="AngleLicense"/>
             <ComponentRef Id="ThirdPartyNotices"/>
             <ComponentRef Id="ApplicationShortcut"/>
         </Feature>

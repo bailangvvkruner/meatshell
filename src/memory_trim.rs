@@ -23,12 +23,15 @@ mod platform {
     use windows::core::{IUnknown, Interface};
     use windows::Win32::Graphics::Dxgi::IDXGIDevice3;
 
+    const STARTUP_TRIM_DELAY: Duration = Duration::from_secs(2);
     const IDLE_TRIM_DELAY: Duration = Duration::from_secs(10);
     const MIN_WORKING_SET_BYTES: u64 = 24 * 1024 * 1024;
 
     #[derive(Debug)]
     struct IdleTrimState {
         dense_tabs: HashSet<String>,
+        started_at: Instant,
+        startup_trim_pending: bool,
         last_activity: Instant,
         trim_requested: bool,
         trim_count: u64,
@@ -41,6 +44,8 @@ mod platform {
         fn new(now: Instant) -> Self {
             Self {
                 dense_tabs: HashSet::new(),
+                started_at: now,
+                startup_trim_pending: true,
                 last_activity: now,
                 trim_requested: true,
                 trim_count: 0,
@@ -72,7 +77,21 @@ mod platform {
         }
 
         fn wait_before_trim(&self, now: Instant) -> Option<Duration> {
-            if !self.trim_requested || !self.dense_tabs.is_empty() {
+            if !self.trim_requested {
+                return None;
+            }
+            // Reclaim renderer initialization pages promptly even when the user
+            // opens a dense TUI before the normal idle timer can fire. This is a
+            // one-time startup trim; later trims still wait for every dense tab
+            // to become sparse so btop does not incur recurring page faults.
+            if self.startup_trim_pending {
+                return Some(
+                    STARTUP_TRIM_DELAY
+                        .checked_sub(now.saturating_duration_since(self.started_at))
+                        .unwrap_or_default(),
+                );
+            }
+            if !self.dense_tabs.is_empty() {
                 return None;
             }
             Some(
@@ -80,6 +99,11 @@ mod platform {
                     .checked_sub(now.saturating_duration_since(self.last_activity))
                     .unwrap_or_default(),
             )
+        }
+
+        fn claim_trim(&mut self) {
+            self.trim_requested = false;
+            self.startup_trim_pending = false;
         }
     }
 
@@ -264,7 +288,7 @@ mod platform {
                         state = next;
                     }
                     Some(_) => {
-                        state.trim_requested = false;
+                        state.claim_trim();
                         break;
                     }
                 }
@@ -408,6 +432,7 @@ mod platform {
         fn dense_terminal_blocks_trim_until_it_becomes_sparse() {
             let start = Instant::now();
             let mut state = IdleTrimState::new(start);
+            state.claim_trim();
             state.observe("a", true, start + Duration::from_secs(1));
             assert_eq!(
                 state.wait_before_trim(start + Duration::from_secs(30)),
@@ -429,6 +454,7 @@ mod platform {
         fn another_dense_tab_keeps_process_trim_deferred() {
             let start = Instant::now();
             let mut state = IdleTrimState::new(start);
+            state.claim_trim();
             state.observe("a", true, start);
             state.observe("b", true, start);
             state.forget("a", start + Duration::from_secs(1));
@@ -447,10 +473,7 @@ mod platform {
         fn explicit_request_restarts_the_idle_delay() {
             let start = Instant::now();
             let mut state = IdleTrimState::new(start);
-            assert_eq!(
-                state.wait_before_trim(start + Duration::from_secs(10)),
-                Some(Duration::ZERO)
-            );
+            state.claim_trim();
 
             state.request(start + Duration::from_secs(20));
             assert_eq!(
@@ -460,6 +483,29 @@ mod platform {
             assert_eq!(
                 state.wait_before_trim(start + Duration::from_secs(30)),
                 Some(Duration::ZERO)
+            );
+        }
+
+        #[test]
+        fn one_time_startup_trim_is_not_blocked_by_dense_terminal() {
+            let start = Instant::now();
+            let mut state = IdleTrimState::new(start);
+            state.observe("a", true, start + Duration::from_secs(1));
+
+            assert_eq!(
+                state.wait_before_trim(start + Duration::from_secs(1)),
+                Some(Duration::from_secs(1))
+            );
+            assert_eq!(
+                state.wait_before_trim(start + STARTUP_TRIM_DELAY),
+                Some(Duration::ZERO)
+            );
+
+            state.claim_trim();
+            state.observe("a", true, start + Duration::from_secs(3));
+            assert_eq!(
+                state.wait_before_trim(start + Duration::from_secs(30)),
+                None
             );
         }
     }
