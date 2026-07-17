@@ -144,6 +144,9 @@ component IconBtn inherits Rectangle {
     height: 26px;
     border-radius: Theme.radius-sm;
     background: ta.has-hover || root.active ? Theme.bg-hover : transparent;
+    accessible-role: button;
+    accessible-label: root.tooltip;
+    accessible-action-default => { root.clicked(); }
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
@@ -2165,6 +2168,12 @@ export component AppWindow inherits Window {
                 height: 28px;
                 border-radius: Theme.radius-sm;
                 background: iface-ta.has-hover ? Theme.bg-hover : transparent;
+                accessible-role: button;
+                accessible-label: root.lang-en ? "Interface" : "界面";
+                accessible-action-default => {
+                    root.settings-open = false;
+                    root.interface-open = true;
+                }
                 iface-ta := TouchArea {
                     mouse-cursor: pointer;
                     clicked => {

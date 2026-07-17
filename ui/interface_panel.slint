@@ -391,10 +391,10 @@ export component InterfacePanel inherits Rectangle {
                 SettingRow {
                     label: root.lang-en ? "Hardware acceleration" : "硬件加速";
                     desc: root.hardware-acceleration-available
-                        ? (root.lang-en ? "Switches the renderer immediately by restarting the application."
-                                        : "切换后将自动重启应用并立即更换渲染后端。")
-                        : (root.lang-en ? "GPU rendering requires the Windows MSVC build."
-                                        : "GPU 渲染需要 Windows MSVC 版本，当前构建不可用。");
+                        ? (root.lang-en ? "Uses the bundled D3D11 GPU renderer; changing it restarts the application immediately."
+                                        : "使用内置 D3D11 GPU 渲染器；切换后应用会立即重启并生效。")
+                        : (root.lang-en ? "GPU rendering is available in Windows x64 builds."
+                                        : "GPU 渲染仅在 Windows x64 版本中可用。");
                     Switch {
                         on: root.hardware-acceleration-enabled;
                         enabled: root.hardware-acceleration-available;

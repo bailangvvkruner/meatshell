@@ -32,6 +32,9 @@ component SessionRow inherits Rectangle {
     border-radius: Theme.radius-sm;
     background: touch.has-hover ? Theme.bg-hover : transparent;
     animate background { duration: 120ms; }
+    accessible-role: button;
+    accessible-label: root.session.name + " " + root.session.host;
+    accessible-action-default => { root.connect(); }
 
     // Remember where the right-click landed so the popup can appear there.
     property <length> ctx-x;

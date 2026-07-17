@@ -7,7 +7,7 @@ name: Release
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "codex/angle-production"]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -95,6 +95,11 @@ jobs:
 
       - name: Build (release)
         run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Verify bundled ANGLE runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/verify-angle.ps1
 
       - name: Verify binary version
         if: runner.os != 'Windows'
@@ -190,6 +195,8 @@ jobs:
           elif [ "${{ runner.os }}" = "Windows" ]; then
             mkdir "$STAGE"
             cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
+            cp vendor/angle/windows-x86_64/libEGL.dll vendor/angle/windows-x86_64/libGLESv2.dll "$STAGE/"
+            cp vendor/angle/windows-x86_64/LICENSE.txt "$STAGE/ANGLE_LICENSE.txt"
             cp README.md README.en.md CHANGELOG.md THIRD_PARTY_NOTICES.md "$STAGE/" 2>/dev/null || true
             7z a "${STAGE}.zip" "$STAGE" >/dev/null
             echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"

@@ -3,19 +3,24 @@
 use cosmic_text::{
     Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight, Wrap,
 };
+use slint::{Rgba8Pixel, SharedPixelBuffer};
 use std::borrow::Cow;
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use unicode_width::UnicodeWidthChar;
 
 const MAX_ROW_WIDTH: u32 = 32_768;
 const MAX_ROW_HEIGHT: u32 = 256;
 const MAX_ROW_BYTES: usize = 32 * 1024 * 1024;
-const MAX_GLYPH_CACHE_ENTRIES: usize = 4_096;
+const MAX_GLYPH_CACHE_ENTRIES: usize = 2_048;
+const MAX_PIXEL_POOL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PIXEL_POOL_BUFFERS: usize = 256;
 const DEFAULT_SHAPE_CACHE_AGES: u64 = 8;
 const MAX_SHAPE_CACHE_AGES: u64 = 256;
+const EMBEDDED_TERMINAL_FAMILY: &str = "Meatshell Mono";
 
 fn shape_cache_ages() -> u64 {
     static AGES: OnceLock<u64> = OnceLock::new();
@@ -26,6 +31,69 @@ fn shape_cache_ages() -> u64 {
             .unwrap_or(DEFAULT_SHAPE_CACHE_AGES)
             .min(MAX_SHAPE_CACHE_AGES)
     })
+}
+
+#[derive(Default)]
+struct RasterPixelPool {
+    buffers: Vec<SharedPixelBuffer<Rgba8Pixel>>,
+    bytes: usize,
+}
+
+impl RasterPixelPool {
+    fn take(&mut self, width: u32, height: u32) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
+        let index = self
+            .buffers
+            .iter()
+            .rposition(|buffer| buffer.width() == width && buffer.height() == height)?;
+        let buffer = self.buffers.swap_remove(index);
+        self.bytes = self.bytes.saturating_sub(buffer.as_bytes().len());
+        Some(buffer)
+    }
+
+    fn recycle(&mut self, buffer: SharedPixelBuffer<Rgba8Pixel>) {
+        let bytes = buffer.as_bytes().len();
+        if bytes == 0 || bytes > MAX_PIXEL_POOL_BYTES {
+            return;
+        }
+        while self.bytes.saturating_add(bytes) > MAX_PIXEL_POOL_BYTES
+            || self.buffers.len() >= MAX_PIXEL_POOL_BUFFERS
+        {
+            let Some(discarded) = self.buffers.pop() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(discarded.as_bytes().len());
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.buffers.push(buffer);
+    }
+}
+
+fn pixel_pool() -> &'static Mutex<RasterPixelPool> {
+    static POOL: OnceLock<Mutex<RasterPixelPool>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(RasterPixelPool::default()))
+}
+
+fn take_pixel_buffer(width: u32, height: u32) -> SharedPixelBuffer<Rgba8Pixel> {
+    pixel_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take(width, height)
+        .unwrap_or_else(|| SharedPixelBuffer::new(width, height))
+}
+
+pub(crate) fn recycle_pixel_buffer(buffer: SharedPixelBuffer<Rgba8Pixel>) {
+    pixel_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .recycle(buffer);
+}
+
+pub(crate) fn clear_pixel_pool() {
+    let mut pool = pixel_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pool.buffers.clear();
+    pool.bytes = 0;
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -159,7 +227,7 @@ pub struct RasterRowPixels {
     pub width: u32,
     pub height: u32,
     /// Premultiplied RGBA8 pixels.
-    pub pixels: Vec<u8>,
+    pub pixels: SharedPixelBuffer<Rgba8Pixel>,
 }
 
 #[derive(Debug)]
@@ -364,22 +432,17 @@ fn worker_loop(queue: Arc<SharedQueue>) {
 
 struct WorkerState {
     font_system: FontSystem,
+    font_set: FontSetKey,
     glyph_cache: SwashCache,
     row_cache: HashMap<String, Vec<u64>>,
 }
 
 impl WorkerState {
     fn new() -> Self {
-        let fonts = [
-            fontdb::Source::Binary(Arc::new(
-                include_bytes!("../ui/fonts/MeatshellMono-Regular.ttf").to_vec(),
-            )),
-            fontdb::Source::Binary(Arc::new(
-                include_bytes!("../ui/fonts/MeatshellMono-Bold.ttf").to_vec(),
-            )),
-        ];
+        let font_set = FontSetKey::default();
         Self {
-            font_system: FontSystem::new_with_fonts(fonts),
+            font_system: build_font_system(&font_set),
+            font_set,
             glyph_cache: SwashCache::new(),
             row_cache: HashMap::new(),
         }
@@ -387,6 +450,13 @@ impl WorkerState {
 
     fn render(&mut self, job: RasterJob) -> RasterCompletion {
         let (width, height) = job.config.pixel_size()?;
+        let needs_cjk = job.rows.iter().flatten().any(|span| span.cjk);
+        let next_font_set = next_font_set(&self.font_set, &job.config, needs_cjk);
+        if self.font_set != next_font_set {
+            self.font_system = build_font_system(&next_font_set);
+            self.font_set = next_font_set;
+            self.glyph_cache = SwashCache::new();
+        }
         let has_content = job.rows.iter().flatten().any(|span| {
             span.background[3] != 0
                 || (span.foreground[3] != 0 && span.text.chars().any(|ch| !ch.is_whitespace()))
@@ -438,6 +508,136 @@ impl WorkerState {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FontSetKey {
+    terminal_family: String,
+    cjk_family: Option<String>,
+}
+
+impl Default for FontSetKey {
+    fn default() -> Self {
+        Self {
+            terminal_family: EMBEDDED_TERMINAL_FAMILY.to_string(),
+            cjk_family: None,
+        }
+    }
+}
+
+fn normalize_font_family(family: &str) -> String {
+    let family = family.trim();
+    if family.is_empty() {
+        EMBEDDED_TERMINAL_FAMILY.to_string()
+    } else {
+        family.to_string()
+    }
+}
+
+fn next_font_set(current: &FontSetKey, config: &RasterConfig, needs_cjk: bool) -> FontSetKey {
+    let terminal_family = normalize_font_family(&config.terminal_family);
+    let configured_cjk = normalize_font_family(&config.cjk_family);
+    let cjk_is_separate = configured_cjk != EMBEDDED_TERMINAL_FAMILY
+        && !configured_cjk.eq_ignore_ascii_case(&terminal_family);
+    let cjk_family = if needs_cjk && cjk_is_separate {
+        Some(configured_cjk.clone())
+    } else if current
+        .terminal_family
+        .eq_ignore_ascii_case(&terminal_family)
+        && current
+            .cjk_family
+            .as_deref()
+            .is_some_and(|loaded| loaded.eq_ignore_ascii_case(&configured_cjk))
+    {
+        current.cjk_family.clone()
+    } else {
+        None
+    };
+    FontSetKey {
+        terminal_family,
+        cjk_family,
+    }
+}
+
+fn embedded_terminal_sources() -> [fontdb::Source; 2] {
+    let regular: &'static [u8] = include_bytes!("../ui/fonts/MeatshellMono-Regular.ttf");
+    let bold: &'static [u8] = include_bytes!("../ui/fonts/MeatshellMono-Bold.ttf");
+    [
+        fontdb::Source::Binary(Arc::new(regular)),
+        fontdb::Source::Binary(Arc::new(bold)),
+    ]
+}
+
+fn build_font_system(font_set: &FontSetKey) -> FontSystem {
+    let mut db = fontdb::Database::new();
+    for source in embedded_terminal_sources() {
+        db.load_font_source(source);
+    }
+
+    let mut requested = Vec::new();
+    if font_set.terminal_family != EMBEDDED_TERMINAL_FAMILY {
+        requested.push(font_set.terminal_family.as_str());
+    }
+    if let Some(cjk_family) = font_set.cjk_family.as_deref() {
+        if !requested
+            .iter()
+            .any(|family| family.eq_ignore_ascii_case(cjk_family))
+        {
+            requested.push(cjk_family);
+        }
+    }
+    let loaded_sources = load_system_font_sources(&mut db, &requested);
+
+    db.set_monospace_family(font_set.terminal_family.clone());
+    db.set_sans_serif_family(
+        font_set
+            .cjk_family
+            .clone()
+            .unwrap_or_else(|| EMBEDDED_TERMINAL_FAMILY.to_string()),
+    );
+    tracing::debug!(
+        terminal_family = %font_set.terminal_family,
+        cjk_family = ?font_set.cjk_family,
+        loaded_sources,
+        faces = db.faces().count(),
+        "terminal raster font set loaded"
+    );
+    FontSystem::new_with_locale_and_db("en-US".to_string(), db)
+}
+
+fn load_system_font_sources(db: &mut fontdb::Database, requested: &[&str]) -> usize {
+    if requested.is_empty() {
+        return 0;
+    }
+
+    // fontdb's default Cosmic Text constructor retains metadata for every
+    // installed font. Scan that catalog only long enough to identify the files
+    // backing the explicitly requested families, then keep those files alone.
+    let mut system_db = fontdb::Database::new();
+    system_db.load_system_fonts();
+    let mut paths = HashSet::<PathBuf>::new();
+    for face in system_db.faces() {
+        let matches_family = face.families.iter().any(|(family, _)| {
+            requested
+                .iter()
+                .any(|requested| family.eq_ignore_ascii_case(requested))
+        });
+        if !matches_family {
+            continue;
+        }
+        match &face.source {
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                paths.insert(path.clone());
+            }
+            fontdb::Source::Binary(_) => {}
+        }
+    }
+
+    let count = paths.len();
+    for path in paths {
+        db.load_font_source(fontdb::Source::File(path));
+    }
+    count
+}
+
 struct TextPiece<'a> {
     text: Cow<'a, str>,
     span: Option<&'a RasterSpan>,
@@ -452,10 +652,12 @@ fn render_row(
     row: &[RasterSpan],
     width: u32,
     height: u32,
-) -> Result<Vec<u8>, String> {
-    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+) -> Result<SharedPixelBuffer<Rgba8Pixel>, String> {
+    let mut pixel_buffer = take_pixel_buffer(width, height);
+    let pixels = pixel_buffer.make_mut_bytes();
+    pixels.fill(0);
     for span in row {
-        fill_background(&mut pixels, width, height, config, span);
+        fill_background(pixels, width, height, config, span);
     }
 
     let mut pieces = Vec::with_capacity(row.len() * 2 + 1);
@@ -590,7 +792,7 @@ fn render_row(
             );
         }
     }
-    Ok(pixels)
+    Ok(pixel_buffer)
 }
 
 /// Map every UTF-8 byte boundary in the shaped row to an authoritative vt100
@@ -696,6 +898,44 @@ mod tests {
     }
 
     #[test]
+    fn default_raster_font_set_contains_only_embedded_faces() {
+        let font_system = build_font_system(&FontSetKey::default());
+        let faces: Vec<_> = font_system.db().faces().collect();
+        assert_eq!(faces.len(), 2);
+        assert!(faces.iter().all(|face| face
+            .families
+            .iter()
+            .any(|(family, _)| family == EMBEDDED_TERMINAL_FAMILY)));
+    }
+
+    #[test]
+    fn cjk_font_loading_is_lazy_and_stays_warm() {
+        let mut cfg = config();
+        cfg.cjk_family = "Microsoft YaHei UI".to_string();
+        let initial = FontSetKey::default();
+        let ascii = next_font_set(&initial, &cfg, false);
+        assert_eq!(ascii.cjk_family, None);
+
+        let cjk = next_font_set(&ascii, &cfg, true);
+        assert_eq!(cjk.cjk_family.as_deref(), Some("Microsoft YaHei UI"));
+        assert_eq!(next_font_set(&cjk, &cfg, false), cjk);
+    }
+
+    #[test]
+    fn pixel_pool_reuses_matching_buffers() {
+        let mut pool = RasterPixelPool::default();
+        let buffer = SharedPixelBuffer::<Rgba8Pixel>::new(4, 2);
+        let original = buffer.as_bytes().as_ptr();
+        pool.recycle(buffer);
+        assert_eq!(pool.bytes, 4 * 2 * 4);
+
+        let reused = pool.take(4, 2).unwrap();
+        assert_eq!(reused.as_bytes().as_ptr(), original);
+        assert_eq!(pool.bytes, 0);
+        assert!(pool.take(8, 1).is_none());
+    }
+
+    #[test]
     fn premultiplied_blending_preserves_alpha_and_color() {
         let mut pixel = [0, 0, 0, 0];
         blend_premultiplied(&mut pixel, [200, 100, 50, 128]);
@@ -718,10 +958,11 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(first.updates.len(), 2);
-        assert!(first
-            .updates
+        assert!(first.updates.iter().all(|update| update
+            .pixels
+            .as_bytes()
             .iter()
-            .all(|update| update.pixels.iter().any(|v| *v != 0)));
+            .any(|v| *v != 0)));
 
         let unchanged = worker
             .render(RasterJob::new(
@@ -769,7 +1010,11 @@ mod tests {
             .unwrap();
         assert_eq!(erased.updates.len(), 1);
         assert_eq!(erased.updates[0].row, 0);
-        assert!(erased.updates[0].pixels.iter().all(|value| *value == 0));
+        assert!(erased.updates[0]
+            .pixels
+            .as_bytes()
+            .iter()
+            .all(|value| *value == 0));
     }
 
     #[test]
@@ -880,11 +1125,15 @@ mod tests {
 
     #[test]
     fn completed_delta_merge_prefers_newer_rows_and_drops_truncated_rows() {
-        let update = |row, value| RasterRowPixels {
-            row,
-            width: 1,
-            height: 1,
-            pixels: vec![value; 4],
+        let update = |row, value| {
+            let mut pixels = SharedPixelBuffer::<Rgba8Pixel>::new(1, 1);
+            pixels.make_mut_bytes().fill(value);
+            RasterRowPixels {
+                row,
+                width: 1,
+                height: 1,
+                pixels,
+            }
         };
         let mut pending = RasterResult {
             tab_id: "tab".to_string(),
@@ -924,9 +1173,9 @@ mod tests {
         assert!(!pending.has_content);
         assert_eq!(pending.updates.len(), 2);
         assert_eq!(pending.updates[0].row, 0);
-        assert_eq!(pending.updates[0].pixels, vec![10; 4]);
+        assert_eq!(pending.updates[0].pixels.as_bytes(), &[10; 4]);
         assert_eq!(pending.updates[1].row, 1);
-        assert_eq!(pending.updates[1].pixels, vec![99; 4]);
+        assert_eq!(pending.updates[1].pixels.as_bytes(), &[99; 4]);
     }
 
     #[test]

@@ -105,9 +105,7 @@ pub(crate) struct DebugPointerEvent {
 /// A renderer snapshot copied into an owned RGBA buffer before it leaves the
 /// Slint event loop. PNG encoding and optional downscaling happen off-thread.
 pub(crate) struct ScreenshotFrame {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) rgba: Vec<u8>,
+    pub(crate) pixels: slint::SharedPixelBuffer<slint::Rgba8Pixel>,
 }
 
 #[derive(Clone)]
@@ -466,13 +464,215 @@ fn mark_sensitive(response: &mut Response) {
 struct HealthResponse {
     status: &'static str,
     version: &'static str,
+    build_profile: &'static str,
+    executable_bytes: Option<u64>,
+    renderer: &'static str,
+    hardware_accelerated: bool,
+    angle_runtime_loaded: bool,
+    terminal_render_interval_ms: u64,
+    memory: ProcessMemory,
+    memory_trim: crate::memory_trim::MemoryTrimDiagnostics,
+}
+
+#[derive(Default, Serialize)]
+struct ProcessMemory {
+    working_set_bytes: Option<u64>,
+    peak_working_set_bytes: Option<u64>,
+    private_working_set_bytes: Option<u64>,
+    private_commit_bytes: Option<u64>,
 }
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
+        build_profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        executable_bytes: std::env::current_exe()
+            .ok()
+            .and_then(|path| path.metadata().ok())
+            .map(|metadata| metadata.len()),
+        renderer: crate::app::active_renderer_name(),
+        hardware_accelerated: crate::app::active_renderer_uses_gpu(),
+        angle_runtime_loaded: angle_runtime_loaded(),
+        terminal_render_interval_ms: crate::app::active_terminal_render_interval_ms(),
+        memory: process_memory(),
+        memory_trim: crate::memory_trim::diagnostics(),
     })
+}
+
+#[cfg(windows)]
+fn process_memory() -> ProcessMemory {
+    #[repr(C)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+
+    #[repr(C)]
+    struct ProcessMemoryCountersEx2 {
+        counters: ProcessMemoryCountersEx,
+        private_working_set_size: usize,
+        shared_commit_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+    }
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(process: isize, counters: *mut u8, size: u32) -> i32;
+    }
+
+    let mut counters: ProcessMemoryCountersEx2 = unsafe { std::mem::zeroed() };
+    counters.counters.cb = std::mem::size_of::<ProcessMemoryCountersEx2>() as u32;
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut counters as *mut ProcessMemoryCountersEx2).cast(),
+            counters.counters.cb,
+        )
+    };
+    if ok == 0 {
+        return ProcessMemory::default();
+    }
+
+    let private_working_set = if counters.private_working_set_size > 0 {
+        Some(counters.private_working_set_size as u64)
+    } else {
+        query_private_working_set(
+            unsafe { GetCurrentProcess() },
+            counters.counters.working_set_size,
+        )
+    };
+    ProcessMemory {
+        working_set_bytes: Some(counters.counters.working_set_size as u64),
+        peak_working_set_bytes: Some(counters.counters.peak_working_set_size as u64),
+        private_working_set_bytes: private_working_set,
+        private_commit_bytes: Some(counters.counters.private_usage as u64),
+    }
+}
+
+#[cfg(windows)]
+fn query_private_working_set(process: isize, working_set_size: usize) -> Option<u64> {
+    #[repr(C)]
+    struct SystemInfo {
+        processor_architecture: u16,
+        reserved: u16,
+        page_size: u32,
+        minimum_application_address: *mut std::ffi::c_void,
+        maximum_application_address: *mut std::ffi::c_void,
+        active_processor_mask: usize,
+        number_of_processors: u32,
+        processor_type: u32,
+        allocation_granularity: u32,
+        processor_level: u16,
+        processor_revision: u16,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemInfo(system_info: *mut SystemInfo);
+    }
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn QueryWorkingSet(process: isize, buffer: *mut u8, size: u32) -> i32;
+    }
+
+    let mut system_info: SystemInfo = unsafe { std::mem::zeroed() };
+    unsafe { GetSystemInfo(&mut system_info) };
+    let page_size = usize::try_from(system_info.page_size).ok()?.max(1);
+    let estimated_pages = working_set_size
+        .checked_div(page_size)?
+        .saturating_add(1024);
+    let mut buffer = vec![0usize; estimated_pages.saturating_add(1)];
+
+    for _ in 0..3 {
+        let byte_len = buffer.len().checked_mul(std::mem::size_of::<usize>())?;
+        let byte_len = u32::try_from(byte_len).ok()?;
+        if unsafe { QueryWorkingSet(process, buffer.as_mut_ptr().cast(), byte_len) } != 0 {
+            let page_count = buffer[0].min(buffer.len().saturating_sub(1));
+            // PSAPI_WORKING_SET_BLOCK stores Shared in bit 8 on both 32- and
+            // 64-bit Windows. A clear bit means the resident page is private.
+            let private_pages = buffer[1..]
+                .iter()
+                .take(page_count)
+                .filter(|block| **block & (1usize << 8) == 0)
+                .count();
+            return u64::try_from(private_pages)
+                .ok()?
+                .checked_mul(u64::try_from(page_size).ok()?);
+        }
+        buffer.resize(buffer.len().checked_mul(2)?, 0);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory() -> ProcessMemory {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return ProcessMemory::default();
+    };
+    let value = |name: &str| {
+        status.lines().find_map(|line| {
+            let value = line.strip_prefix(name)?.trim();
+            let kib = value.strip_suffix(" kB")?.trim().parse::<u64>().ok()?;
+            kib.checked_mul(1024)
+        })
+    };
+    ProcessMemory {
+        working_set_bytes: value("VmRSS:"),
+        peak_working_set_bytes: value("VmHWM:"),
+        private_working_set_bytes: value("RssAnon:"),
+        private_commit_bytes: None,
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn process_memory() -> ProcessMemory {
+    ProcessMemory::default()
+}
+
+#[cfg(windows)]
+fn angle_runtime_loaded() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(module_name: *const u16) -> isize;
+    }
+
+    const LIB_EGL_DLL: [u16; 11] = [
+        b'l' as u16,
+        b'i' as u16,
+        b'b' as u16,
+        b'E' as u16,
+        b'G' as u16,
+        b'L' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        0,
+    ];
+
+    unsafe { GetModuleHandleW(LIB_EGL_DLL.as_ptr()) != 0 }
+}
+
+#[cfg(not(windows))]
+fn angle_runtime_loaded() -> bool {
+    false
 }
 
 #[derive(Serialize)]
@@ -616,38 +816,46 @@ async fn screenshot(
 }
 
 fn encode_screenshot(frame: ScreenshotFrame, max_width: u32, max_height: u32) -> Result<Vec<u8>> {
-    let expected_len = u64::from(frame.width)
-        .checked_mul(u64::from(frame.height))
+    let width = frame.pixels.width();
+    let height = frame.pixels.height();
+    let expected_len = u64::from(width)
+        .checked_mul(u64::from(height))
         .and_then(|pixels| pixels.checked_mul(4))
         .context("screenshot dimensions overflow")?;
-    if frame.width == 0
-        || frame.height == 0
-        || expected_len != u64::try_from(frame.rgba.len()).unwrap_or(u64::MAX)
+    if width == 0
+        || height == 0
+        || expected_len != u64::try_from(frame.pixels.as_bytes().len()).unwrap_or(u64::MAX)
     {
         bail!("invalid RGBA screenshot buffer");
     }
 
     let pixel_scale =
-        (MAX_SCREENSHOT_PIXELS as f64 / (f64::from(frame.width) * f64::from(frame.height))).sqrt();
+        (MAX_SCREENSHOT_PIXELS as f64 / (f64::from(width) * f64::from(height))).sqrt();
     let scale = 1.0_f64
-        .min(f64::from(max_width) / f64::from(frame.width))
-        .min(f64::from(max_height) / f64::from(frame.height))
+        .min(f64::from(max_width) / f64::from(width))
+        .min(f64::from(max_height) / f64::from(height))
         .min(pixel_scale);
-    let output_width = (f64::from(frame.width) * scale).floor().max(1.0) as u32;
-    let output_height = (f64::from(frame.height) * scale).floor().max(1.0) as u32;
+    let output_width = (f64::from(width) * scale).floor().max(1.0) as u32;
+    let output_height = (f64::from(height) * scale).floor().max(1.0) as u32;
 
-    let pixels = if output_width == frame.width && output_height == frame.height {
-        frame.rgba
+    let pixels = if output_width == width && output_height == height {
+        std::borrow::Cow::Borrowed(frame.pixels.as_bytes())
     } else {
-        let source = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
-            .context("invalid RGBA screenshot buffer")?;
-        image::imageops::resize(
-            &source,
-            output_width,
-            output_height,
-            image::imageops::FilterType::Triangle,
+        let source = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(
+            width,
+            height,
+            frame.pixels.as_bytes(),
         )
-        .into_raw()
+        .context("invalid RGBA screenshot buffer")?;
+        std::borrow::Cow::Owned(
+            image::imageops::resize(
+                &source,
+                output_width,
+                output_height,
+                image::imageops::FilterType::Triangle,
+            )
+            .into_raw(),
+        )
     };
 
     let mut png = Vec::new();
@@ -1035,6 +1243,12 @@ mod tests {
         String::from_utf8(request_bytes(address, request)).unwrap()
     }
 
+    fn screenshot_frame(width: u32, height: u32, rgba: &[u8]) -> ScreenshotFrame {
+        let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        pixels.make_mut_bytes().copy_from_slice(rgba);
+        ScreenshotFrame { pixels }
+    }
+
     #[test]
     fn generated_token_is_256_bit_url_safe_value() {
         let first = generate_token();
@@ -1043,6 +1257,21 @@ mod tests {
         assert!(!first.contains('='));
         assert_ne!(first, second);
         assert!(validate_token(&first).is_ok());
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn process_memory_reports_the_current_working_set() {
+        let memory = process_memory();
+        assert!(memory.working_set_bytes.is_some_and(|bytes| bytes > 0));
+        assert!(memory
+            .peak_working_set_bytes
+            .zip(memory.working_set_bytes)
+            .is_some_and(|(peak, current)| peak >= current));
+        #[cfg(windows)]
+        assert!(memory
+            .private_working_set_bytes
+            .is_some_and(|bytes| bytes > 0));
     }
 
     #[test]
@@ -1056,11 +1285,7 @@ mod tests {
 
     #[test]
     fn screenshot_encoder_preserves_aspect_ratio_and_caps_dimensions() {
-        let frame = ScreenshotFrame {
-            width: 4,
-            height: 2,
-            rgba: vec![255; 4 * 2 * 4],
-        };
+        let frame = screenshot_frame(4, 2, &[255; 4 * 2 * 4]);
         let png = encode_screenshot(frame, 2, 2).unwrap();
         let decoded = image::load_from_memory(&png).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (2, 1));
@@ -1102,11 +1327,11 @@ mod tests {
         });
         state.set_screenshot_requester(|reply| {
             reply
-                .send(Ok(ScreenshotFrame {
-                    width: 2,
-                    height: 1,
-                    rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
-                }))
+                .send(Ok(screenshot_frame(
+                    2,
+                    1,
+                    &[255, 0, 0, 255, 0, 255, 0, 255],
+                )))
                 .map_err(|_| "screenshot receiver closed".to_string())
         });
         state.upsert_terminal(TerminalMetadata::new(
@@ -1151,6 +1376,9 @@ mod tests {
         );
         assert!(health.starts_with("HTTP/1.1 200"));
         assert!(health.contains("\"status\":\"ok\""));
+        assert!(health.contains("\"build_profile\":"));
+        assert!(health.contains("\"executable_bytes\":"));
+        assert!(health.contains("\"memory\":{"));
 
         let screen = request(
             address,

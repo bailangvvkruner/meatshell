@@ -17,6 +17,7 @@ mod forward;
 mod i18n;
 mod known_hosts;
 mod local;
+mod memory_trim;
 mod panes;
 mod proxy;
 mod serial;
@@ -52,6 +53,7 @@ fn main() -> anyhow::Result<()> {
     // that override is available without a rebuild.
 
     init_tracing();
+    harden_dll_search_path();
 
     // ── IME policy ───────────────────────────────────────────────────────────
     // NOTE: We deliberately DO **NOT** call `ImmDisableIME` here.
@@ -70,6 +72,24 @@ fn main() -> anyhow::Result<()> {
 
     app::run()
 }
+
+#[cfg(windows)]
+fn harden_dll_search_path() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetDefaultDllDirectories(directory_flags: u32) -> i32;
+    }
+
+    // Application directory + System32 + explicitly registered user dirs.
+    // In particular, do not load a forged libEGL.dll from the working directory.
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
+        tracing::warn!("failed to restrict the Windows DLL search path");
+    }
+}
+
+#[cfg(not(windows))]
+fn harden_dll_search_path() {}
 
 /// Set up tracing: stderr (honours RUST_LOG, default info) **plus** a capped
 /// `error.log` file at WARN and above so users can send diagnostics — e.g. a

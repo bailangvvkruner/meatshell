@@ -108,17 +108,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Feature is additive over the base `arboard = "3"` dependency above.
 arboard = { version = "3", features = ["wayland-data-control"] }
 
-[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
-# Keep the software renderer available, but also compile Skia so
-# MSVC releases can use its native Direct3D 12 surface. GNU/MinGW builds keep
-# the software backend because rust-skia does not publish binaries for them.
-i-slint-backend-winit = { version = "1.17.1", features = ["renderer-skia"] }
-i-slint-core = "1.17.1"
+[target.'cfg(windows)'.dependencies]
+# Query ANGLE's D3D11 device for IDXGIDevice3::Trim when the terminal has been
+# idle. This releases driver scratch buffers without changing the Slint scene,
+# themes, wallpaper, or rendering state.
+windows = { version = "0.62.2", default-features = false, features = ["Win32_Graphics_Dxgi"] }
 
 # Also compile the Skia renderer on macOS (the feature is additive over the base
 # Slint dependency) so users can opt into it with SLINT_BACKEND=winit-skia.
-# Windows MSVC is configured above for Direct3D; GNU/MinGW and Linux keep the
-# lighter non-Skia backend.
+# Windows uses the lighter FemtoVG/ANGLE path; Linux keeps its default backend.
 [target.'cfg(target_os = "macos")'.dependencies]
 slint = { version = "1.17.1", features = ["renderer-skia"] }
 
@@ -129,6 +127,18 @@ slint-build = "1.17.1"
 # show the app icon. Windows-only; ignored on other targets.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+[patch.crates-io]
+# Slint currently asks glutin-winit to prefer native WGL. This tiny vendored
+# patch tries the bundled ANGLE EGL/D3D11 runtime first and still falls back to
+# WGL when the DLLs are absent or cannot initialize.
+glutin-winit = { path = "vendor/glutin-winit" }
+# OpenGL snapshots must redraw the requested window before readback; otherwise
+# the last ComboBox/menu popup surface leaks into the Debug API screenshot.
+i-slint-renderer-femtovg = { path = "vendor/i-slint-renderer-femtovg" }
+
+[package.metadata.wix]
+include = ["wix/angle.wxs"]
 
 [profile.release]
 opt-level = 3

@@ -1,4 +1,6 @@
 fn main() {
+    copy_angle_runtime();
+
     // Bundle the gettext `.po` translations under `lang/` so the UI's `@tr(...)`
     // strings can switch language at runtime via slint::select_bundled_translation.
     // Source language is Chinese (the msgids); `lang/<lc>/LC_MESSAGES/meatshell.po`
@@ -47,6 +49,39 @@ fn main() {
         if let Err(e) = res.compile() {
             println!("cargo:warning=failed to embed Windows resources: {e}");
         }
+    }
+}
+
+fn copy_angle_runtime() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
+        || std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
+    {
+        return;
+    }
+
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    );
+    let runtime_dir = manifest_dir.join("vendor/angle/windows-x86_64");
+    let out_dir =
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    let binary_dir = out_dir
+        .ancestors()
+        .nth(3)
+        .expect("OUT_DIR uses Cargo's target/<profile>/build/<package>/out layout");
+
+    for name in ["libEGL.dll", "libGLESv2.dll"] {
+        let source = runtime_dir.join(name);
+        let destination = binary_dir.join(name);
+        println!("cargo:rerun-if-changed={}", source.display());
+
+        let source_bytes = std::fs::read(&source)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", source.display()));
+        if std::fs::read(&destination).ok().as_deref() == Some(source_bytes.as_slice()) {
+            continue;
+        }
+        std::fs::write(&destination, source_bytes)
+            .unwrap_or_else(|error| panic!("failed to write {}: {error}", destination.display()));
     }
 }
 

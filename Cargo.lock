@@ -2354,8 +2354,6 @@ dependencies = [
 [[package]]
 name = "glutin-winit"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85edca7075f8fc728f28cb8fbb111a96c3b89e930574369e3e9c27eb75d3788f"
 dependencies = [
  "cfg_aliases",
  "glutin",
@@ -2839,8 +2837,6 @@ dependencies = [
 [[package]]
 name = "i-slint-renderer-femtovg"
 version = "1.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78d0d99a18d66738b684758fe8460743a0aa0f64a96e05940942231a340085b1"
 dependencies = [
  "cfg-if",
  "const-field-offset",
@@ -3670,7 +3666,6 @@ dependencies = [
  "fontdb 0.16.2",
  "futures",
  "i-slint-backend-winit",
- "i-slint-core",
  "icu_provider",
  "image",
  "portable-pty",
@@ -3699,6 +3694,7 @@ dependencies = [
  "ureq",
  "uuid",
  "vt100",
+ "windows 0.62.2",
  "winresource",
  "zeroize",
 ]

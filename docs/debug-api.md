@@ -19,6 +19,13 @@ Authorization: Bearer <token>
 - `POST /v1/terminals/{id}/input`
 - `POST /v1/terminals/{id}/pointer`
 
+The health response includes the build profile and executable size, current and
+peak process memory, selected renderer, whether it is GPU-backed, whether the
+bundled ANGLE EGL runtime is actually loaded, and the active terminal render
+interval. These fields let automated checks catch an accidental debug binary,
+track memory growth, and distinguish the D3D11 path from a software or
+native-OpenGL fallback.
+
 The input request body is JSON:
 
 ```json
