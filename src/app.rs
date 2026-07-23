@@ -410,7 +410,7 @@ use crate::ssh::{
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
 use crate::terminal_raster::{
     clear_pixel_pool, recycle_pixel_buffer, RasterCompletion, RasterConfig, RasterJob,
-    RasterResult, RasterSpan, TerminalRasterizer,
+    RasterResult, RasterResultState, RasterSpan, TerminalRasterizer,
 };
 
 fn tab_title_len(title: &str) -> i32 {
@@ -6600,11 +6600,25 @@ fn raster_rows(spans: &[TermSpan], row_count: usize) -> Vec<Vec<RasterSpan>> {
 struct RasterUiState {
     pending: HashMap<String, RasterCompletion>,
     scheduled: HashSet<String>,
+    requested: HashSet<String>,
 }
 
 fn raster_ui_state() -> &'static Mutex<RasterUiState> {
     static STATE: OnceLock<Mutex<RasterUiState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(RasterUiState::default()))
+}
+
+fn set_terminal_raster_requested(tab_id: &str, requested: bool) {
+    let mut state = raster_ui_state().lock().unwrap();
+    if requested {
+        state.requested.insert(tab_id.to_string());
+    } else {
+        state.requested.remove(tab_id);
+    }
+}
+
+fn terminal_raster_requested(tab_id: &str) -> bool {
+    raster_ui_state().lock().unwrap().requested.contains(tab_id)
 }
 
 fn merge_raster_completion(slot: &mut RasterCompletion, incoming: RasterCompletion) {
@@ -6618,6 +6632,7 @@ fn forget_terminal_raster_ui(tab_id: &str) {
     let mut state = raster_ui_state().lock().unwrap();
     state.pending.remove(tab_id);
     state.scheduled.remove(tab_id);
+    state.requested.remove(tab_id);
 }
 
 fn forget_terminal_raster(tab_id: &str) {
@@ -6625,17 +6640,45 @@ fn forget_terminal_raster(tab_id: &str) {
     forget_terminal_raster_ui(tab_id);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RasterApplyAction {
+    Drop,
+    Cache,
+    Publish,
+}
+
+fn raster_apply_action(requested: bool, state: RasterResultState) -> RasterApplyAction {
+    match (requested, state) {
+        (true, RasterResultState::Latest) => RasterApplyAction::Publish,
+        (true, RasterResultState::Stale) => RasterApplyAction::Cache,
+        _ => RasterApplyAction::Drop,
+    }
+}
+
 fn apply_terminal_raster_completion(win: &AppWindow, tab_id: &str, completion: RasterCompletion) {
     match completion {
         Ok(result) => {
-            let is_latest =
-                terminal_rasterizer().is_latest_generation(&result.tab_id, result.generation);
-            apply_terminal_raster_result(win, result, is_latest);
+            let state = terminal_rasterizer().result_state(&result);
+            match raster_apply_action(terminal_raster_requested(&result.tab_id), state) {
+                RasterApplyAction::Drop => {
+                    tracing::trace!(
+                        tab_id = result.tab_id,
+                        generation = result.generation,
+                        ?state,
+                        "terminal row raster dropped"
+                    );
+                    recycle_terminal_raster_result(result);
+                }
+                RasterApplyAction::Cache => apply_terminal_raster_result(win, result, false),
+                RasterApplyAction::Publish => apply_terminal_raster_result(win, result, true),
+            }
         }
         Err(error) => {
             tracing::warn!(tab_id, %error, "terminal row raster failed");
-            set_terminal_row(win, tab_id, |row| row.row_images_ready = false);
-            win.window().request_redraw();
+            if terminal_raster_requested(tab_id) {
+                set_terminal_row(win, tab_id, |row| row.row_images_ready = false);
+                win.window().request_redraw();
+            }
         }
     }
 }
@@ -6699,6 +6742,12 @@ fn recycle_terminal_row_image(image: TermRowImage) {
         if let Some(buffer) = image.source.to_rgba8_premultiplied() {
             recycle_pixel_buffer(buffer);
         }
+    }
+}
+
+fn recycle_terminal_raster_result(result: RasterResult) {
+    for update in result.updates {
+        recycle_pixel_buffer(update.pixels);
     }
 }
 
@@ -6960,11 +7009,17 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     if changed {
         win.window().request_redraw();
     }
-    if forget_sparse_raster {
+    if !row_images_for_frame {
+        // Cancel even when the first dense frame has not produced any image
+        // geometry yet. Otherwise its delayed completion can re-enable the
+        // image layer after this frame has returned to authoritative spans.
         forget_terminal_raster(tab_id);
+    }
+    if forget_sparse_raster {
         clear_pixel_pool();
     }
     if row_images_for_frame {
+        set_terminal_raster_requested(tab_id, true);
         submit_terminal_raster(
             win,
             tab_id,
@@ -7013,6 +7068,26 @@ mod terminal_model_tests {
     #[test]
     fn emoji_frames_stay_on_the_native_image_path() {
         assert!(!terminal_frame_prefers_row_images(true, 200, 35, true));
+    }
+
+    #[test]
+    fn raster_results_publish_only_for_the_requested_current_frame() {
+        assert_eq!(
+            raster_apply_action(true, RasterResultState::Latest),
+            RasterApplyAction::Publish
+        );
+        assert_eq!(
+            raster_apply_action(true, RasterResultState::Stale),
+            RasterApplyAction::Cache
+        );
+        assert_eq!(
+            raster_apply_action(true, RasterResultState::Invalidated),
+            RasterApplyAction::Drop
+        );
+        assert_eq!(
+            raster_apply_action(false, RasterResultState::Latest),
+            RasterApplyAction::Drop
+        );
     }
 
     fn model_matches(model: &VecModel<TermSpan>, expected: &[TermSpan]) -> bool {
@@ -13505,6 +13580,18 @@ mod key_tests {
     fn alt_letter_still_sends_esc_prefix() {
         // Alt+a (a real Meta combo) must still send ESC + 'a'.
         assert_eq!(key_to_pty_bytes("a", false, true, false), vec![0x1b, b'a']);
+    }
+
+    #[test]
+    fn backspace_and_delete_use_terminal_erase_sequences() {
+        assert_eq!(
+            key_to_pty_bytes("\u{0008}", false, false, false),
+            vec![0x7f]
+        );
+        assert_eq!(
+            key_to_pty_bytes("\u{007f}", false, false, false),
+            b"\x1b[3~"
+        );
     }
 
     #[test]

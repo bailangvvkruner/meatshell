@@ -248,8 +248,14 @@ pub struct RasterResult {
 impl RasterResult {
     /// Merge a newer delta into a result that has not reached the UI yet.
     pub fn merge_from(&mut self, mut newer: Self) {
+        // A forgotten frame starts a fresh worker cache. Deltas from the old
+        // epoch cannot fill holes in that cache and must never be published as
+        // part of the new frame.
+        if self.tab_id != newer.tab_id || self.epoch != newer.epoch {
+            *self = newer;
+            return;
+        }
         self.generation = newer.generation;
-        self.epoch = newer.epoch;
         self.row_count = newer.row_count;
         self.columns = newer.columns;
         self.logical_cell_width = newer.logical_cell_width;
@@ -274,6 +280,13 @@ impl RasterResult {
 
 pub type RasterCompletion = Result<RasterResult, String>;
 type Completion = Box<dyn FnOnce(RasterCompletion) + Send + 'static>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RasterResultState {
+    Latest,
+    Stale,
+    Invalidated,
+}
 
 struct Envelope {
     job: RasterJob,
@@ -344,7 +357,14 @@ impl TerminalRasterizer {
         *generation = generation.wrapping_add(1);
         job.generation = *generation;
         job.epoch = state.epochs.get(&job.tab_id).copied().unwrap_or_default();
-        job.reset_cache = state.reset_tabs.remove(&job.tab_id);
+        // A waiting frame can be replaced before the worker observes it. Carry
+        // its reset bit forward so the replacement still rebuilds every row
+        // after UI textures or the worker cache were invalidated.
+        job.reset_cache = state.reset_tabs.remove(&job.tab_id)
+            || state
+                .pending
+                .get(&job.tab_id)
+                .is_some_and(|pending| pending.job.reset_cache);
 
         if !state.pending.contains_key(&job.tab_id) {
             state.order.push_back(job.tab_id.clone());
@@ -363,25 +383,40 @@ impl TerminalRasterizer {
 
     pub fn forget(&self, tab_id: &str) {
         let mut state = self.queue.state.lock().unwrap();
-        state.pending.remove(tab_id);
-        state.last_frame_keys.remove(tab_id);
-        state.generations.remove(tab_id);
+        let had_frame =
+            state.pending.remove(tab_id).is_some() | state.last_frame_keys.remove(tab_id).is_some();
+        if !had_frame {
+            return;
+        }
+
+        // Keep generations monotonic across cache resets. Besides making logs
+        // unambiguous, this prevents an old gen=1 completion from matching a
+        // new gen=1 frame after forget/resubmit.
+        let generation = state.generations.entry(tab_id.to_string()).or_default();
+        *generation = generation.wrapping_add(1);
         let epoch = state.epochs.entry(tab_id.to_string()).or_default();
         *epoch = epoch.wrapping_add(1);
         state.reset_tabs.insert(tab_id.to_string());
     }
 
-    /// True when `generation` is still the newest frame submitted for `tab_id`.
-    /// Older deltas may still be applied to the hidden image cache, but must not
-    /// make that cache visible over a newer terminal span frame.
-    pub fn is_latest_generation(&self, tab_id: &str, generation: u64) -> bool {
-        self.queue
-            .state
-            .lock()
-            .unwrap()
-            .generations
-            .get(tab_id)
-            .is_some_and(|latest| *latest == generation)
+    /// Classify a completion against the full cache token. Older deltas from
+    /// the same epoch may update the hidden image cache; a forgotten epoch must
+    /// not touch that cache or make it visible.
+    pub(crate) fn result_state(&self, result: &RasterResult) -> RasterResultState {
+        let state = self.queue.state.lock().unwrap();
+        let current_epoch = state
+            .epochs
+            .get(&result.tab_id)
+            .copied()
+            .unwrap_or_default();
+        if current_epoch != result.epoch {
+            return RasterResultState::Invalidated;
+        }
+        match state.generations.get(&result.tab_id) {
+            Some(latest) if *latest == result.generation => RasterResultState::Latest,
+            Some(_) => RasterResultState::Stale,
+            None => RasterResultState::Invalidated,
+        }
     }
 }
 
@@ -891,6 +926,24 @@ mod tests {
         }]
     }
 
+    fn pending_result(rasterizer: &TerminalRasterizer, tab_id: &str) -> RasterResult {
+        let state = rasterizer.queue.state.lock().unwrap();
+        let job = &state.pending.get(tab_id).unwrap().job;
+        RasterResult {
+            tab_id: job.tab_id.clone(),
+            generation: job.generation,
+            epoch: job.epoch,
+            row_count: job.rows.len(),
+            columns: job.config.columns,
+            logical_cell_width: job.logical_cell_width,
+            logical_cell_height: job.logical_cell_height,
+            cursor_row: job.cursor_row,
+            cursor_col: job.cursor_col,
+            has_content: true,
+            updates: Vec::new(),
+        }
+    }
+
     #[test]
     fn default_raster_font_set_contains_only_embedded_faces() {
         let font_system = build_font_system(&FontSetKey::default());
@@ -1055,7 +1108,64 @@ mod tests {
     }
 
     #[test]
-    fn latest_generation_advances_when_a_waiting_frame_is_replaced() {
+    fn replacement_after_forget_keeps_the_full_cache_reset() {
+        let rasterizer = TerminalRasterizer {
+            queue: Arc::new(SharedQueue::default()),
+        };
+        assert!(rasterizer.submit(
+            RasterJob::new(
+                "tab".to_string(),
+                config(),
+                vec![
+                    row("one", [255, 255, 255, 255]),
+                    row("two", [255, 0, 0, 255]),
+                ],
+            ),
+            |_| {},
+        ));
+        let mut worker = WorkerState::new();
+        let initial = rasterizer.queue.take();
+        assert_eq!(worker.render(initial.job).unwrap().updates.len(), 2);
+
+        rasterizer.forget("tab");
+        assert!(rasterizer.submit(
+            RasterJob::new(
+                "tab".to_string(),
+                config(),
+                vec![
+                    row("one", [255, 255, 255, 255]),
+                    row("three", [255, 0, 0, 255]),
+                ],
+            ),
+            |_| {},
+        ));
+        assert!(rasterizer.submit(
+            RasterJob::new(
+                "tab".to_string(),
+                config(),
+                vec![
+                    row("one", [255, 255, 255, 255]),
+                    row("four", [255, 0, 0, 255]),
+                ],
+            ),
+            |_| {},
+        ));
+
+        let replacement = rasterizer.queue.take();
+        assert!(replacement.job.reset_cache);
+        let rebuilt = worker.render(replacement.job).unwrap();
+        assert_eq!(
+            rebuilt
+                .updates
+                .iter()
+                .map(|update| update.row)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn latest_result_advances_when_a_waiting_frame_is_replaced() {
         let rasterizer = TerminalRasterizer {
             queue: Arc::new(SharedQueue::default()),
         };
@@ -1067,7 +1177,8 @@ mod tests {
             ),
             |_| {},
         ));
-        assert!(rasterizer.is_latest_generation("tab", 1));
+        let first = pending_result(&rasterizer, "tab");
+        assert_eq!(rasterizer.result_state(&first), RasterResultState::Latest);
 
         assert!(rasterizer.submit(
             RasterJob::new(
@@ -1077,8 +1188,44 @@ mod tests {
             ),
             |_| {},
         ));
-        assert!(!rasterizer.is_latest_generation("tab", 1));
-        assert!(rasterizer.is_latest_generation("tab", 2));
+        let second = pending_result(&rasterizer, "tab");
+        assert_eq!(rasterizer.result_state(&first), RasterResultState::Stale);
+        assert_eq!(rasterizer.result_state(&second), RasterResultState::Latest);
+    }
+
+    #[test]
+    fn forgotten_result_cannot_match_a_resubmitted_frame() {
+        let rasterizer = TerminalRasterizer {
+            queue: Arc::new(SharedQueue::default()),
+        };
+        assert!(rasterizer.submit(
+            RasterJob::new(
+                "tab".to_string(),
+                config(),
+                vec![row("old", [255, 255, 255, 255])],
+            ),
+            |_| {},
+        ));
+        let forgotten = pending_result(&rasterizer, "tab");
+
+        rasterizer.forget("tab");
+        assert!(rasterizer.submit(
+            RasterJob::new(
+                "tab".to_string(),
+                config(),
+                vec![row("new", [255, 255, 255, 255])],
+            ),
+            |_| {},
+        ));
+        let current = pending_result(&rasterizer, "tab");
+
+        assert_ne!(forgotten.epoch, current.epoch);
+        assert!(current.generation > forgotten.generation);
+        assert_eq!(
+            rasterizer.result_state(&forgotten),
+            RasterResultState::Invalidated
+        );
+        assert_eq!(rasterizer.result_state(&current), RasterResultState::Latest);
     }
 
     #[test]
@@ -1170,6 +1317,54 @@ mod tests {
         assert_eq!(pending.updates[0].pixels.as_bytes(), &[10; 4]);
         assert_eq!(pending.updates[1].row, 1);
         assert_eq!(pending.updates[1].pixels.as_bytes(), &[99; 4]);
+    }
+
+    #[test]
+    fn completed_delta_merge_drops_rows_from_a_forgotten_epoch() {
+        let update = |row, value| {
+            let mut pixels = SharedPixelBuffer::<Rgba8Pixel>::new(1, 1);
+            pixels.make_mut_bytes().fill(value);
+            RasterRowPixels {
+                row,
+                width: 1,
+                height: 1,
+                pixels,
+            }
+        };
+        let mut forgotten = RasterResult {
+            tab_id: "tab".to_string(),
+            generation: 1,
+            epoch: 4,
+            row_count: 2,
+            columns: 8,
+            logical_cell_width: 8.0,
+            logical_cell_height: 18.0,
+            cursor_row: 1,
+            cursor_col: 2,
+            has_content: true,
+            updates: vec![update(0, 10), update(1, 20)],
+        };
+        let current = RasterResult {
+            tab_id: "tab".to_string(),
+            generation: 3,
+            epoch: 5,
+            row_count: 2,
+            columns: 8,
+            logical_cell_width: 8.0,
+            logical_cell_height: 18.0,
+            cursor_row: 0,
+            cursor_col: 4,
+            has_content: true,
+            updates: vec![update(1, 99)],
+        };
+
+        forgotten.merge_from(current);
+
+        assert_eq!(forgotten.epoch, 5);
+        assert_eq!(forgotten.generation, 3);
+        assert_eq!(forgotten.updates.len(), 1);
+        assert_eq!(forgotten.updates[0].row, 1);
+        assert_eq!(forgotten.updates[0].pixels.as_bytes(), &[99; 4]);
     }
 
     #[test]
