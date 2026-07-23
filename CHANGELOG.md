@@ -13,6 +13,7 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ### 修复 / Fixed
 
+- **修复 Windows 向远程 Bash 粘贴多行命令时出现双换行。** bracketed paste 现在会把剪贴板中的 `CRLF` 折叠为单个终端回车，同时保留原有的单独 `LF` 和 `CR`；带反斜杠续行的 Docker 等命令不再被空行提前截断。
 - **避免错误密码触发重复 SSH 认证并导致账户锁定。** `password` 被服务器拒绝后，仅当服务端明确提供 `keyboard-interactive` 时才切换认证方式；仅提供 `publickey,password` 的 OpenSSH 服务器会直接弹出重输密码窗口，不再为同一个密码新建连接并额外失败一次。密码已部分成功且要求 MFA 的服务器会保留当前连接继续完成二次认证。
 - **SSH 密码被服务器拒绝后可直接重新输入。** 正式终端、独立 SFTP 连接和跳板机现在共用同一套认证流程；已保存密码失效时会弹出明确的认证失败对话框，允许输入并选择保存新密码，而不是直接关闭会话。每次重试都使用全新 SSH 连接以避免 russh 在失败连接上切换认证方式时挂起，并限制为最多三次重输，取消或 UI 通道关闭时立即结束等待。
 - **修复 GPU 启动内存在快速进入 btop 后长期停留在 100 MiB 以上。** Windows GPU 路径现在会在启动约 2 秒后执行一次不可被密集终端推迟的初始化工作集回收；后续回收仍只在所有密集终端退出并空闲 10 秒后进行，避免持续渲染时反复换页。实测同一配置的私有工作集由启动 `120.6 MiB` 在 `3.4 s` 降至 `10.1 MiB`，之后稳定在 `10–12 MiB`，ANGLE/D3D11 GPU 活动保持正常。
@@ -39,6 +40,7 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ### Fixed
 
+- **Fix doubled newlines when pasting multi-line commands from Windows into remote Bash.** Bracketed paste now collapses clipboard `CRLF` to one terminal return while preserving existing lone `LF` and `CR` input, so backslash-continued commands such as Docker invocations are no longer terminated by blank lines.
 - **Avoid duplicate SSH failures and account lockout after a rejected password.** MeatShell now falls back from `password` only when the server explicitly advertises `keyboard-interactive`. OpenSSH servers offering only `publickey,password` immediately show the password re-entry dialog instead of reconnecting and failing the same password a second time. Servers that partially accept the password and require MFA continue on the existing connection to complete the second factor.
 - **Re-prompt after the server rejects an SSH password.** Terminal, dedicated SFTP, and jump-host connections now share one authentication flow. When a saved password is stale, a dedicated authentication-failed dialog accepts and can persist a replacement instead of immediately closing the session. Every retry uses a fresh SSH transport to avoid russh hanging while switching methods on a rejected connection, re-prompts are capped at three, and cancellation or a closed UI channel ends the wait immediately.
 - **Fix GPU startup memory remaining above 100 MiB when btop is opened quickly.** The Windows GPU path now performs one initialization working-set trim about two seconds after startup that a dense terminal cannot defer. Later trims still wait until all dense terminals have exited and remained idle for ten seconds, avoiding repeated paging during continuous rendering. With the same configuration, private working set fell from `120.6 MiB` at startup to `10.1 MiB` at `3.4 s`, then remained at `10–12 MiB` while ANGLE/D3D11 GPU activity continued normally.

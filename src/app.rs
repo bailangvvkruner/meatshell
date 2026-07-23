@@ -11419,6 +11419,13 @@ fn normalize_pasted_newlines(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
+/// Collapse Windows clipboard CRLF to one terminal return in bracketed paste.
+/// Forwarding both bytes would make readline insert an empty line after every
+/// logical line. Lone LF and CR are preserved for existing Unix/editor input.
+fn normalize_bracketed_paste_newlines(text: &str) -> String {
+    text.replace("\r\n", "\r")
+}
+
 /// Encode clipboard text according to the mode requested by the remote
 /// application. Bracketed paste lets shells and editors distinguish pasted
 /// text from typed keystrokes, preserving multi-line layout and indentation.
@@ -11430,7 +11437,7 @@ fn encode_pasted_text(text: &str, bracketed: bool) -> Vec<u8> {
     // A pasted ESC could forge the end marker; Ctrl+C also terminates bracketed
     // paste in some shells. Match established terminal-emulator behaviour by
     // filtering both before wrapping the payload.
-    let filtered = text.replace(['\x1b', '\x03'], "");
+    let filtered = normalize_bracketed_paste_newlines(text).replace(['\x1b', '\x03'], "");
     let mut bytes = Vec::with_capacity(filtered.len() + 12);
     bytes.extend_from_slice(b"\x1b[200~");
     bytes.extend_from_slice(filtered.as_bytes());
@@ -13300,8 +13307,15 @@ mod key_tests {
     #[test]
     fn paste_uses_remote_bracketed_paste_mode() {
         assert_eq!(
-            encode_pasted_text("first\r\n  second", true),
-            b"\x1b[200~first\r\n  second\x1b[201~"
+            encode_pasted_text("first\r\n  second\rthird\nfourth", true),
+            b"\x1b[200~first\r  second\rthird\nfourth\x1b[201~"
+        );
+        assert_eq!(
+            encode_pasted_text(
+                "docker run --rm \\\r\n--name wrk \\\r\nbailangvvking/wrk",
+                true,
+            ),
+            b"\x1b[200~docker run --rm \\\r--name wrk \\\rbailangvvking/wrk\x1b[201~"
         );
         assert_eq!(
             encode_pasted_text("safe\x1b[201~\x03text", true),
