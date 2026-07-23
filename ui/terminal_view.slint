@@ -93,9 +93,159 @@ component MenuItem inherits Rectangle {
     }
 }
 
+// Persistent, resizable quick-command panel (#215). It deliberately shares the
+// same model/actions as the command-bar popup; docking only adds another view.
+export component QuickDockPanel inherits Rectangle {
+    in property <[QuickCmd]> commands;
+    in property <string> dock-edge: "right";
+    callback activate(string, bool /* send-enter */);
+    callback toggle-group(string);
+    callback manage();
+    callback close();
+    callback dock-drag-move(length, length);
+    callback dock-drag-end();
+
+    background: Theme.bg-panel;
+    border-width: 1px;
+    border-color: Theme.border-subtle;
+    clip: true;
+
+    VerticalLayout {
+        spacing: 0;
+        Rectangle {
+            height: 34px;
+            background: Theme.bg-panel-alt;
+            drag-area := TouchArea {
+                mouse-cursor: grab;
+                moved => {
+                    if (self.pressed) {
+                        root.dock-drag-move(self.absolute-position.x + self.mouse-x,
+                                            self.absolute-position.y + self.mouse-y);
+                    }
+                }
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.up) { root.dock-drag-end(); }
+                }
+            }
+            HorizontalLayout {
+                padding-left: 8px; padding-right: 4px; spacing: 6px;
+                Text {
+                    text: "\u{E25D}";
+                    font-family: "Material Icons";
+                    color: Theme.text-muted; font-size: Theme.fs-md;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: @tr("Quick commands");
+                    color: Theme.text-primary; font-size: Theme.fs-sm;
+                    font-weight: 700; vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Rectangle {
+                    width: 28px;
+                    background: close-ta.has-hover ? Theme.bg-hover : transparent;
+                    border-radius: Theme.radius-sm;
+                    close-ta := TouchArea { mouse-cursor: pointer; clicked => { root.close(); } }
+                    Text {
+                        text: root.dock-edge == "right" ? "\u{E5CC}"
+                            : root.dock-edge == "top" ? "\u{E5CE}"
+                            : root.dock-edge == "bottom" ? "\u{E5CF}"
+                            : "\u{E5CB}";
+                        font-family: "Material Icons";
+                        color: Theme.text-secondary; font-size: Theme.fs-md;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        Flickable {
+            vertical-stretch: 1;
+            viewport-width: self.width;
+            viewport-height: max(self.height, list.preferred-height);
+            list := VerticalLayout {
+                padding: 6px; spacing: 2px; alignment: start;
+                if root.commands.length == 0 : Text {
+                    height: 36px;
+                    text: @tr("No quick commands yet");
+                    color: Theme.text-muted; font-size: Theme.fs-xs;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+                for q in root.commands : VerticalLayout {
+                    spacing: 1px;
+                    if q.group-header != "" : Rectangle {
+                        height: 26px;
+                        border-radius: Theme.radius-sm;
+                        background: group-ta.has-hover ? Theme.bg-hover : transparent;
+                        group-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.toggle-group(q.group); }
+                        }
+                        HorizontalLayout {
+                            padding-left: 6px; padding-right: 6px; spacing: 5px;
+                            Text {
+                                text: q.collapsed ? "\u{E5CC}" : "\u{E5CF}";
+                                font-family: "Material Icons";
+                                color: Theme.text-muted; font-size: Theme.fs-sm;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: q.group; color: Theme.text-muted;
+                                font-size: Theme.fs-xs; font-weight: 700;
+                                vertical-alignment: center; overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                    }
+                    if !q.collapsed && q.orig-index >= 0 : Rectangle {
+                        height: max(44px, item-col.preferred-height + 8px);
+                        border-radius: Theme.radius-sm;
+                        background: item-ta.has-hover ? Theme.bg-hover : transparent;
+                        item-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.activate(q.command, q.send-enter); }
+                        }
+                        item-col := VerticalLayout {
+                            padding-left: 9px; padding-right: 9px;
+                            padding-top: 4px; padding-bottom: 4px; spacing: 1px;
+                            Text {
+                                text: q.name; color: Theme.text-primary;
+                                font-size: Theme.fs-sm; wrap: word-wrap;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: q.command; color: Theme.text-muted;
+                                font-size: Theme.fs-xs; overflow: elide;
+                                font-family: Theme.ui-font-family;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 32px;
+            background: manage-ta.has-hover ? Theme.bg-hover : Theme.bg-panel-alt;
+            manage-ta := TouchArea { mouse-cursor: pointer; clicked => { root.manage(); } }
+            Text {
+                text: @tr("Manage…"); color: Theme.accent; font-size: Theme.fs-sm;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+    }
+}
+
 // --- TerminalView ----------------------------------------------------------
 
 export component TerminalView inherits Rectangle {
+    in property <bool> active: true;
+    in property <bool> quick-sidebar-enabled: false;
+    in property <bool> quick-panel-docked: false;
+    in property <string> quick-external-command;
+    in property <bool> quick-external-send-enter;
+    in property <int> quick-external-sequence;
     in property <string> tab-id;
     in property <string> status-line: @tr("Not connected");
     in property <[TermSpan]> spans;     // coloured runs of the visible screen
@@ -170,6 +320,8 @@ export component TerminalView inherits Rectangle {
     property <int> history-selected: 0;
     callback run-command(string /* cmd */, bool /* to-all */);
     callback manage-quick-commands();          // open the add/edit/delete dialog
+    callback quick-dock-drag-move(length, length);
+    callback quick-dock-drag-end();
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
     // Right-click management on the popup, mirroring the welcome session list (#55).
     callback edit-quick-command(int /* index */);
@@ -254,6 +406,17 @@ export component TerminalView inherits Rectangle {
     property <bool> focus-pending: false;
     callback focus-terminal();
     focus-terminal => { root.focus-pending = true; }
+
+    changed quick-external-sequence => {
+        if (root.active) {
+            if (root.quick-external-send-enter) {
+                root.run-command(root.quick-external-command, root.send-to-all);
+            } else {
+                cmd-input.text = root.quick-external-command;
+                cmd-input.focus();
+            }
+        }
+    }
 
     background: Theme.term-bg;
     forward-focus: ime-input;
@@ -409,10 +572,11 @@ export component TerminalView inherits Rectangle {
         vertical-stretch: 1;
         // Collapsed → shrink to the 36px ToolStrip icon bar at the docked edge
         // (M5), click its icon to re-expand. The 4px splitter is gone collapsed.
-        // Side-docked toolbar has a compact 190px layout. Clamp legacy/saved
-        // widths below that floor so its controls never enter the terminal (#285).
+        // Side-docked SFTP needs enough room for its compact action row and a
+        // usable path field. Clamp legacy/saved widths below that floor instead
+        // of letting Slint squeeze controls out of alignment.
         property <length> sf-w: root.sftp-collapsed ? 36px
-            : root.sftp-horizontal ? max(190px, root.sftp-panel-width)
+            : root.sftp-horizontal ? max(300px, root.sftp-panel-width)
             : root.sftp-panel-width;
         property <length> sf-h: root.sftp-collapsed ? 36px : root.sftp-panel-height;
         property <length> sp:   root.sftp-collapsed ? 0px : 4px;
@@ -1221,8 +1385,9 @@ export component TerminalView inherits Rectangle {
                 padding-top: 4px; padding-bottom: 4px;
                 spacing: 6px;
 
-                // Quick-command toggle.
-                Rectangle {
+                // Quick-command toggle. Once the sidebar has been docked, the
+                // sidebar/icon strip becomes its only entry point (#215).
+                if !root.quick-panel-docked : Rectangle {
                     width: qc-row.preferred-width + 16px;
                     border-radius: Theme.radius-sm;
                     background: qc-ta.has-hover || root.quick-open ? Theme.bg-hover : Theme.bg-elevated;
@@ -1570,14 +1735,46 @@ export component TerminalView inherits Rectangle {
                         // Manage entry.
                         Rectangle {
                             height: 30px;
-                            border-radius: Theme.radius-sm;
-                            background: mng-ta.has-hover ? Theme.bg-hover : transparent;
-                            mng-ta := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.quick-open = false; root.manage-quick-commands(); }
+                            HorizontalLayout {
+                                spacing: 2px;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    border-radius: Theme.radius-sm;
+                                    background: mng-ta.has-hover ? Theme.bg-hover : transparent;
+                                    mng-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.quick-open = false; root.manage-quick-commands(); }
+                                    }
+                                    Text { text: @tr("Manage…"); color: Theme.accent; font-size: Theme.fs-sm;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                if root.quick-sidebar-enabled : Rectangle {
+                                    width: 34px;
+                                    border-radius: Theme.radius-sm;
+                                    background: quick-grip.has-hover ? Theme.bg-hover : transparent;
+                                    quick-grip := TouchArea {
+                                        mouse-cursor: grab;
+                                        moved => {
+                                            if (self.pressed) {
+                                                root.quick-dock-drag-move(
+                                                    self.absolute-position.x + self.mouse-x,
+                                                    self.absolute-position.y + self.mouse-y);
+                                            }
+                                        }
+                                        pointer-event(ev) => {
+                                            if (ev.kind == PointerEventKind.up) {
+                                                root.quick-open = false;
+                                                root.quick-dock-drag-end();
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        text: "\u{E25D}"; font-family: "Material Icons";
+                                        color: Theme.text-secondary; font-size: Theme.fs-md;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
+                                }
                             }
-                            Text { text: @tr("Manage…"); color: Theme.accent; font-size: Theme.fs-sm;
-                                   horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
                 }
@@ -1797,13 +1994,13 @@ export component TerminalView inherits Rectangle {
                 moved => {
                     if (root.sftp-dragging) {
                         if (root.sftp-horizontal) {
-                            // Floor matches SftpPanel's compact toolbar layout;
-                            // narrower widths would force controls over terminal.
+                            // Floor matches SftpPanel's compact two-row toolbar;
+                            // narrower widths make the path field and actions unusable.
                             root.set-sftp-panel-width(clamp(
                                 root.sftp-dock == "right"
                                     ? dock-region.width - ((self.absolute-position.x + self.mouse-x) - dock-region.absolute-position.x)
                                     : (self.absolute-position.x + self.mouse-x) - dock-region.absolute-position.x,
-                                190px, max(200px, dock-region.width - 200px)));
+                                300px, max(310px, dock-region.width - 200px)));
                         } else {
                             root.set-sftp-panel-height(clamp(
                                 root.sftp-dock == "bottom"
@@ -1930,6 +2127,7 @@ export component TerminalView inherits Rectangle {
                 }
             }
         }
+
         }
     }
 }

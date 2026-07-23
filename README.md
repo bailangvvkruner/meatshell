@@ -1,13 +1,14 @@
 > [!IMPORTANT]
 > ## 本分支相对上游的增强
 >
-> 本分支基于上游 [`jeff141/meatshell` v0.6.1](https://github.com/jeff141/meatshell/releases/tag/v0.6.1)，主要补丁和行为差异如下：
+> 本分支基于上游 [`jeff141/meatshell` v0.6.6](https://github.com/jeff141/meatshell/releases/tag/v0.6.6)，主要补丁和行为差异如下：
 >
 > - 记住并恢复上次关闭时的窗口尺寸与最大化状态，同时校正超出当前显示器的窗口尺寸。
 > - 资源侧栏支持固定当前本机或 SSH 会话，不会在切换标签页时自动改变数据来源。
 > - 设置中可分别调整本机（1-30 秒）和远端 SSH（1-60 秒）资源刷新间隔，修改后实时生效，已连接的 SSH 会话无需重连。
 > - 将进程监视器恢复为主窗口内弹窗，修复 Windows 上的空白窄条；进程采集兼容 Alpine/OpenWrt 的 BusyBox `top`/`ps`。
 > - 修复 SSH 高频 UTF-8 输出跨网络分包时的字符破坏，避免 btop/htop 以 100ms 刷新时因框线字符扩宽而重复行、错行。
+> - 修复 Windows 剪贴板通过 SSH 向 Bash 粘贴 `CRLF` 多行命令时产生双换行，保留反斜杠续行命令的完整结构。
 > - 内存已用量与总量分别选择单位，小于 1 GiB 的数值使用 `M`，例如 `700M/2.8G`。
 > - 新建 SSH 会话时，用户名留空会以浅色 `root` 提示，并在保存或连接时自动使用 `root`。
 > - 增加默认关闭、仅监听 `127.0.0.1`、使用 Bearer Token 鉴权的本机 AI / 调试接口；Token 加密保存，接口不读取已保存的凭据，详见 [Debug API 文档](docs/debug-api.md)。
@@ -175,15 +176,6 @@ meatshell/
   `slint::invoke_from_event_loop` 回调。
 - SSH / SFTP 共享 `known_hosts` 校验逻辑：首次连接会确认并记住主机密钥，
   后续密钥变化会再次提示。
-
-## 赞赏 / 请我喝杯咖啡
-
-觉得作品还不错的话，请我喝杯咖啡吧 ☕
-
-<p align="center">
-  <strong>亮出网络乞丐乞讨专用码</strong><br>
-  <img src="docs/screenshots/sponsor-wechat.png" alt="微信赞赏码" width="260">
-</p>
 
 ## 发版
 

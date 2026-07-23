@@ -401,6 +401,14 @@ fn default_sftp_width() -> f32 {
 fn default_sftp_height() -> f32 {
     220.0
 }
+
+fn default_quick_panel_width() -> f32 {
+    260.0
+}
+
+fn default_quick_panel_height() -> f32 {
+    220.0
+}
 fn default_flow() -> String {
     "none".to_string()
 }
@@ -698,6 +706,20 @@ pub struct ConfigFile {
     /// empty quick-command groups survive and can be renamed/deleted (#55).
     #[serde(default)]
     pub quick_groups: Vec<String>,
+    /// Opt-in docked quick-command sidebar (#215). The command-bar popup remains
+    /// available until the user actually drags it into the main dock layer.
+    #[serde(default)]
+    pub quick_commands_as_sidebar: bool,
+    #[serde(default)]
+    pub quick_panel_open: bool,
+    #[serde(default)]
+    pub quick_panel_collapsed: bool,
+    #[serde(default = "default_quick_panel_width")]
+    pub quick_panel_width: f32,
+    #[serde(default = "default_quick_panel_height")]
+    pub quick_panel_height: f32,
+    #[serde(default)]
+    pub quick_panel_dock: String,
     /// Recent commands sent from the command box, oldest first, capped (#55).
     #[serde(default)]
     pub command_history: Vec<String>,
@@ -1248,6 +1270,70 @@ impl ConfigStore {
 
     pub fn set_quick_commands(&mut self, cmds: Vec<QuickCommand>) {
         self.cache.quick_commands = cmds;
+    }
+
+    pub fn quick_panel_open(&self) -> bool {
+        self.cache.quick_panel_open
+    }
+
+    pub fn quick_commands_as_sidebar(&self) -> bool {
+        self.cache.quick_commands_as_sidebar
+    }
+
+    pub fn set_quick_commands_as_sidebar(&mut self, enabled: bool) {
+        self.cache.quick_commands_as_sidebar = enabled;
+        if !enabled {
+            self.cache.quick_panel_open = false;
+        }
+    }
+
+    pub fn set_quick_panel_open(&mut self, open: bool) {
+        self.cache.quick_panel_open = open;
+    }
+
+    pub fn quick_panel_collapsed(&self) -> bool {
+        self.cache.quick_panel_collapsed
+    }
+
+    pub fn set_quick_panel_collapsed(&mut self, collapsed: bool) {
+        self.cache.quick_panel_collapsed = collapsed;
+    }
+
+    pub fn quick_panel_width(&self) -> f32 {
+        let width = self.cache.quick_panel_width;
+        if width <= 0.0 {
+            default_quick_panel_width()
+        } else {
+            width
+        }
+    }
+
+    pub fn set_quick_panel_width(&mut self, width: f32) {
+        self.cache.quick_panel_width = width;
+    }
+
+    pub fn quick_panel_height(&self) -> f32 {
+        let height = self.cache.quick_panel_height;
+        if height <= 0.0 {
+            default_quick_panel_height()
+        } else {
+            height
+        }
+    }
+
+    pub fn set_quick_panel_height(&mut self, height: f32) {
+        self.cache.quick_panel_height = height;
+    }
+
+    pub fn quick_panel_dock(&self) -> String {
+        match self.cache.quick_panel_dock.trim() {
+            "left" | "right" | "top" | "bottom" => self.cache.quick_panel_dock.clone(),
+            _ => "right".into(),
+        }
+    }
+
+    pub fn set_quick_panel_dock(&mut self, dock: String) {
+        self.cache.quick_panel_dock = dock;
     }
 
     /// Explicit quick-command groups (#55) — parallels [`groups`](Self::groups).

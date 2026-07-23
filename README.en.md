@@ -1,13 +1,14 @@
 > [!IMPORTANT]
 > ## Changes in this fork
 >
-> This fork is based on upstream [`jeff141/meatshell` v0.6.1](https://github.com/jeff141/meatshell/releases/tag/v0.6.1) and adds these behavior changes:
+> This fork is based on upstream [`jeff141/meatshell` v0.6.6](https://github.com/jeff141/meatshell/releases/tag/v0.6.6) and adds these behavior changes:
 >
 > - Restores the last windowed size and maximized state, clamping invalid geometry to the current display.
 > - Lets the resource sidebar stay pinned to the local machine or a selected SSH session.
 > - Adds live settings for local (1-30 seconds) and remote SSH (1-60 seconds) resource refresh intervals; connected SSH sessions do not need to reconnect.
 > - Restores the process monitor as an in-app dialog to fix the blank Windows strip, with BusyBox `top`/`ps` fallbacks for Alpine and OpenWrt.
 > - Preserves UTF-8 characters split across SSH packets, preventing duplicated or displaced btop/htop rows at 100 ms refresh intervals.
+> - Collapses Windows clipboard `CRLF` to one terminal return when pasting multi-line commands into Bash over SSH, preserving backslash continuations.
 > - Selects `M` or `G` for each memory value independently, for example `700M/2.8G`.
 > - Shows a light `root` placeholder for blank SSH usernames and uses `root` when saving or connecting.
 > - Adds an opt-in, loopback-only local AI/debug API with Bearer authentication. Its token is encrypted at rest and saved credentials are never exposed; see the [Debug API documentation](docs/debug-api.md).
