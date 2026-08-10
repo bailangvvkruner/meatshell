@@ -22,10 +22,10 @@ export global Theme {
     in-out property <bool>  wallpaper-active: false;
     in-out property <color> wp-accent: #4a90e2;   // vivid accent from the image
     in-out property <color> wp-tint:   #808080;   // average colour, tints surfaces
-    // Frosted-panel opacity over a wallpaper (0.40–1.00). User-adjustable via the
+    // Frosted-panel opacity over a wallpaper (0.30–1.00). User-adjustable via the
     // Interface › Wallpaper opacity slider; bg-root / term-bg derive from it so one
-    // control scales the whole wallpaper wash. Default 0.86 (#v0.5).
-    in-out property <float> panel-alpha: 0.86;
+    // control scales the whole wallpaper wash. Default 0.85 (15% transparency).
+    in-out property <float> panel-alpha: 0.85;
     property <float> tint-amt: 0.10;              // how far surfaces pull to wp-tint
 
     // Frost a base surface: pull it slightly toward the wallpaper tint and make

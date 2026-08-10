@@ -10,30 +10,30 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Run-Git {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Args)
+    param([string[]] $GitArgs)
 
     if ($DryRun) {
-        Write-Host "git $($Args -join ' ')"
+        Write-Host "git $($GitArgs -join ' ')"
         return
     }
 
-    & git @Args
+    & git @GitArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "git $($Args -join ' ') failed"
+        throw "git $($GitArgs -join ' ') failed"
     }
 }
 
 function Run-Cargo {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Args)
+    param([string[]] $CargoArgs)
 
     if ($DryRun) {
-        Write-Host "cargo $($Args -join ' ')"
+        Write-Host "cargo $($CargoArgs -join ' ')"
         return
     }
 
-    & cargo @Args
+    & cargo @CargoArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "cargo $($Args -join ' ') failed"
+        throw "cargo $($CargoArgs -join ' ') failed"
     }
 }
 
@@ -48,10 +48,11 @@ function Run-CheckedOutput {
         return
     }
 
-    $output = (& $Command[0] @($Command | Select-Object -Skip 1)).Trim()
+    $rawOutput = & $Command[0] @($Command | Select-Object -Skip 1)
     if ($LASTEXITCODE -ne 0) {
         throw "$($Command -join ' ') failed"
     }
+    $output = ($rawOutput | Out-String).Trim()
     if ($output -ne $Expected) {
         throw "Expected '$Expected' but got '$output'."
     }
@@ -108,20 +109,26 @@ if ($newCargoLock -eq $cargoLock) {
 if ($DryRun) {
     Write-Host "Would set Cargo.toml and Cargo.lock version to $version."
 } else {
-    Set-Content -LiteralPath $cargoTomlPath -Value $newCargoToml -NoNewline
-    Set-Content -LiteralPath $cargoLockPath -Value $newCargoLock -NoNewline
+    # Windows PowerShell 5 uses the active ANSI code page for Set-Content by
+    # default, which corrupts non-ASCII comments and makes Cargo reject the
+    # manifests as invalid UTF-8. Write explicit UTF-8 without a BOM instead.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($cargoTomlPath, $newCargoToml, $utf8NoBom)
+    [System.IO.File]::WriteAllText($cargoLockPath, $newCargoLock, $utf8NoBom)
 }
 
-Run-Cargo check --locked
-Run-CheckedOutput "meatshell $version" cargo run --locked -- --version
+Run-Cargo -CargoArgs @("check", "--locked")
+Run-CheckedOutput -Expected "meatshell $version" -Command @(
+    "cargo", "run", "--locked", "--", "--version"
+)
 
-Run-Git add Cargo.toml Cargo.lock
-Run-Git commit -m "Release $Tag"
-Run-Git tag -a $Tag -m "Release $Tag"
+Run-Git -GitArgs @("add", "Cargo.toml", "Cargo.lock")
+Run-Git -GitArgs @("commit", "-m", "Release $Tag")
+Run-Git -GitArgs @("tag", "-a", $Tag, "-m", "Release $Tag")
 
 if ($Push) {
-    Run-Git push origin HEAD
-    Run-Git push origin $Tag
+    Run-Git -GitArgs @("push", "origin", "HEAD")
+    Run-Git -GitArgs @("push", "origin", $Tag)
     Write-Host "Released $Tag and pushed branch + tag."
 } else {
     Write-Host "Created release commit and tag $Tag."

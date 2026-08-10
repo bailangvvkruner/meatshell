@@ -13,6 +13,7 @@ export struct SessionInfo {
     group: string,        // folder/group name ("" = ungrouped)
     group-header: string, // set on the first row of each group → render a header
     collapsed: bool,      // group is collapsed → this session row is hidden
+    builtin: bool,        // built-in local shell, not a saved server session
 }
 
 // --- SessionRow ------------------------------------------------------------
@@ -26,15 +27,12 @@ component SessionRow inherits Rectangle {
     // Full session list — group-header is non-empty once per group, so the
     // "move to group" submenu can iterate it to list each group exactly once.
     in property <[SessionInfo]> all-sessions;
-    property <bool> system-row: root.session.group == "system";
+    property <bool> system-row: root.session.builtin;
 
     height: 36px;
     border-radius: Theme.radius-sm;
     background: touch.has-hover ? Theme.bg-hover : transparent;
     animate background { duration: 120ms; }
-    accessible-role: button;
-    accessible-label: root.session.name + " " + root.session.host;
-    accessible-action-default => { root.connect(); }
 
     // Remember where the right-click landed so the popup can appear there.
     property <length> ctx-x;
@@ -139,7 +137,8 @@ component SessionRow inherits Rectangle {
                 // per group (incl. empty folders), so iterating the full list
                 // yields each group once; the current group is skipped.
                 for s[i] in root.all-sessions : Rectangle {
-                    visible: !root.system-row && s.group-header != "" && s.group-header != root.session.group;
+                    visible: !root.system-row && s.group-header != ""
+                        && s.group-header != "system" && s.group-header != root.session.group;
                     height: self.visible ? 28px : 0px;
                     border-radius: Theme.radius-sm;
                     background: mv-ta.has-hover ? Theme.bg-hover : transparent;
@@ -241,6 +240,7 @@ export component Welcome inherits Rectangle {
     callback edit-group(string /* current-name */);
     callback delete-group(string /* name */);
     callback remove-session(string);
+    callback cycle-tab(bool /* reverse */);
     // Compact mode (welcome-as-sidebar): drop the big title/tagline header and
     // tighten padding so the session list fits a narrow docked panel (#v0.5).
     in property <bool> compact;
@@ -252,6 +252,23 @@ export component Welcome inherits Rectangle {
     callback dock-drag-end();
 
     background: Theme.bg-root;
+
+    // The regular welcome page is itself a tab. When Ctrl+Tab wraps from the
+    // last terminal to this page, keep the shortcut chain alive so the next
+    // press can continue to the first terminal (#294). The compact welcome
+    // sidebar must never take focus away from an active terminal.
+    if !root.compact : FocusScope {
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if ((Theme.is-mac ? event.modifiers.meta : event.modifiers.control)
+                    && (event.text == Key.Tab || event.text == Key.Backtab)) {
+                root.cycle-tab(event.modifiers.shift || event.text == Key.Backtab);
+                accept
+            } else {
+                reject
+            }
+        }
+    }
 
     VerticalLayout {
         padding: root.compact ? 12px : 24px;
@@ -420,7 +437,7 @@ export component Welcome inherits Rectangle {
                                 // empty); right-click opens the group menu.
                                 clicked => { root.toggle-group(session.group); }
                                 pointer-event(e) => {
-                                    if (session.group != "system" && e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                                    if (!session.builtin && e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
                                         gmx = self.mouse-x;
                                         gmy = self.mouse-y;
                                         grp-menu.show();

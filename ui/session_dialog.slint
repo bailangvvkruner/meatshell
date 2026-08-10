@@ -538,7 +538,13 @@ export component SessionDialog inherits Rectangle {
                     SegOption {
                         label: "SSH";
                         active: root.draft-kind == "ssh";
-                        clicked => { root.draft-kind = "ssh"; }
+                        clicked => {
+                            // Switch protocol defaults while leaving non-default ports untouched (#303).
+                            if (root.draft-kind != "ssh" && root.draft-port == "23") {
+                                root.draft-port = "22";
+                            }
+                            root.draft-kind = "ssh";
+                        }
                     }
                     SegOption {
                         label: @tr("Serial");
@@ -548,7 +554,12 @@ export component SessionDialog inherits Rectangle {
                     SegOption {
                         label: "Telnet";
                         active: root.draft-kind == "telnet";
-                        clicked => { root.draft-kind = "telnet"; }
+                        clicked => {
+                            if (root.draft-kind != "telnet" && root.draft-port == "22") {
+                                root.draft-port = "23";
+                            }
+                            root.draft-kind = "telnet";
+                        }
                     }
                 }
             }
@@ -612,7 +623,7 @@ export component SessionDialog inherits Rectangle {
                 input-background: Theme.bg-elevated;
                 idle-border: Theme.border-strong;
                 label: @tr("Username");
-                placeholder: "root";
+                placeholder: @tr("Prompted on connect if blank");
                 value <=> root.draft-user;
             }
 

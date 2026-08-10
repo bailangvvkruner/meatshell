@@ -1,35 +1,22 @@
 // Entry point. Wires the Slint UI to the config store, system sampler and
 // SSH session manager.
 
-// Keep normal Windows launches free of a console window in both debug and
-// release builds. `cargo run --features dev-console` restores the console for
-// development; test harnesses retain it so `cargo test` output stays visible.
-#![cfg_attr(
-    all(windows, not(test), not(feature = "dev-console")),
-    windows_subsystem = "windows"
-)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod config;
-mod debug_api;
-mod errlog;
-mod forward;
 mod i18n;
-mod known_hosts;
-mod local;
-mod memory_trim;
-mod panes;
-mod ppk;
-mod proxy;
-mod serial;
+mod layout;
+mod logging;
+mod resource;
+mod session;
 mod sftp;
 mod ssh;
-mod ssh_config;
-mod system;
-mod telnet;
-mod terminal_raster;
+mod terminal;
+mod tunnel;
+mod ui;
 mod wallpaper;
-mod zmodem;
+mod webdav;
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
@@ -46,15 +33,14 @@ fn main() -> anyhow::Result<()> {
     // "PingFang SC" UI font and all text vanished there instead (#129). Icons
     // survived in both cases because Material Icons is an embedded font.
     //
-    // Neither renderer works for every macOS machine, so we no longer pick for the
-    // user: femtovg is the known-good default for the majority. Users for whom
-    // femtovg fails to render text (e.g. #108) can opt into Skia at launch with
-    //     SLINT_BACKEND=winit-skia
-    // The renderer-skia feature is still compiled in on macOS (see Cargo.toml) so
-    // that override is available without a rebuild.
+    // Neither renderer works for every macOS machine, so FemtoVG remains the
+    // known-good default for the majority. Users for whom it fails to render text
+    // (e.g. #108) can select Skia under Settings -> Interface -> Rendering. The
+    // SLINT_BACKEND=winit-skia diagnostic override remains available and takes
+    // precedence over the saved setting. The renderer-skia feature is compiled in
+    // on macOS (see Cargo.toml), so switching does not require a rebuild.
 
     init_tracing();
-    harden_dll_search_path();
 
     // ── IME policy ───────────────────────────────────────────────────────────
     // NOTE: We deliberately DO **NOT** call `ImmDisableIME` here.
@@ -73,24 +59,6 @@ fn main() -> anyhow::Result<()> {
 
     app::run()
 }
-
-#[cfg(windows)]
-fn harden_dll_search_path() {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn SetDefaultDllDirectories(directory_flags: u32) -> i32;
-    }
-
-    // Application directory + System32 + explicitly registered user dirs.
-    // In particular, do not load a forged libEGL.dll from the working directory.
-    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
-    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
-        tracing::warn!("failed to restrict the Windows DLL search path");
-    }
-}
-
-#[cfg(not(windows))]
-fn harden_dll_search_path() {}
 
 /// Set up tracing: stderr (honours RUST_LOG, default info) **plus** a capped
 /// `error.log` file at WARN and above so users can send diagnostics — e.g. a
@@ -125,12 +93,12 @@ fn init_tracing() {
 
     // One file, capped at 50 MiB, auto-overwriting when full (5 MiB was too
     // small to diagnose anything useful).
-    let file_layer = errlog::path()
-        .and_then(|p| errlog::CappedFile::open(p, 50 * 1024 * 1024).ok())
+    let file_layer = logging::path()
+        .and_then(|p| logging::CappedFile::open(p, 50 * 1024 * 1024).ok())
         .map(|cf| {
             fmt::layer()
                 .with_ansi(false)
-                .with_writer(errlog::CappedWriter::new(cf))
+                .with_writer(logging::CappedWriter::new(cf))
                 .with_filter(quiet_noise(EnvFilter::new("warn")))
         });
 

@@ -1,0 +1,205 @@
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::Secret;
+
+/// Which transport a session uses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    /// SSH shell + SFTP (the original and default behaviour).
+    #[default]
+    Ssh,
+    /// Local serial port (COM3 / /dev/ttyUSB0) for switches, routers, MCUs (#14).
+    Serial,
+    /// Plain Telnet over TCP, for legacy network gear (#17).
+    Telnet,
+    /// Local shell process on this machine (PowerShell/CMD/WSL/$SHELL).
+    Local,
+}
+
+impl SessionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionKind::Ssh => "ssh",
+            SessionKind::Serial => "serial",
+            SessionKind::Telnet => "telnet",
+            SessionKind::Local => "local",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "serial" => SessionKind::Serial,
+            "telnet" => SessionKind::Telnet,
+            "local" => SessionKind::Local,
+            _ => SessionKind::Ssh,
+        }
+    }
+}
+
+fn default_baud() -> u32 {
+    115_200
+}
+fn default_data_bits() -> u8 {
+    8
+}
+fn default_stop_bits() -> u8 {
+    1
+}
+fn default_parity() -> String {
+    "none".to_string()
+}
+
+fn default_flow() -> String {
+    "none".to_string()
+}
+
+/// How a session authenticates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMethod {
+    Password,
+    #[serde(rename = "keyboard-interactive")]
+    KeyboardInteractive,
+    Key,
+}
+
+impl AuthMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthMethod::Password => "password",
+            AuthMethod::KeyboardInteractive => "keyboard-interactive",
+            AuthMethod::Key => "key",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "keyboard-interactive" | "keyboard" | "interactive" => AuthMethod::KeyboardInteractive,
+            "key" => AuthMethod::Key,
+            _ => AuthMethod::Password,
+        }
+    }
+}
+
+/// A single saved SSH target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: AuthMethod,
+    #[serde(default)]
+    pub password: Secret,
+    #[serde(default)]
+    pub private_key_path: String,
+    #[serde(default)]
+    pub private_key_inline: Secret,
+    /// Optional outbound proxy, e.g. "socks5://127.0.0.1:1080" or
+    /// "http://user:pass@host:8080". Empty = use $ALL_PROXY, else direct.
+    #[serde(default)]
+    pub proxy: String,
+    /// Optional SSH jump host (bastion): the id of another saved SSH session to
+    /// tunnel this connection through, like OpenSSH's ProxyJump. Empty = direct.
+    /// Single hop only; the jump session supplies its own host/user/auth (#211).
+    #[serde(default)]
+    pub jump_session_id: String,
+    #[serde(default)]
+    pub last_used: Option<String>,
+    /// Optional folder/group name to organize sessions in the list (#41).
+    /// Empty = ungrouped. Sessions are grouped by this in Quick Connect.
+    #[serde(default)]
+    pub group: String,
+
+    // --- Transport ----------------------------------------------------------
+    /// SSH (default), Serial, or Telnet. Absent in old config files → Ssh.
+    #[serde(default)]
+    pub kind: SessionKind,
+
+    // --- Serial-only fields (ignored unless kind == Serial) -----------------
+    /// Serial device path, e.g. "COM3" (Windows) or "/dev/ttyUSB0" (Linux).
+    #[serde(default)]
+    pub serial_port: String,
+    #[serde(default = "default_baud")]
+    pub baud_rate: u32,
+    #[serde(default = "default_data_bits")]
+    pub data_bits: u8,
+    #[serde(default = "default_stop_bits")]
+    pub stop_bits: u8,
+    /// "none" | "odd" | "even".
+    #[serde(default = "default_parity")]
+    pub parity: String,
+    /// "none" | "hardware" | "software".
+    #[serde(default = "default_flow")]
+    pub flow_control: String,
+
+    // --- SSH port forwarding / tunnels (#56) --------------------------------
+    /// Tunnels established automatically when this SSH session connects.
+    #[serde(default)]
+    pub forwards: Vec<PortForward>,
+
+    /// Skip the shell-integration setup (the cwd-follow PROMPT_COMMAND hook + the
+    /// remote resource monitor). Those assume a POSIX shell; on a Windows server
+    /// whose shell is pwsh/cmd the injected hook breaks the shell. Turn this on
+    /// for such servers (#140).
+    #[serde(default)]
+    pub disable_shell_integration: bool,
+    /// Free-form note for this session — somewhere to stash extra info (jump-host
+    /// details, credentials hints, owner, etc.). Shown only in the edit dialog.
+    /// (B站 suggestion)
+    #[serde(default)]
+    pub note: String,
+}
+
+/// One SSH tunnel (#56). `kind` is "local" (-L), "remote" (-R) or
+/// "dynamic" (-D / SOCKS5). For local/remote, `host:host_port` is the target;
+/// for dynamic it is ignored (the SOCKS client picks the destination).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PortForward {
+    pub kind: String,
+    /// Optional label to tell rules apart (#100). Empty = unnamed.
+    #[serde(default)]
+    pub name: String,
+    /// Listener bind address (local side for L/D, remote side for R).
+    /// Empty → 127.0.0.1.
+    #[serde(default)]
+    pub bind_addr: String,
+    pub bind_port: u16,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub host_port: u16,
+}
+
+impl Session {
+    pub fn new_empty() -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name: String::new(),
+            host: String::new(),
+            port: 22,
+            user: "root".into(),
+            auth: AuthMethod::Password,
+            password: Secret::default(),
+            private_key_path: String::new(),
+            private_key_inline: Secret::default(),
+            proxy: String::new(),
+            jump_session_id: String::new(),
+            last_used: None,
+            group: String::new(),
+            kind: SessionKind::Ssh,
+            serial_port: String::new(),
+            baud_rate: default_baud(),
+            data_bits: default_data_bits(),
+            stop_bits: default_stop_bits(),
+            parity: default_parity(),
+            flow_control: default_flow(),
+            forwards: Vec::new(),
+            disable_shell_integration: false,
+            note: String::new(),
+        }
+    }
+}

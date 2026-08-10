@@ -1,21 +1,3 @@
-> [!IMPORTANT]
-> ## Changes in this fork
->
-> This fork is based on upstream [`jeff141/meatshell` v0.6.6](https://github.com/jeff141/meatshell/releases/tag/v0.6.6) and adds these behavior changes:
->
-> - Restores the last windowed size and maximized state, clamping invalid geometry to the current display.
-> - Lets the resource sidebar stay pinned to the local machine or a selected SSH session.
-> - Adds live settings for local (1-30 seconds) and remote SSH (1-60 seconds) resource refresh intervals; connected SSH sessions do not need to reconnect.
-> - Restores the process monitor as an in-app dialog to fix the blank Windows strip, with BusyBox `top`/`ps` fallbacks for Alpine and OpenWrt.
-> - Preserves UTF-8 characters split across SSH packets, preventing duplicated or displaced btop/htop rows at 100 ms refresh intervals.
-> - Collapses Windows clipboard `CRLF` to one terminal return when pasting multi-line commands into Bash over SSH, preserving backslash continuations.
-> - Selects `M` or `G` for each memory value independently, for example `700M/2.8G`.
-> - Shows a light `root` placeholder for blank SSH usernames and uses `root` when saving or connecting.
-> - Adds an opt-in, loopback-only local AI/debug API with Bearer authentication. Its token is encrypted at rest and saved credentials are never exposed; see the [Debug API documentation](docs/debug-api.md).
-> - Temporarily builds Windows x64 only. Every push to `main` updates the rolling `nightly` Release; Linux and macOS builds remain disabled.
->
-> Future upstream changes do not automatically include these patches, so they must be retained or adapted when merging upstream.
-
 # meatshell
 
 [简体中文](./README.md) | **English**
@@ -40,15 +22,13 @@ the tens-of-MB range of a native binary.
 
 ## Download & install
 
-This fork currently builds **Windows x64 only**. Every push to `main` updates the
-[Windows x64 nightly](https://github.com/bailangvvkruner/meatshell/releases/tag/nightly),
-while a `v*` tag publishes the corresponding formal release. Linux and macOS
-builds are currently disabled.
+Every `v*` tag triggers a GitHub Actions build that produces native binaries for
+**Windows / Linux / macOS**, published on the
+[Releases](https://github.com/jeff141/meatshell/releases) page.
 
 ### Windows
 
-Download `meatshell-*-windows-x86_64.zip`, unzip, and run `meatshell.exe`. If the
-same Release also provides an `.msi`, you can use that installer instead.
+Download `meatshell-*-windows-x86_64.zip`, unzip, and run `meatshell.exe`.
 
 ### Linux
 
@@ -121,7 +101,6 @@ open /Applications/meatshell.app
 - [x] Session passwords encrypted at rest (ChaCha20-Poly1305)
 - [x] Known-hosts (`known_hosts`) verification + first-connect confirmation
 - [x] Split panes for tabbed terminals
-- [x] Opt-in local AI / Debug API with Bearer authentication ([API guide](docs/debug-api.md))
 
 Color emoji graphics are provided by [Twemoji](https://github.com/jdecked/twemoji)
 under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See

@@ -1,21 +1,3 @@
-> [!IMPORTANT]
-> ## 本分支相对上游的增强
->
-> 本分支基于上游 [`jeff141/meatshell` v0.6.6](https://github.com/jeff141/meatshell/releases/tag/v0.6.6)，主要补丁和行为差异如下：
->
-> - 记住并恢复上次关闭时的窗口尺寸与最大化状态，同时校正超出当前显示器的窗口尺寸。
-> - 资源侧栏支持固定当前本机或 SSH 会话，不会在切换标签页时自动改变数据来源。
-> - 设置中可分别调整本机（1-30 秒）和远端 SSH（1-60 秒）资源刷新间隔，修改后实时生效，已连接的 SSH 会话无需重连。
-> - 将进程监视器恢复为主窗口内弹窗，修复 Windows 上的空白窄条；进程采集兼容 Alpine/OpenWrt 的 BusyBox `top`/`ps`。
-> - 修复 SSH 高频 UTF-8 输出跨网络分包时的字符破坏，避免 btop/htop 以 100ms 刷新时因框线字符扩宽而重复行、错行。
-> - 修复 Windows 剪贴板通过 SSH 向 Bash 粘贴 `CRLF` 多行命令时产生双换行，保留反斜杠续行命令的完整结构。
-> - 内存已用量与总量分别选择单位，小于 1 GiB 的数值使用 `M`，例如 `700M/2.8G`。
-> - 新建 SSH 会话时，用户名留空会以浅色 `root` 提示，并在保存或连接时自动使用 `root`。
-> - 增加默认关闭、仅监听 `127.0.0.1`、使用 Bearer Token 鉴权的本机 AI / 调试接口；Token 加密保存，接口不读取已保存的凭据，详见 [Debug API 文档](docs/debug-api.md)。
-> - 发布流程暂时只构建 Windows x64；每次推送 `main` 都会更新滚动的 `nightly` Release，Linux 和 macOS 构建保持禁用。
->
-> 上游后续更新不会自动包含这些补丁；合并上游时需要保留或重新适配上述差异。
-
 # meatshell
 
 **简体中文** | [English](./README.en.md)
@@ -39,13 +21,12 @@ JVM 压到几十 MB 原生级别。
 
 ## 下载与安装
 
-本分支暂时只构建 **Windows x64**。每次推送 `main` 都会更新
-[Windows x64 nightly](https://github.com/bailangvvkruner/meatshell/releases/tag/nightly)；
-推送 `v*` 标签时会发布对应正式版本。Linux 与 macOS 构建目前保持禁用。
+每次打 `v*` 标签，GitHub Actions 会自动构建 **Windows / Linux / macOS** 三平台二进制，
+发布到 [Releases](https://github.com/jeff141/meatshell/releases) 页面。
 
 ### Windows
 
-下载 `meatshell-*-windows-x86_64.zip`，解压后双击 `meatshell.exe`；若同一 Release 提供 `.msi`，也可以使用安装包。
+下载 `meatshell-*-windows-x86_64.zip`，解压后双击 `meatshell.exe`。
 
 ### Linux
 
@@ -115,7 +96,6 @@ open /Applications/meatshell.app
 - [x] 会话密码加密存储（ChaCha20-Poly1305）
 - [x] 已知主机（`known_hosts`）校验 + 首次连接确认
 - [x] 多标签页终端分屏
-- [x] 可开关的本机 AI / 调试接口（Bearer 鉴权，见 [调用说明](docs/debug-api.md)）
 
 彩色 emoji 图形来自 [Twemoji](https://github.com/jdecked/twemoji)，按
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 使用；完整署名见

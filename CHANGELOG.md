@@ -5,57 +5,144 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
-### 新增 / Added
+## [0.6.10] - 2026-08-05
 
-- **Windows 默认启用可切换的 D3D11 硬件加速。** Windows x86-64 现在优先使用随包分发的 ANGLE EGL/FemtoVG GPU 路径；设置 → 界面新增默认开启的“硬件加速”开关，切换后会保存设置并无控制台窗口地立即重启，软件渲染仍作为兼容回退。调试接口会分别报告渲染器、GPU 状态、ANGLE 是否实际加载及当前终端调度间隔。
-- **为密集终端加入有界行图像缓存。** btop 等全屏 TUI 会在后台线程中仅重绘签名变化的行，并以行纹理交给 GPU 合成；每个标签最多保留一个待处理帧，过期代次会被丢弃，像素池、字形缓存和 shaping 缓存均有上限。普通 shell 继续使用低内存文本路径，离开 TUI 后释放行纹理，并在空闲 10 秒后回收堆、工作集与 D3D11 缓存。
-- **完善本地鉴权调试接口。** 新增无需切换前台即可获取当前渲染窗口 PNG 的截图接口，并在健康信息中公开构建类型、可执行文件大小、工作集/私有提交量、GPU 后端及空闲内存回收诊断；截图、输入和屏幕读取均有限流或大小上限，JSON 显式声明 UTF-8 以兼容 Windows PowerShell 5 的终端框线与中文解码，接口仍只监听回环地址且必须使用 Bearer token。
+- **修复关闭“欢迎页设为侧栏”时闪退（#323）。** 欢迎页在侧栏与标签页之间切换时，分屏模型现在会延迟到下一次界面事件循环再刷新，并跳过尺寸和内容均未变化的重复更新，避免 Windows 下递归重建界面导致当前进程及后续启动闪退。
+- **Fix crashes when disabling “Welcome page as sidebar” (#323).** Switching the welcome page between sidebar and tab mode now defers pane-model rebuilding to the next UI event-loop turn and skips unchanged model updates, preventing recursive UI reconstruction on Windows during the toggle and subsequent launches.
+
+- **修复快速连接中重复的 system 分组和空白右键菜单（#316、#324）。** 内置 `system` 与隐式 `default` 现在统一视为保留分组，不再出现在服务器的“移动到”目标中，也无法通过新建、重命名、编辑或导入写入；新建或重命名为已有分组时会保留弹窗并提示“分组已存在”。升级时会自动把旧版本误放进 `system` 的服务器迁回 `default`。内置终端行改用显式标记识别，包括空密码 SSH 会话在内的普通服务器不会再因组名碰撞而隐藏右键操作。
+- **Fix duplicate system groups and empty context menus in Quick Connect (#316, #324).** The built-in `system` and implicit `default` groups are now reserved across move, create, rename, edit, and import paths. Creating or renaming to an existing group keeps the dialog open and reports that the group already exists. Existing servers accidentally filed under `system` are migrated back to `default`, while explicit built-in-row markers prevent ordinary servers, including passwordless SSH sessions, from losing their context-menu actions due to a group-name collision.
+
+- **回复终端状态与设备属性查询（#328）。** 远端程序发送 DSR 状态/光标位置查询或 DA1 主设备属性查询时，MeatShell 现在会立即向 PTY 返回对应的状态、CPR 光标坐标或保守的 VT100 能力标识；查询序列即使被拆分到多个 SSH 输出块也能正确识别，依赖终端握手的交互式程序不再等待超时或卡死。
+- **Respond to terminal status and device-attribute queries (#328).** MeatShell now immediately returns status, CPR cursor coordinates, or a conservative VT100 identity when remote programs issue DSR or primary DA1 queries. Split query sequences are recognized across SSH output chunks, preventing interactive applications that rely on terminal handshakes from timing out or hanging.
+
+- **修复内置编辑器打开大文件时崩溃，并调整历史命令排序（#331）。** 内置查看/编辑现在采用有界读取，并在文件超过 512 KB、行数过多或存在超长单行时安全拒绝并引导使用外部打开/编辑；历史命令弹窗改为从新到旧显示，同时保留输入框 ↑/↓ 的原有回溯顺序。
+- **Prevent large-file editor crashes and reorder command history (#331).** Built-in viewing/editing now uses bounded reads and safely redirects files over 512 KB, excessive line counts, or exceptionally long lines to external tools. The history popup now lists newest commands first while preserving the input field's existing ↑/↓ recall order.
+
+- **修复 zsh 中 Home 和 End 按键无效（#329）。** 远端 shell 启用应用光标模式时，Home/End 现在会像方向键一样改用对应的 SS3 控制序列，恢复 oh-my-zsh/ZLE 中的行首和行尾移动。
+- **Fix Home and End keys in zsh (#329).** When the remote shell enables application cursor mode, Home/End now use their corresponding SS3 sequences like the arrow keys, restoring beginning/end-of-line movement in oh-my-zsh/ZLE.
+
+- **Linux 支持选择界面渲染器（#330）。** “设置 → 界面 → 渲染”现在可选择自动、GPU 与软件模式，默认继续使用 Slint 自动选择；设置在重启 MeatShell 后生效，`SLINT_BACKEND` 环境变量仍具有最高优先级。
+- **Select the UI renderer on Linux (#330).** Settings → Interface → Rendering now offers Automatic, GPU, and Software modes while retaining Slint's automatic selection by default. Changes apply after restarting MeatShell, and `SLINT_BACKEND` keeps the highest priority.
+
+## [0.6.9] - 2026-07-31
+
+### OpenWrt SSH shell integration fix / OpenWrt SSH shell 集成修复
+
+- **修复 OpenWrt SSH 登录时泄露并卡在 shell 集成初始化命令的问题（#314、#317）。** 连接现在先通过独立的非交互 SSH 通道识别远端 shell，只向真正支持该集成的 Bash/Zsh 会话发送提示符钩子；BusyBox ash、fish 与未知 shell 不再收到 `test -z \"$FISH_VERSION\" ...` 长命令。
+- **Prevent shell-integration setup from leaking or hanging OpenWrt SSH sessions (#314, #317).** MeatShell now identifies the remote shell through a separate non-interactive SSH channel and sends the prompt hook only to Bash/Zsh; BusyBox ash, fish, and unknown shells no longer receive the long `test -z \"$FISH_VERSION\" ...` command.
 
 ### 修复 / Fixed
 
-- **修复 Windows 向远程 Bash 粘贴多行命令时出现双换行。** bracketed paste 现在会把剪贴板中的 `CRLF` 折叠为单个终端回车，同时保留原有的单独 `LF` 和 `CR`；带反斜杠续行的 Docker 等命令不再被空行提前截断。
-- **避免错误密码触发重复 SSH 认证并导致账户锁定。** `password` 被服务器拒绝后，仅当服务端明确提供 `keyboard-interactive` 时才切换认证方式；仅提供 `publickey,password` 的 OpenSSH 服务器会直接弹出重输密码窗口，不再为同一个密码新建连接并额外失败一次。密码已部分成功且要求 MFA 的服务器会保留当前连接继续完成二次认证。
-- **SSH 密码被服务器拒绝后可直接重新输入。** 正式终端、独立 SFTP 连接和跳板机现在共用同一套认证流程；已保存密码失效时会弹出明确的认证失败对话框，允许输入并选择保存新密码，而不是直接关闭会话。每次重试都使用全新 SSH 连接以避免 russh 在失败连接上切换认证方式时挂起，并限制为最多三次重输，取消或 UI 通道关闭时立即结束等待。
-- **修复 GPU 启动内存在快速进入 btop 后长期停留在 100 MiB 以上。** Windows GPU 路径现在会在启动约 2 秒后执行一次不可被密集终端推迟的初始化工作集回收；后续回收仍只在所有密集终端退出并空闲 10 秒后进行，避免持续渲染时反复换页。实测同一配置的私有工作集由启动 `120.6 MiB` 在 `3.4 s` 降至 `10.1 MiB`，之后稳定在 `10–12 MiB`，ANGLE/D3D11 GPU 活动保持正常。
-- **修复远程 Linux SSH 中 btop 双击只选中进程而不打开详情。** SSH 鼠标按下事件现在至少间隔 120 ms，等待期间仍持续读取远端输出；调试接口的双击也拆成两组完整 press/release 发送。该节流仅位于 SSH 传输路径，本地终端、串口和 Telnet 保持原样，不包含 Windows btop 适配。
-- **修复密集终端切换与输入擦除后的旧帧残留。** 新输入、退格、光标移动及从全屏 TUI 返回 shell 时会先显示当前权威文本帧，旧的异步行图像不能覆盖较新的稀疏终端状态；窗口恢复、字体/DPI 与尺寸变化会使旧纹理代次失效并完整重建。
+- **修复终端粘贴、命令框、光标、选区与回滚历史问题（#319）。** 括号粘贴现在也会把 Windows CRLF 规范化为单个终端换行，命令框保留多行 heredoc 的原始换行；Vim/nano 的竖线光标不再右移，事件积压时真实 Backspace 不再被实时键状态误判，按键时会恢复光标可见；普通单击不再复制字符，`ESC[3J` 同时清除 MeatShell 自己维护的回滚与重放缓存。
+- **修复 macOS 下 `Ctrl+X` 在 nano 中错误打开搜索的问题（#312）。** Slint 在 macOS 上会先把单独按下的物理 Control 键报告为控制键标记，再发送组合键字符；程序现在会在平台事件边界过滤该标记，只把随后的真实 `Ctrl+X` 控制字符发送到 PTY，同时保持 Command 应用快捷键与其他平台行为不变。
+- **改善超大终端输出的渐进显示与响应性（#311）。** 持续输出现在按累计字节预算、在完整输出块边界提交 UI 快照，并用可等待的请求代次消除丢失通知和重复渲染；当事件积压过大或夹有连接状态事件时会优先追赶队列，避免节奏等待造成内存增长或延迟 `Connected` / `Closed`。隐藏标签、标签关闭及事件循环退出均不会让输出泵固定空等。
 
-### 安全 / Security
+---
 
-- **升级 SSH 栈并阻断已知远程拒绝服务路径。** `russh` 升级到 0.62.2 的 Ring 后端并保留 RSA、压缩与旧服务器兼容算法，移除旧 `russh-keys`；发布工作流在上传任何 nightly/release 产物前运行 RustSec，Dependabot 每周检查 Cargo 与 GitHub Actions，例外及可达性记录在 `docs/security-audit.md`。
+### Fixed
 
-### 构建 / Build
+- **Fix terminal paste, command bar, cursor, selection, and scrollback behavior (#319).** Bracketed paste now normalizes Windows CRLF to one terminal newline, while the command bar preserves multiline heredocs. Vim/nano bar cursors no longer shift right, genuine Backspace events survive delayed dispatch, keyboard input restores cursor visibility, plain clicks no longer copy a character, and `ESC[3J` clears MeatShell's own scrollback and replay buffers.
+- **Fix `Ctrl+X` opening search instead of exiting nano on macOS (#312).** Slint reports a standalone physical Control press as a modifier marker on macOS before delivering the chord character. MeatShell now filters that marker at the platform event boundary and forwards only the real `Ctrl+X` control character to the PTY, without changing Command shortcuts or other platforms.
+- **Improve progressive rendering and responsiveness under very large terminal output (#311).** Sustained output now commits UI snapshots at complete output-chunk boundaries after a cumulative byte budget, while generation-based wait tickets eliminate lost notifications and redundant renders. A large event backlog or pending connection-state event switches to catch-up mode so pacing cannot inflate memory use or delay `Connected` / `Closed`; hidden tabs, tab closure, and event-loop shutdown no longer cause repeated timeout waits.
 
-- **修复 nightly MSI 显示成功却保留旧附件。** ANGLE 安装文件已合并到唯一的 WiX 源，避免 `angle.wxs` 被重复编译；MSI 构建、artifact 上传和 Release 附件现在都是强制门禁，文件缺失或生成失败会直接使工作流失败。
-- **升级并固定最新编译链。** 仓库与 GitHub Actions 统一使用 Rust 1.97.0，Slint 全组件升级到 1.17.1，Windows Skia 升级到 0.99.0，并刷新锁文件内所有兼容版本依赖；项目实际最低 Rust 版本同步为 1.92。
-- **修复分支云构建打包失败。** workflow 手动构建含 `/` 的分支名时会先将路径分隔符转换为 `-`，避免创建 Windows、Linux 或 macOS 产物目录时报错；非 Windows 二进制版本校验改为读取包版本，不再把分支名误当版本号。
+### 改进 / Changed
+
+- **快速连接分组默认收起并记住展开状态。** 首次启动时快速连接中的系统与会话目录保持收起；用户展开或收起目录后会立即保存该状态，刷新会话列表及重启应用后仍保持原样。
+
+### 性能 / Performance
+
+- **提升终端鼠标拖选文字的响应速度。** 拖动选区时只刷新轻量选区图层，不再为每次鼠标移动重新生成整块终端文本与样式，长回滚记录下也能即时显示选中内容。
+
+---
+
+### Changed
+
+- **Default Quick Connect groups to collapsed and remember their state.** System and session folders start collapsed, while later expand/collapse choices are saved immediately and survive session-list refreshes and application restarts.
+
+### Performance
+
+- **Improve terminal text-selection responsiveness.** Dragging now refreshes only the lightweight selection overlay instead of rebuilding all terminal text and styling for every mouse movement, keeping selection immediate with long scrollback histories.
+
+## [0.6.8] - 2026-07-26
+
+### 改进 / Changed
+
+- **Windows MSI 会沿用已有安装目录并创建桌面快捷方式（#293）。** 安装程序会优先读取 MeatShell 记录的目录，并可通过旧版主程序组件位置迁移 v0.6.5-v0.6.7 的自定义安装路径；全新安装仍默认使用 `Program Files`。MSI 安装时还会在当前用户桌面创建 MeatShell 快捷方式，卸载时一并移除。
+
+### 修复 / Fixed
+
+- **修复内置壁纸覆盖已保存浅色/深色主题的问题。** 启动时恢复内置壁纸不再根据壁纸亮度强制切换主题，用户选择的浅色或深色模式会在重启后保留；仅在用户主动选择内置壁纸时应用其推荐主题。
+- **修复新建 Telnet 会话的默认端口（#303）。** 从 SSH 或串口切换到 Telnet 时，端口现在会从 SSH 默认值 `22` 自动调整为 Telnet 标准端口 `23`；切回 SSH 时恢复为 `22`，非默认端口保持不变。
+- **修复 AUR 发布工作流校验失败。** 发布步骤现在通过作业环境变量判断所需的 AUR 仓库 Secret 是否完整配置，避免在 `if` 条件中直接引用不受支持的 `secrets` 上下文而导致工作流无法运行。
+- **修复手动产物构建的版本校验。** 从分支手动运行 Release 工作流时改为根据 `Cargo.toml` 校验二进制版本，不再把分支名误当成版本号；手动构建仍只上传工作流产物，不创建 GitHub Release。
+- **修复 Windows 使用 `Ctrl+Space` 切换输入法后 Ctrl 状态残留（#309）。** 当微软输入法把 Ctrl 松开标记为 `VK_PROCESSKEY` 时，程序现在会根据事件保留的左右 Ctrl 物理键信息向 Slint 补齐对应的松开事件；正常终端 Ctrl 快捷键及其他操作系统不受影响。
+
+---
+
+### Changed
+
+- **Preserve the existing Windows MSI install location and add a desktop shortcut (#293).** Setup now prefers MeatShell's recorded directory and can migrate custom v0.6.5-v0.6.7 locations from the legacy executable component; clean installs still default to Program Files. MSI installs also create a MeatShell shortcut on the current user's desktop and remove it during uninstall.
+
+### Fixed
+
+- **Preserve the saved light/dark theme when restoring a built-in wallpaper.** Startup no longer forces a theme from the built-in wallpaper's luminance, so the user's light or dark preference survives a restart. The recommended paired theme is applied only when the user actively selects a built-in wallpaper.
+- **Use the standard Telnet port for new sessions (#303).** Switching from SSH or Serial to Telnet now changes the SSH default `22` to the standard Telnet port `23`; switching back to SSH restores `22`, while non-default ports are preserved.
+- **Fix AUR publishing workflow validation.** The publishing step now checks the required AUR repository secrets through job environment variables, avoiding the unsupported direct use of the `secrets` context in an `if` condition that prevented the workflow from running.
+- **Fix version verification for manually dispatched artifact builds.** Release workflow runs started from a branch now verify the binary against the package version in `Cargo.toml` instead of treating the branch name as a version. Manual builds continue to upload workflow artifacts without creating a GitHub Release.
+- **Fix the Ctrl modifier remaining active after switching the Windows IME with `Ctrl+Space` (#309).** When Microsoft IME labels a Ctrl release as `VK_PROCESSKEY`, the application now uses the retained left/right physical Ctrl identity to deliver the matching release to Slint. Normal terminal Ctrl shortcuts and other operating systems are unaffected.
+
+### 新增 / Added
+
+- **macOS 支持在设置中选择界面渲染器。** “设置 → 界面 → 渲染”现在在 macOS 上提供 FemtoVG 和 Skia 两种后端，遇到文字缺失或显示异常时可以直接切换，重启 MeatShell 后生效；`SLINT_BACKEND` 环境变量仍优先于界面设置。
+- **支持使用快捷键循环切换标签页（#294）。** `Ctrl+Tab` 切换到当前分栏的下一个标签页，`Ctrl+Shift+Tab` 切换到上一个，并在首尾循环；macOS 使用物理 Control 键。快捷键面板新增“标签页”分组并列出两项操作。
+
+### 修复 / Fixed
+
+- **修复 SSH 内部初始化命令污染远端历史（#289）。** Shell integration 初始化完成后会主动清理当前初始化项及旧版本残留，不再依赖远端是否启用 `HISTCONTROL=ignorespace`；迟到回显过滤也只在连接初始化阶段生效，切换标签页后按上键不会再召回内部命令、清空终端行或破坏首屏内容。
+- **修复 SSH 会话中 Bash 历史命令重绘错位（#289）。** 隐藏 shell integration 初始化命令后会主动复位并清空当前终端行，使本地 VT 光标与远端 PTY 重新同步；在 Debian 等桌面系统中使用上下方向键浏览历史时，提示符和命令不再相互重叠或依次拼接。
+
+### 性能 / Performance
+
+- **优化大容量终端回滚历史（#290）。** 终端历史缓冲改用双端队列；超过 100,000 行上限时从队首逐行回收，不再通过 `Vec::drain` 搬移全部剩余记录，持续输出大量内容时的裁剪开销更加稳定。
 
 ---
 
 ### Added
 
-- **Enable switchable D3D11 acceleration by default on Windows.** Windows x86-64 now prefers the bundled ANGLE EGL/FemtoVG GPU path. Settings > Interface exposes a default-on Hardware Acceleration toggle; changing it persists the setting and immediately restarts without a console window, while software rendering remains the compatibility fallback. Debug health reports the renderer, GPU status, actual ANGLE loading, and terminal scheduling interval separately.
-- **Add a bounded row-image cache for dense terminals.** Full-screen TUIs such as btop rasterize only rows whose signatures changed on a worker and submit row textures for GPU composition. Each tab retains at most one pending frame, obsolete generations are discarded, and pixel, glyph, and shaping caches are bounded. Sparse shells retain the lower-memory text path; leaving a TUI releases row textures and a ten-second idle pass reclaims heap, working-set, and D3D11 caches.
-- **Expand the authenticated local Debug API.** Tools can capture the currently rendered window as PNG without taking focus, while health now exposes build type, executable size, working/private memory, renderer state, and idle-trim diagnostics. Screenshot, input, and screen routes are bounded or rate-limited, and JSON explicitly declares UTF-8 so terminal box drawing and CJK text decode correctly in Windows PowerShell 5. The server remains loopback-only and requires a Bearer token.
+- **Select the UI renderer from Settings on macOS.** Settings → Interface → Rendering now offers the FemtoVG and Skia backends on macOS, allowing users to switch when text is missing or rendered incorrectly. Changes apply after restarting MeatShell, and `SLINT_BACKEND` continues to override the saved setting.
+- **Add keyboard shortcuts for cycling tabs (#294).** `Ctrl+Tab` selects the next tab in the focused pane, while `Ctrl+Shift+Tab` selects the previous one, wrapping at both ends; macOS uses the physical Control key. The shortcuts panel now includes both actions in a dedicated Tabs section.
 
 ### Fixed
 
-- **Fix doubled newlines when pasting multi-line commands from Windows into remote Bash.** Bracketed paste now collapses clipboard `CRLF` to one terminal return while preserving existing lone `LF` and `CR` input, so backslash-continued commands such as Docker invocations are no longer terminated by blank lines.
-- **Avoid duplicate SSH failures and account lockout after a rejected password.** MeatShell now falls back from `password` only when the server explicitly advertises `keyboard-interactive`. OpenSSH servers offering only `publickey,password` immediately show the password re-entry dialog instead of reconnecting and failing the same password a second time. Servers that partially accept the password and require MFA continue on the existing connection to complete the second factor.
-- **Re-prompt after the server rejects an SSH password.** Terminal, dedicated SFTP, and jump-host connections now share one authentication flow. When a saved password is stale, a dedicated authentication-failed dialog accepts and can persist a replacement instead of immediately closing the session. Every retry uses a fresh SSH transport to avoid russh hanging while switching methods on a rejected connection, re-prompts are capped at three, and cancellation or a closed UI channel ends the wait immediately.
-- **Fix GPU startup memory remaining above 100 MiB when btop is opened quickly.** The Windows GPU path now performs one initialization working-set trim about two seconds after startup that a dense terminal cannot defer. Later trims still wait until all dense terminals have exited and remained idle for ten seconds, avoiding repeated paging during continuous rendering. With the same configuration, private working set fell from `120.6 MiB` at startup to `10.1 MiB` at `3.4 s`, then remained at `10–12 MiB` while ANGLE/D3D11 GPU activity continued normally.
-- **Fix btop double-click selecting a process instead of opening details over Linux SSH.** SSH pointer presses are now at least 120 ms apart while remote output continues to be read, and Debug API double clicks are split into two complete press/release batches. Pacing is confined to SSH transport; local terminals, serial, and Telnet remain pass-through, with no Windows btop compatibility layer.
-- **Fix stale dense-terminal frames covering input and erase updates.** New text, backspace, cursor movement, and the transition from a full-screen TUI to a shell expose the authoritative text frame before asynchronous row images; an old image generation cannot cover newer sparse state. Restore, font/DPI, and resize transitions invalidate and rebuild old textures.
+- **Prevent SSH shell setup from polluting remote history (#289).** Shell integration now removes both its current initialization entry and leftovers from older versions from Bash history instead of relying on the remote `HISTCONTROL=ignorespace` setting. Late-echo filtering is limited to connection setup, so pressing Up after switching tabs no longer recalls internal commands, clears terminal rows, or damages the initial screen.
+- **Fix misaligned Bash history repainting in SSH sessions (#289).** After hiding the shell-integration setup command, MeatShell now resets and clears the current terminal row to resynchronize the local VT cursor with the remote PTY. Browsing history with the arrow keys on Debian and other desktops no longer overlaps the prompt or appends recalled commands beside one another.
 
-### Security
+### Performance
 
-- **Upgrade the SSH stack and block known remote denial-of-service paths.** `russh` is upgraded to 0.62.2 with the Ring backend while retaining RSA, compression, and legacy-server algorithms, and the old `russh-keys` dependency is removed. Release workflows run RustSec before uploading nightly or release artifacts, Dependabot checks Cargo and GitHub Actions weekly, and narrowly scoped exceptions are documented in `docs/security-audit.md`.
+- **Optimize large terminal scrollback histories (#290).** The terminal history buffer now uses a double-ended queue. Once the 100,000-line cap is reached, old rows are reclaimed from the front without shifting every retained row through `Vec::drain`, keeping pruning costs stable during sustained high-volume output.
 
-### Build
+## [0.6.7] - 2026-07-25
 
-- **Fix nightly MSI jobs succeeding while retaining a stale release asset.** ANGLE installer files now live in the single WiX source instead of compiling `angle.wxs` twice. MSI creation, artifact upload, and Release attachment are required gates, so a missing or failed installer now fails the workflow.
-- **Update and pin the current build toolchain.** The repository and GitHub Actions now use Rust 1.97.0, all Slint components use 1.17.1, Windows Skia uses 0.99.0, and the lockfile contains the latest compatible dependency versions. The effective MSRV is now 1.92.
-- **Fix packaging for cloud builds from branches.** Workflow runs now replace `/` in branch names with `-` before creating Windows, Linux, or macOS artifact paths. Non-Windows version checks read the Cargo package version instead of treating the branch name as a version.
+### 新增 / Added
+
+- **Windows 支持选择界面渲染器（#280）。** “设置 → 界面 → 渲染”新增自动、GPU 与软件三种模式；自动模式直接使用 Slint 的渲染器初始化与软件回退机制，不额外扫描显卡或启动检测窗口。现有安装继续默认使用软件渲染以保留高分屏、虚拟机和远程桌面的兼容性，设置将在下次启动时生效，`SLINT_BACKEND` 环境变量仍可用于诊断覆盖。
+
+### 改进 / Changed
+
+- **按业务功能重组源码目录。** 除 `main.rs` 与 `app.rs` 外，配置、终端、SSH、SFTP、布局、资源监控等 Rust 模块均迁入 `src/<功能>/` 业务包；数据结构放入 `struct/`，实现放入 `impls/`，并由各包的 `mod.rs` 提供统一入口，减少根目录文件和跨模块维护成本。
+
+---
+
+### Added
+
+- **Add selectable UI renderers on Windows (#280).** Settings → Interface → Rendering now offers Automatic, GPU, and Software modes. Automatic relies directly on Slint's renderer initialization and software fallback without scanning the GPU or opening a probe window. Existing installations keep software rendering as the compatibility default for high-DPI displays, virtual machines, and remote desktops. Changes apply on the next launch, while `SLINT_BACKEND` remains available as a diagnostic override.
+
+### Changed
+
+- **Reorganize source files into feature-oriented packages.** Rust modules other than `main.rs` and `app.rs` now live under `src/<feature>/`, covering configuration, terminal, SSH, SFTP, layout, resource monitoring, and other features. Data structures live in `struct/`, implementations in `impls/`, and each package exposes a focused `mod.rs` facade.
+
+
 ## [0.6.6] - 2026-07-23
 
 ### 新增 / Added
@@ -81,6 +168,7 @@ All notable changes are documented here. 本文件记录所有重要变更。
 - **Fix click offsets after restoring a window on KDE Wayland (#286).** Wayland now uses the startup size actually configured by the compositor instead of requesting restoration through advisory-only window sizing, keeping rendered content aligned with pointer coordinates.
 - **Simplify session port-forward rule editing (#277).** Port forwards now use a directly savable multi-row form. Add only creates another input row, and every completed rule is validated and persisted together on save instead of showing separate pending and added-rule interfaces.
 - **Fix text fields becoming unusable after switching IMEs on Windows (#236).** Username, password, and other text fields continue accepting input after repeatedly switching between Chinese and English input methods.
+
 ## [0.6.5] - 2026-07-17
 
 ### 新增 / Added

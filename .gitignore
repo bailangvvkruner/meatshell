@@ -1,16 +1,6 @@
 /target
-/target-*
-/artifacts/
-/config/
-/log/
-# Local copies produced while reproducing the release-packaging workflow.
-/meatshell-*/
-/meatshell-*.zip
-/meatshell-*.tar.gz
-/meatshell-*.msi
-*.dmp
+Cargo.lock
 *.rs.bk
-*.profraw
 .DS_Store
 /.vscode
 /.idea
