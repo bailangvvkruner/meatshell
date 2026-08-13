@@ -13,9 +13,14 @@ pub(super) fn resolve_jump(store: &Rc<RefCell<ConfigStore>>, session: &Session) 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
 /// already-registered tab. Used by the initial connect and by in-place
 /// reconnect (#79); the tab/terminal/parser must already exist.
-pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
+pub(super) fn start_session_in_tab(
+    tab_id: &str,
+    session: Session,
+    ctx: &ConnectCtx,
+    initial_cols: u32,
+    initial_rows: u32,
+) {
     let has_sftp = session.kind == SessionKind::Ssh;
-    let (initial_cols, initial_rows) = *ctx.last_term_size.lock().unwrap();
     // Resolve the optional SSH jump host now (on the UI thread, where the store
     // lives) so the owned Session can be handed to the worker threads (#211).
     let jump = resolve_jump(&ctx.store, &session);

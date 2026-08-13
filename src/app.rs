@@ -526,6 +526,12 @@ pub fn run() -> Result<()> {
     // size to spawn_session before the first resize callback fires.
     // Default: 80 cols × 24 rows (SSH spec minimum).
     let last_term_size: Arc<Mutex<(u32, u32)>> = Arc::new(Mutex::new((80, 24)));
+    // A new terminal can emit its first real grid size while Slint is still
+    // constructing the model row, before its TermBuffer/SessionHandle exists.
+    // Keep that size per tab so the delayed session start cannot fall back to
+    // the parser's old 80x24 dimensions (#btop-wrap).
+    let pending_initial_term_sizes: Rc<RefCell<HashMap<String, (u32, u32)>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
     // --- Build window + models ------------------------------------------
     // Set the Wayland app_id / X11 WM_CLASS *before* the window is created so
@@ -1712,6 +1718,7 @@ pub fn run() -> Result<()> {
         render_gates.clone(),
         runtime.clone(),
         last_term_size.clone(),
+        pending_initial_term_sizes.clone(),
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
         tab_statuses.clone(),
@@ -2063,6 +2070,7 @@ pub fn run() -> Result<()> {
         splitters_model.clone(),
         handles.clone(),
         bufs.clone(),
+        pending_initial_term_sizes.clone(),
         render_gates.clone(),
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
@@ -2076,6 +2084,7 @@ pub fn run() -> Result<()> {
         handles.clone(),
         bufs.clone(),
         last_term_size.clone(),
+        pending_initial_term_sizes.clone(),
         store.clone(),
         ConnectCtx {
             weak: window.as_weak(),
@@ -2088,7 +2097,6 @@ pub fn run() -> Result<()> {
             tab_statuses: tab_statuses.clone(),
             local_snap: local_snap.clone(),
             local_net_hist: local_net_hist.clone(),
-            last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
             remote_resource_refresh: remote_resource_refresh.clone(),
             store: store.clone(),
@@ -3223,6 +3231,7 @@ fn wire_session_callbacks(
     render_gates: RenderGates,
     runtime: Arc<Runtime>,
     last_term_size: Arc<Mutex<(u32, u32)>>,
+    pending_initial_term_sizes: Rc<RefCell<HashMap<String, (u32, u32)>>>,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
     tab_statuses: TabStatuses,
@@ -4051,6 +4060,7 @@ fn wire_session_callbacks(
         let render_gates = render_gates.clone();
         let runtime = runtime.clone();
         let last_term_size = last_term_size.clone();
+        let pending_initial_term_sizes = pending_initial_term_sizes.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
         let tab_statuses = tab_statuses.clone();
@@ -4077,6 +4087,10 @@ fn wire_session_callbacks(
             };
             let tab_id = format!("term-{}", uuid::Uuid::new_v4());
             let tab_title = session.name.clone();
+            // Snapshot the last visible grid for the local parser and remote
+            // PTY. The first resize callback is debounced, so a hard-coded
+            // 80x24 parser could decode the initial frame at another width.
+            let (initial_cols, initial_rows) = *last_term_size.lock().unwrap();
 
             // Connection label shown in the sidebar / status line, per transport.
             let conn_label = match session.kind {
@@ -4179,9 +4193,9 @@ fn wire_session_callbacks(
                 sftp_panel_width: sftp_w_default,
                 sftp_saved_height: sftp_h_default,
             });
-            // Create vt100 parser for this tab (default 24×80; resized on first
-            // terminal-resize callback). 5000-line scrollback is stored for
-            // future scroll-navigation support.
+            // Create vt100 parser with the same initial grid requested from the
+            // transport. The first terminal-resize callback is debounced, so
+            // decoding a full-screen btop frame at another width wraps it.
             let is_dark_now = weak.upgrade().map(|w| w.get_dark_mode()).unwrap_or(true);
             let (output_highlight, custom_highlight_rules) = {
                 let settings = store.borrow();
@@ -4196,7 +4210,11 @@ fn wire_session_callbacks(
             bufs.lock().unwrap().insert(
                 tab_id.clone(),
                 Arc::new(Mutex::new(TermBuffer {
-                    parser: vt100::Parser::new(24, 80, 5000),
+                    parser: vt100::Parser::new(
+                        initial_rows.clamp(1, u16::MAX as u32) as u16,
+                        initial_cols.clamp(1, u16::MAX as u32) as u16,
+                        5000,
+                    ),
                     raster_cell_width: 8.0,
                     raster_cell_height: 16.0,
                     find_query: String::new(),
@@ -4235,8 +4253,10 @@ fn wire_session_callbacks(
                 );
             }
 
-            // Spawn the shell (+ SFTP) workers and their event-pump threads.
-            // Shared with in-place reconnect (#79) via start_session_in_tab.
+            // Start the shell (+ SFTP) workers on the next event-loop turn.
+            // TerminalView emits its first real grid size while this model
+            // update is being laid out; delaying the transport lets that size
+            // reach the parser and the initial PTY request before btop paints.
             let ctx = ConnectCtx {
                 weak: weak.clone(),
                 runtime: runtime.clone(),
@@ -4248,14 +4268,49 @@ fn wire_session_callbacks(
                 tab_statuses: tab_statuses.clone(),
                 local_snap: local_snap.clone(),
                 local_net_hist: local_net_hist.clone(),
-                last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
                 remote_resource_refresh: remote_resource_refresh.clone(),
                 store: store.clone(),
                 debug_api: debug_api.clone(),
                 runtime_sessions: runtime_sessions.clone(),
             };
-            start_session_in_tab(&tab_id, session, &ctx);
+            let tab_for_start = tab_id.clone();
+            let bufs_for_start = bufs.clone();
+            let last_size_for_start = last_term_size.clone();
+            let pending_size_for_start = pending_initial_term_sizes.clone();
+            // Let the model/layout pass deliver the first real TerminalView
+            // resize before starting the transport. A zero-delay timer can run
+            // before that callback on the winit event loop.
+            slint::Timer::single_shot(std::time::Duration::from_millis(16), move || {
+                if term_buf(&bufs_for_start, &tab_for_start).is_none() {
+                    return;
+                }
+                // The first resize may arrive while Slint is constructing the
+                // model row, before this tab has a buffer. Prefer that saved
+                // per-tab size over the parser's initial 80x24 dimensions.
+                let pending_size = pending_size_for_start
+                    .borrow_mut()
+                    .remove(&tab_for_start);
+                let parser_size = term_buf(&bufs_for_start, &tab_for_start).map(|buffer| {
+                    let buffer = buffer.lock().unwrap();
+                    buffer.parser.screen().size()
+                });
+                let (rows, cols) = pending_size
+                    .map(|(cols, rows)| (rows, cols))
+                    .or_else(|| parser_size.map(|(rows, cols)| (rows as u32, cols as u32)))
+                    .unwrap_or_else(|| *last_size_for_start.lock().unwrap());
+                if let Some(buffer) = term_buf(&bufs_for_start, &tab_for_start) {
+                    let mut buffer = buffer.lock().unwrap();
+                    let (new_rows, new_cols) = (
+                        rows.clamp(1, u16::MAX as u32) as u16,
+                        cols.clamp(1, u16::MAX as u32) as u16,
+                    );
+                    if buffer.parser.screen().size() != (new_rows, new_cols) {
+                        buffer.parser.set_size(new_rows, new_cols);
+                    }
+                }
+                start_session_in_tab(&tab_for_start, session, &ctx, cols, rows);
+            });
         });
     }
 
@@ -4536,6 +4591,7 @@ fn wire_key_input(
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
     last_term_size: Arc<Mutex<(u32, u32)>>,
+    pending_initial_term_sizes: Rc<RefCell<HashMap<String, (u32, u32)>>>,
     store: Rc<RefCell<ConfigStore>>,
     ctx: ConnectCtx,
 ) {
@@ -4977,7 +5033,16 @@ fn wire_key_input(
                                 crate::i18n::t("重连中...", "Reconnecting...").into();
                         });
                     }
-                    start_session_in_tab(tab_id.as_str(), session, &ctx);
+                    let (initial_rows, initial_cols) = term_buf(&ctx.bufs, tab_id.as_str())
+                        .map(|h| h.lock().unwrap().parser.screen().size())
+                        .unwrap_or((24, 80));
+                    start_session_in_tab(
+                        tab_id.as_str(),
+                        session,
+                        &ctx,
+                        initial_cols as u32,
+                        initial_rows as u32,
+                    );
                     return;
                 }
             }
@@ -5215,6 +5280,7 @@ fn wire_key_input(
         let handles = handles.clone();
         let bufs_resize = bufs.clone(); // keep bufs alive for the copy handler below
         let weak_resize = window.as_weak();
+        let pending_initial_term_sizes_resize = pending_initial_term_sizes.clone();
         // The Slint side now measures the real Consolas cell size (via a hidden
         // probe Text) and passes whole column/row counts directly, so there is
         // no pixel→cell guesswork here.  This keeps full-screen programs like
@@ -5251,6 +5317,24 @@ fn wire_key_input(
             }
             let cols = (cols_f as u32).max(10);
             let rows = (rows_f as u32).max(5);
+            // A newly-created tab has no transport handle yet. Apply its first
+            // real grid immediately so the parser can be paired with the PTY
+            // before the first btop frame arrives; the 150 ms debounce below is
+            // still used for every already-running session during layout drag.
+            if !handles.borrow().contains_key(tab_id.as_str()) {
+                pending_initial_term_sizes_resize
+                    .borrow_mut()
+                    .insert(tab_id.to_string(), (cols, rows));
+                apply_terminal_resize(
+                    &handles,
+                    &bufs_resize,
+                    &last_term_size,
+                    tab_id.as_str(),
+                    cols,
+                    rows,
+                );
+                return;
+            }
             pending_size
                 .borrow_mut()
                 .insert(tab_id.to_string(), (cols, rows));

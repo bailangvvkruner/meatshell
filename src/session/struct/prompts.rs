@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::runtime::Runtime;
 
@@ -26,7 +26,6 @@ pub(crate) struct ConnectCtx {
     pub(crate) tab_statuses: TabStatuses,
     pub(crate) local_snap: LocalSnap,
     pub(crate) local_net_hist: NetHist,
-    pub(crate) last_term_size: Arc<Mutex<(u32, u32)>>,
     pub(crate) sftp_follow_cd: Arc<AtomicBool>,
     pub(crate) remote_resource_refresh: tokio::sync::watch::Sender<u32>,
     pub(crate) store: Rc<RefCell<ConfigStore>>,
