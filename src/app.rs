@@ -6,6 +6,7 @@
 //!   * Manage the tab list + per-tab `SessionHandle` map.
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
+mod clipboard_connect;
 mod port_forward;
 mod quick_commands;
 mod resource_ui;
@@ -21,6 +22,7 @@ mod webdav;
 mod window;
 
 use self::auth_dialogs::*;
+use self::clipboard_connect::*;
 use self::port_forward::*;
 use self::quick_commands::*;
 use self::resource_ui::*;
@@ -181,6 +183,70 @@ fn tab_title_len(title: &str) -> i32 {
 
 fn should_block_close(exit_confirmed: bool, has_live_sessions: bool) -> bool {
     !exit_confirmed && has_live_sessions
+}
+
+fn clipboard_prompt_blocked(win: &AppWindow) -> bool {
+    win.get_clipboard_connect_open()
+        || win.get_confirm_close_open()
+        || win.get_hostkey_prompt_open()
+        || win.get_cred_prompt_open()
+        || win.get_mfa_prompt_open()
+        || win.get_dialog_open()
+        || win.get_confirm_delete_open()
+        || win.get_paste_confirm_open()
+        || win.get_batch_import_open()
+        || win.get_sftp_prompt_open()
+        || win.get_chmod_open()
+        || win.get_group_dialog_open()
+        || win.get_editor_open()
+        || win.get_interface_open()
+}
+
+/// Read the clipboard off the UI event handler and return only the parsed
+/// target to Slint. The raw value is retained solely for per-value de-duplication
+/// and is never logged or persisted.
+fn queue_clipboard_connect_prompt(
+    weak: &slint::Weak<AppWindow>,
+    prompted: &Arc<Mutex<Option<String>>>,
+) {
+    let weak = weak.clone();
+    let prompted = prompted.clone();
+    std::thread::spawn(move || {
+        let Ok(text) = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text())
+        else {
+            return;
+        };
+        let raw = text.trim().to_string();
+        let target = parse_clipboard_ssh_target(&raw);
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(win) = weak.upgrade() else { return };
+            let changed = prompted
+                .lock()
+                .ok()
+                .and_then(|value| value.clone())
+                .as_deref()
+                != Some(raw.as_str());
+            if !changed {
+                return;
+            }
+            // A different clipboard value, including a non-SSH value, clears
+            // the de-duplication marker so returning to the target later can
+            // ask again. Do not retain the new value until it is prompted.
+            if let Ok(mut value) = prompted.lock() {
+                *value = None;
+            }
+            let Some(target) = target else { return };
+            if clipboard_prompt_blocked(&win) {
+                return;
+            }
+            if let Ok(mut value) = prompted.lock() {
+                *value = Some(raw);
+            }
+            win.set_clipboard_connect_user(target.user.into());
+            win.set_clipboard_connect_host(target.host.into());
+            win.set_clipboard_connect_open(true);
+        });
+    });
 }
 
 /// Tab ids currently shown in a pane (`term.id == pane.active-id` in Slint).
@@ -380,6 +446,10 @@ pub fn run() -> Result<()> {
 
     // Per-tab SSH handles (shell only; lives on Slint thread via Rc).
     let handles: Rc<RefCell<HashMap<String, SessionHandle>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    // Clipboard quick-connect sessions are kept here only while the app is
+    // running. They never enter the persisted ConfigStore.
+    let runtime_sessions: Rc<RefCell<HashMap<String, Session>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
     // Per-tab SFTP handles — Arc<Mutex> so the event-pump OS thread and the
@@ -1650,6 +1720,7 @@ pub fn run() -> Result<()> {
         sftp_follow_cd.clone(),
         remote_resource_refresh.clone(),
         debug_api_state.clone(),
+        runtime_sessions.clone(),
     );
 
     // Recompute the sidebar whenever the active tab changes (fired from Slint's
@@ -1996,6 +2067,8 @@ pub fn run() -> Result<()> {
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
         debug_api_state.clone(),
+        tab_statuses.clone(),
+        runtime_sessions.clone(),
     );
     wire_sftp_callbacks(&window, sftp_handles.clone(), sftp_last_cwd.clone());
     wire_key_input(
@@ -2020,8 +2093,44 @@ pub fn run() -> Result<()> {
             remote_resource_refresh: remote_resource_refresh.clone(),
             store: store.clone(),
             debug_api: debug_api_state.clone(),
+            runtime_sessions: runtime_sessions.clone(),
         },
     );
+
+    // The clipboard confirmation creates a runtime-only session and then
+    // delegates to the normal connect callback. Cancelling only closes the
+    // prompt; de-duplication is handled when the clipboard is first observed.
+    {
+        let weak = window.as_weak();
+        let runtime_sessions = runtime_sessions.clone();
+        window.on_clipboard_connect_confirmed(move || {
+            let Some(win) = weak.upgrade() else { return };
+            let user = win.get_clipboard_connect_user().to_string();
+            let host = win.get_clipboard_connect_host().to_string();
+            win.set_clipboard_connect_open(false);
+            let Some(target) = parse_clipboard_ssh_target(&format!("{user}@{host}")) else {
+                return;
+            };
+            let mut session = Session::new_empty();
+            session.id = format!("runtime:clipboard:{}", uuid::Uuid::new_v4());
+            session.name = format!("{}@{}", target.user, target.host);
+            session.user = target.user;
+            session.host = target.host;
+            session.auth = AuthMethod::Password;
+            session.runtime_passwordless = true;
+            let id = session.id.clone();
+            runtime_sessions.borrow_mut().insert(id.clone(), session);
+            win.invoke_connect_session(id.into());
+        });
+    }
+    {
+        let weak = window.as_weak();
+        window.on_clipboard_connect_cancelled(move || {
+            if let Some(win) = weak.upgrade() {
+                win.set_clipboard_connect_open(false);
+            }
+        });
+    }
 
     // --- Window activity, for idle-CPU throttling (#127) ----------------
     // Idle terminals shouldn't burn CPU: pause the sampler when the window is
@@ -2036,6 +2145,10 @@ pub fn run() -> Result<()> {
         Hidden,     // minimized / occluded → paused
     }
     let activity = Rc::new(std::cell::Cell::new(WinActivity::Active));
+    // Last clipboard value that produced a prompt. Keeping the value (rather
+    // than the parsed host) means a cancel is remembered until the clipboard
+    // changes, while a copied value is never logged or persisted.
+    let clipboard_prompted: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Once the user confirms shutdown, every subsequent native/custom close
     // request must pass through without reopening the modal. Windows Installer
     // and Restart Manager may issue more than one close request while replacing
@@ -2158,12 +2271,13 @@ pub fn run() -> Result<()> {
         let ev_store = store.clone();
         let ev_activity = activity.clone();
         let ev_exit_confirmed = exit_confirmed.clone();
+        let ev_clipboard_prompted = clipboard_prompted.clone();
         let ev_window_size_tracking_ready = window_size_tracking_ready.clone();
         let ev_pending_window_size_restore = pending_window_size_restore.clone();
         let mut last_cursor_logical: Option<(f32, f32)> = None;
         let mut macos_wheel_accum = 0.0_f32;
         // Track the inputs that make up WinActivity; recompute on each change.
-        let mut focused = true;
+        let mut focused = false;
         let mut minimized = false;
         let mut occluded = false;
         let mut last_terminal_raster_refresh =
@@ -2300,6 +2414,7 @@ pub fn run() -> Result<()> {
                         }
                     }
                     WEvent::Focused(f) => {
+                        let became_focused = *f && !focused;
                         focused = *f;
                         apply_activity(focused, minimized, occluded);
                         if *f {
@@ -2339,6 +2454,9 @@ pub fn run() -> Result<()> {
                                 }
                             }
                             refresh_revealed_main_window(weak.clone());
+                            if became_focused {
+                                queue_clipboard_connect_prompt(&weak, &ev_clipboard_prompted);
+                            }
                         }
                     }
                     WEvent::Occluded(o) => {
@@ -3113,6 +3231,7 @@ fn wire_session_callbacks(
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
     remote_resource_refresh: tokio::sync::watch::Sender<u32>,
     debug_api: DebugApiState,
+    runtime_sessions: Rc<RefCell<HashMap<String, Session>>>,
 ) {
     // Working set of port forwards (#56) for the session being created/edited.
     // The forward add/delete callbacks mutate it; saving reads it into
@@ -3641,6 +3760,7 @@ fn wire_session_callbacks(
                 },
                 user: draft.user.to_string(),
                 auth: AuthMethod::from_str(&draft.auth.to_string()),
+                runtime_passwordless: false,
                 password,
                 // Store the key path with forward slashes uniformly.
                 private_key_path,
@@ -3939,6 +4059,7 @@ fn wire_session_callbacks(
         let sftp_follow_cd = sftp_follow_cd.clone();
         let remote_resource_refresh = remote_resource_refresh.clone();
         let debug_api = debug_api.clone();
+        let runtime_sessions = runtime_sessions.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
             let session = if id.starts_with("system:") {
@@ -3946,6 +4067,8 @@ fn wire_session_callbacks(
                     Some(s) => s,
                     None => return,
                 }
+            } else if let Some(session) = runtime_sessions.borrow().get(&id).cloned() {
+                session
             } else {
                 match store.borrow().get(&id).cloned() {
                     Some(s) => s,
@@ -4130,6 +4253,7 @@ fn wire_session_callbacks(
                 remote_resource_refresh: remote_resource_refresh.clone(),
                 store: store.clone(),
                 debug_api: debug_api.clone(),
+                runtime_sessions: runtime_sessions.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -4808,7 +4932,13 @@ fn wire_key_input(
                         .map(|st| st.session_id.clone())
                 };
                 if let Some(session_id) = dead_session {
-                    let Some(session) = store.borrow().get(&session_id).cloned() else {
+                    let session = ctx
+                        .runtime_sessions
+                        .borrow()
+                        .get(&session_id)
+                        .cloned()
+                        .or_else(|| store.borrow().get(&session_id).cloned());
+                    let Some(session) = session else {
                         return;
                     };
                     // Drop the dead shell/SFTP handles for this tab.

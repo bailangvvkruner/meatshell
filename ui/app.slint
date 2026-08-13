@@ -559,6 +559,13 @@ export component AppWindow inherits Window {
     in-out property <string> hostkey-confirm-label; // trust-button text (from Rust, bilingual)
     callback hostkey-accept();                     // trust (and remember) the key
     callback hostkey-reject();                      // abort the connection
+    // Clipboard quick-connect confirmation. The accepted target is converted
+    // into a runtime-only session by Rust; it is never saved to sessions.json.
+    in-out property <bool> clipboard-connect-open: false;
+    in-out property <string> clipboard-connect-user;
+    in-out property <string> clipboard-connect-host;
+    callback clipboard-connect-confirmed();
+    callback clipboard-connect-cancelled();
     // Connect-time credential prompt (#110). Rust opens this when a session is
     // missing its username and/or password; the answer flows back via accept.
     in-out property <bool> cred-prompt-open: false;
@@ -3623,6 +3630,79 @@ export component AppWindow inherits Window {
         confirm-label: root.hostkey-confirm-label;
         confirm => { root.hostkey-accept(); }
         cancel => { root.hostkey-reject(); }
+    }
+
+    // A copied `ssh user@host` is only a suggestion. Require an explicit
+    // confirmation before opening the temporary passwordless connection.
+    if root.clipboard-connect-open : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000aa;
+        TouchArea { clicked => { root.clipboard-connect-cancelled(); } }
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) {
+                    root.clipboard-connect-cancelled();
+                    accept
+                } else if (e.text == Key.Return || e.text == " ") {
+                    root.clipboard-connect-confirmed();
+                    accept
+                } else {
+                    accept
+                }
+            }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 420px;
+            height: 190px;
+            background: Theme.bg-panel;
+            border-radius: Theme.radius-md;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #000000a0;
+            TouchArea {}
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text {
+                    text: root.lang-en ? "Temporary SSH connection?" : "是否临时连接 SSH？";
+                    color: Theme.text-primary;
+                    font-size: Theme.fs-lg;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.lang-en
+                        ? "Connect without asking for a password?"
+                        : "无需输入密码，是否建立临时连接？";
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.clipboard-connect-user + "@" + root.clipboard-connect-host;
+                    color: Theme.text-primary;
+                    font-family: Theme.font-mono;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GhostButton {
+                        text: root.lang-en ? "Cancel" : "取消";
+                        clicked => { root.clipboard-connect-cancelled(); }
+                    }
+                    PrimaryButton {
+                        text: root.lang-en ? "Connect" : "连接";
+                        clicked => { root.clipboard-connect-confirmed(); }
+                    }
+                }
+            }
+        }
     }
 
     // Batch-import connections from pasted text (#150).

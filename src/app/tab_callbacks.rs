@@ -14,6 +14,8 @@ pub(super) fn wire_tab_callbacks(
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
     debug_api: DebugApiState,
+    tab_statuses: TabStatuses,
+    runtime_sessions: Rc<RefCell<HashMap<String, Session>>>,
 ) {
     // Ctrl+Tab / Ctrl+Shift+Tab cycle within the currently focused pane (#294).
     {
@@ -134,12 +136,29 @@ pub(super) fn wire_tab_callbacks(
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
         let debug_api = debug_api.clone();
+        let tab_statuses = tab_statuses.clone();
+        let runtime_sessions = runtime_sessions.clone();
         let panes_model = panes_model.clone();
         let splitters_model = splitters_model.clone();
         window.on_pane_tab_closed(move |_pane_id: i32, id: SharedString| {
             let id = id.to_string();
             if id == "welcome" {
                 return;
+            }
+            let session_id = tab_statuses
+                .lock()
+                .unwrap()
+                .remove(&id)
+                .map(|status| status.session_id);
+            if let Some(session_id) = session_id {
+                let still_used = tab_statuses
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|status| status.session_id == session_id);
+                if !still_used {
+                    runtime_sessions.borrow_mut().remove(&session_id);
+                }
             }
             if let Some(handle) = handles.borrow_mut().remove(&id) {
                 handle.close();

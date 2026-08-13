@@ -339,6 +339,7 @@ pub(super) fn session_from_draft(
         },
         user: draft.user.to_string(),
         auth: AuthMethod::from_str(&draft.auth.to_string()),
+        runtime_passwordless: false,
         password,
         private_key_path,
         private_key_inline,

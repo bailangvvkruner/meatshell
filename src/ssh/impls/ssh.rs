@@ -4,12 +4,14 @@
 //! on the shared Tokio runtime; commands come in via an MPSC channel and
 //! output lines are pushed back via an `UnboundedSender<SessionEvent>`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use futures::future::BoxFuture;
 use russh::client::{self, Handle, Handler, Msg};
+use russh::keys::agent::client::AgentStream;
+use russh::keys::agent::{client::AgentClient, AgentIdentity};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{decode_secret_key, load_secret_key, PrivateKey};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind};
@@ -844,6 +846,150 @@ const MAX_CREDENTIAL_REPROMPTS: usize = 3;
 pub(crate) type AuthReconnectFuture<H> =
     BoxFuture<'static, Result<(Handle<H>, Option<Handle<ClientHandler>>)>>;
 
+type DynamicAgent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
+
+async fn connect_local_ssh_agent() -> Option<DynamicAgent> {
+    #[cfg(unix)]
+    {
+        return AgentClient::connect_env()
+            .await
+            .ok()
+            .map(|agent| agent.dynamic());
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(agent) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+            return Some(agent.dynamic());
+        }
+        return AgentClient::connect_pageant()
+            .await
+            .ok()
+            .map(|agent| agent.dynamic());
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn runtime_identity_paths(session: &Session) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for host in crate::ssh::ssh_config::parse_default() {
+        if (host.alias == session.host || host.hostname == session.host)
+            && !host.identity_file.trim().is_empty()
+        {
+            paths.push(PathBuf::from(host.identity_file));
+        }
+    }
+    if let Some(home) = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        let ssh = home.join(".ssh");
+        for name in ["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"] {
+            paths.push(ssh.join(name));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+async fn authenticate_passwordless<H, F>(
+    handle: &mut Handle<H>,
+    jump_handle: &mut Option<Handle<ClientHandler>>,
+    session: &Session,
+    mut reconnect: F,
+) -> Result<AuthResult>
+where
+    H: Handler + 'static,
+    H::Error: std::error::Error + Send + Sync + 'static,
+    F: FnMut() -> AuthReconnectFuture<H>,
+{
+    let user = session.user.trim();
+    if user.is_empty() {
+        return Ok(AuthResult::Failed);
+    }
+
+    // Match the normal OpenSSH order: keys held by the local agent first.
+    let mut agent_attempted = false;
+    if let Some(mut agent) = connect_local_ssh_agent().await {
+        if let Ok(identities) = agent.request_identities().await {
+            for (index, identity) in identities.iter().enumerate() {
+                agent_attempted = true;
+                let hash = identity
+                    .public_key()
+                    .algorithm()
+                    .is_rsa()
+                    .then_some(HashAlg::Sha256);
+                let result = match identity {
+                    AgentIdentity::PublicKey { key, .. } => {
+                        handle
+                            .authenticate_publickey_with(user, key.clone(), hash, &mut agent)
+                            .await
+                    }
+                    AgentIdentity::Certificate { certificate, .. } => {
+                        handle
+                            .authenticate_certificate_with(
+                                user,
+                                certificate.clone(),
+                                hash,
+                                &mut agent,
+                            )
+                            .await
+                    }
+                };
+                match result {
+                    Ok(result) if result.success() => return Ok(AuthResult::Success),
+                    Ok(_) | Err(_) => {
+                        if index + 1 < identities.len() {
+                            reconnect_auth_handle(handle, jump_handle, &mut reconnect).await?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if agent_attempted {
+        reconnect_auth_handle(handle, jump_handle, &mut reconnect).await?;
+    }
+
+    // Also try the usual unencrypted OpenSSH private keys. An encrypted key is
+    // intentionally skipped: this quick-connect path must never ask for a
+    // passphrase or password.
+    let paths = runtime_identity_paths(session);
+    let mut key_attempted = false;
+    for (index, path) in paths.iter().enumerate() {
+        let mut candidate = session.clone();
+        candidate.private_key_path = path.to_string_lossy().replace('\\', "/");
+        candidate.private_key_inline = crate::config::Secret::default();
+        let Ok(keypair) = load_session_private_key(&candidate, "") else {
+            continue;
+        };
+        let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
+        key_attempted = true;
+        let result = handle
+            .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(keypair), hash))
+            .await;
+        if result
+            .as_ref()
+            .is_ok_and(russh::client::AuthResult::success)
+        {
+            return Ok(AuthResult::Success);
+        }
+        if index + 1 < paths.len() {
+            reconnect_auth_handle(handle, jump_handle, &mut reconnect).await?;
+        }
+    }
+    if key_attempted {
+        reconnect_auth_handle(handle, jump_handle, &mut reconnect).await?;
+    }
+
+    // Finally try SSH `none` for servers that explicitly allow passwordless
+    // accounts. Rejection is terminal and never falls through to a credential
+    // prompt for this runtime-only connection.
+    Ok(if handle.authenticate_none(user).await?.success() {
+        AuthResult::Success
+    } else {
+        AuthResult::Failed
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PasswordAuthDecision {
     Success,
@@ -937,6 +1083,13 @@ where
     H::Error: std::error::Error + Send + Sync + 'static,
     F: FnMut() -> AuthReconnectFuture<H>,
 {
+    // Clipboard quick-connect targets use the local OpenSSH agent/default key
+    // path, then SSH `none`; do this before resolving credentials so an empty
+    // password never opens the normal credential dialog.
+    if session.runtime_passwordless {
+        return authenticate_passwordless(handle, jump_handle, session, reconnect).await;
+    }
+
     let (user, mut password) = match resolve_credentials(session, events).await {
         Some(c) => c,
         None => return Ok(AuthResult::Cancelled),

@@ -92,6 +92,10 @@ pub struct Session {
     pub port: u16,
     pub user: String,
     pub auth: AuthMethod,
+    /// Runtime-only marker used by clipboard quick-connect. It is deliberately
+    /// skipped from config serialization and never appears in the session UI.
+    #[serde(skip)]
+    pub(crate) runtime_passwordless: bool,
     #[serde(default)]
     pub password: Secret,
     #[serde(default)]
@@ -183,6 +187,7 @@ impl Session {
             port: 22,
             user: "root".into(),
             auth: AuthMethod::Password,
+            runtime_passwordless: false,
             password: Secret::default(),
             private_key_path: String::new(),
             private_key_inline: Secret::default(),

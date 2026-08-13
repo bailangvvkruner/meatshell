@@ -31,6 +31,9 @@ pub(crate) struct ConnectCtx {
     pub(crate) remote_resource_refresh: tokio::sync::watch::Sender<u32>,
     pub(crate) store: Rc<RefCell<ConfigStore>>,
     pub(crate) debug_api: DebugApiState,
+    /// Runtime-only sessions, such as clipboard quick-connect targets. They
+    /// are intentionally separate from the persisted ConfigStore.
+    pub(crate) runtime_sessions: Rc<RefCell<HashMap<String, crate::config::Session>>>,
 }
 
 pub(crate) struct PendingHostKey {
