@@ -4,8 +4,9 @@ use tokio::task::JoinHandle;
 use crate::config::PortForward;
 
 use super::{
-    CredentialResponder, HostKeyResponder, MfaResponder, ProcInfo, ProcessKillResult, RemoteEntry,
-    RemoteTreeNode, RuntimeTunnelInfo, SessionCommand, SystemDetails,
+    CredentialResponder, HostKeyResponder, MfaResponder, PointerInputKind, ProcInfo,
+    ProcessKillResult, RemoteEntry, RemoteTreeNode, RuntimeTunnelInfo, SessionCommand,
+    SystemDetails,
 };
 
 /// Events emitted back to the UI thread.
@@ -39,6 +40,8 @@ pub enum SessionEvent {
         user: String,
         need_user: bool,
         need_password: bool,
+        /// True when credentials supplied earlier were rejected by the server.
+        retry: bool,
         responder: CredentialResponder,
     },
     /// A keyboard-interactive challenge that isn't the account password —
@@ -140,6 +143,12 @@ pub struct SessionHandle {
 impl SessionHandle {
     pub fn send_raw(&self, bytes: Vec<u8>) {
         let _ = self.commands.send(SessionCommand::RawInput(bytes));
+    }
+
+    pub fn send_pointer(&self, bytes: Vec<u8>, kind: PointerInputKind) {
+        let _ = self
+            .commands
+            .send(SessionCommand::PointerInput { bytes, kind });
     }
 
     pub fn resize(&self, cols: u32, rows: u32) {

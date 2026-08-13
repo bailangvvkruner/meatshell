@@ -1,0 +1,20 @@
+# Project-specific cargo-audit configuration.
+#
+# Keep this list synchronized with the rustsec/audit-check step in
+# .github/workflows/release.yml. Each exception is constrained by the current
+# dependency graph and must be removed when its upstream dependency can be
+# upgraded without a breaking Slint migration.
+
+[advisories]
+ignore = [
+    # No fixed rsa release exists. The affected operation is RSA private-key
+    # authentication; users can avoid the timing risk by using Ed25519/ECDSA.
+    "RUSTSEC-2023-0071",
+
+    # Both quick-xml versions are transitive Slint Linux dependencies. The
+    # 0.39 copy is used by the Wayland protocol proc-macro; the 0.38 copy is
+    # used by AccessKit/zbus bindings. Neither parses remote/user XML here.
+    # Their dependency version ranges cannot select patched quick-xml >= 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

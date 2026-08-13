@@ -27,6 +27,7 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
             jump.clone(),
             initial_cols,
             initial_rows,
+            ctx.remote_resource_refresh.subscribe(),
         ),
         SessionKind::Serial => crate::terminal::serial::spawn_serial_session(
             ctx.runtime.handle(),
@@ -49,6 +50,11 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
         ),
     };
     let terminal_reply_tx = handle.commands.clone();
+    let debug_input_sender = handle.commands.clone();
+    let debug_input_generation = ctx.debug_api.begin_input_session(tab_id.to_string());
+    // Do not expose the command queue while authentication or host-key/MFA
+    // prompts are still pending. Otherwise a timed-out API request could remain
+    // queued and execute unexpectedly after the transport eventually connects.
     ctx.handles.borrow_mut().insert(tab_id.to_string(), handle);
 
     // Separate SFTP connection for the same session (SSH only). It waits for
@@ -89,9 +95,11 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
         let net_pump = ctx.local_net_hist.clone();
         let follow_cd_pump = ctx.sftp_follow_cd.clone();
         let render_gates_pump = ctx.render_gates.clone();
+        let debug_api_pump = ctx.debug_api.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut sftp_ready_tx = sftp_ready_tx;
+            let mut debug_input_generation = debug_input_generation;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
             // Reusable scratch so a fast firehose doesn't reallocate every batch.
             let mut drained: Vec<SessionEvent> = Vec::new();
@@ -127,6 +135,13 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                         SessionEvent::Connected => {
                             if let Some(ready) = sftp_ready_tx.take() {
                                 let _ = ready.send(());
+                            }
+                            if let Some(generation) = debug_input_generation {
+                                debug_api_pump.connect_input_sender(
+                                    &tab_id_pump,
+                                    generation,
+                                    debug_input_sender.clone(),
+                                );
                             }
                             ui_batch.push(SessionEvent::Connected);
                         }
@@ -184,7 +199,15 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                                 ui_batch.push(SessionEvent::Output(chunk));
                             }
                         }
-                        other => ui_batch.push(other),
+                        other => {
+                            if matches!(other, SessionEvent::Closed(_)) {
+                                if let Some(generation) = debug_input_generation.take() {
+                                    debug_api_pump
+                                        .disconnect_input_session(&tab_id_pump, generation);
+                                }
+                            }
+                            ui_batch.push(other);
+                        }
                     }
                 }
                 if ui_batch.is_empty() {
@@ -276,6 +299,9 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                         }
                     }
                 });
+            }
+            if let Some(generation) = debug_input_generation {
+                debug_api_pump.disconnect_input_session(&tab_id_pump, generation);
             }
         });
     }

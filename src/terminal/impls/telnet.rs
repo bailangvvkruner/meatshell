@@ -21,6 +21,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::config::Session;
 use crate::i18n::t;
 use crate::ssh::{SessionCommand, SessionEvent, SessionHandle};
+use crate::terminal::Utf8StreamDecoder;
 
 // Telnet protocol bytes (RFC 854).
 const IAC: u8 = 255;
@@ -154,12 +155,14 @@ async fn run_telnet(
 
     let mut state = TnState::Data;
     let mut buf = [0u8; 4096];
+    let mut decoder = Utf8StreamDecoder::default();
 
     loop {
         tokio::select! {
             cmd = commands.recv() => {
                 match cmd {
-                    Some(SessionCommand::RawInput(bytes)) => {
+                    Some(SessionCommand::RawInput(bytes))
+                    | Some(SessionCommand::PointerInput { bytes, .. }) => {
                         // Never log keystroke bytes — they can be passwords (#15).
                         tracing::debug!("telnet write len={} bytes", bytes.len());
                         // Escape IAC (0xFF) in user data per RFC 854.
@@ -174,6 +177,29 @@ async fn run_telnet(
                             break;
                         }
                         let _ = wr.flush().await;
+                    }
+                    Some(SessionCommand::DebugInput { bytes, ack }) => {
+                        tracing::debug!("telnet debug input len={} bytes", bytes.len());
+                        let mut out = Vec::with_capacity(bytes.len());
+                        for byte in bytes {
+                            out.push(byte);
+                            if byte == IAC {
+                                out.push(IAC);
+                            }
+                        }
+                        let result = async {
+                            wr.write_all(&out).await?;
+                            wr.flush().await
+                        }
+                        .await
+                        .map_err(|error| error.to_string());
+                        let failed = result.is_err();
+                        let _ = ack.send(result);
+                        if failed {
+                            let _ = events.send(SessionEvent::Closed(
+                                t("写入失败", "write failed").into()));
+                            break;
+                        }
                     }
                     Some(SessionCommand::Resize(cols, rows)) => {
                         let _ = wr.write_all(&naws_subneg(cols, rows)).await;
@@ -201,8 +227,10 @@ async fn run_telnet(
                             let _ = wr.flush().await;
                         }
                         if !data.is_empty() {
-                            let text = String::from_utf8_lossy(&data).into_owned();
-                            let _ = events.send(SessionEvent::Output(text));
+                            let text = decoder.decode(&data);
+                            if !text.is_empty() {
+                                let _ = events.send(SessionEvent::Output(text));
+                            }
                         }
                     }
                     Err(e) => {
@@ -215,6 +243,10 @@ async fn run_telnet(
         }
     }
 
+    let tail = decoder.finish();
+    if !tail.is_empty() {
+        let _ = events.send(SessionEvent::Output(tail));
+    }
     let _ = events.send(SessionEvent::Closed(
         t("连接已关闭", "connection closed").into(),
     ));

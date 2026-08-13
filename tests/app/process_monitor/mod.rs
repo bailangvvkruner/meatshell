@@ -6,15 +6,15 @@ fn marks_owner_and_preserves_source_tab() {
         ProcInfo {
             pid: 10,
             user: "alice".into(),
-            cpu: 1.0,
-            mem: 2.0,
+            cpu: Some(1.0),
+            mem: Some(2.0),
             command: "own".into(),
         },
         ProcInfo {
             pid: 11,
             user: "root".into(),
-            cpu: 3.0,
-            mem: 4.0,
+            cpu: Some(3.0),
+            mem: Some(4.0),
             command: "other".into(),
         },
     ];
@@ -22,6 +22,24 @@ fn marks_owner_and_preserves_source_tab() {
     assert!(rows[0].own_process);
     assert!(!rows[1].own_process);
     assert!(rows.iter().all(|row| row.tab_id.as_str() == "term-a"));
+}
+
+#[test]
+fn unavailable_busybox_metrics_render_as_dashes() {
+    let rows = proc_rows(
+        &[ProcInfo {
+            pid: 1,
+            user: "root".into(),
+            cpu: None,
+            mem: None,
+            command: "/sbin/init".into(),
+        }],
+        "root",
+        "term-a",
+    );
+    assert_eq!(rows[0].cpu.as_str(), "-");
+    assert_eq!(rows[0].mem.as_str(), "-");
+    assert_eq!(rows[0].cpu_frac, 0.0);
 }
 
 #[test]

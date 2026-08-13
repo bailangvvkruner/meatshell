@@ -144,8 +144,16 @@ pub(super) fn enqueue_cred_prompt(
     user: String,
     need_user: bool,
     need_password: bool,
+    retry: bool,
     responder: crate::ssh::CredentialResponder,
 ) {
+    if retry {
+        // The server explicitly rejected the previous answer. Do not replay it
+        // from the shell/SFTP de-duplication cache.
+        CRED_DECIDED.with(|d| {
+            d.borrow_mut().remove(&session_id);
+        });
+    }
     if let Some(reply) = CRED_DECIDED.with(|d| d.borrow().get(&session_id).cloned()) {
         responder.respond(reply);
         return;
@@ -153,6 +161,9 @@ pub(super) fn enqueue_cred_prompt(
     let show_now = CRED_QUEUE.with(|q| {
         let mut q = q.borrow_mut();
         if let Some(p) = q.iter_mut().find(|p| p.session_id == session_id) {
+            p.need_user |= need_user;
+            p.need_password |= need_password;
+            p.retry |= retry;
             p.responders.push(responder);
             return false;
         }
@@ -163,6 +174,7 @@ pub(super) fn enqueue_cred_prompt(
             user,
             need_user,
             need_password,
+            retry,
             responders: vec![responder],
         });
         was_empty
@@ -179,9 +191,10 @@ pub(super) fn show_front_cred(win: &AppWindow) {
             win.set_cred_host(p.host.clone().into());
             win.set_cred_need_user(p.need_user);
             win.set_cred_need_password(p.need_password);
+            win.set_cred_retry(p.retry);
             win.set_cred_user(p.user.clone().into());
             win.set_cred_password("".into());
-            win.set_cred_remember(false);
+            win.set_cred_remember(p.retry);
             win.set_cred_prompt_open(true);
         }
     });

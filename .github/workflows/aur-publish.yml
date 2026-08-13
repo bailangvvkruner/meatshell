@@ -20,8 +20,8 @@ jobs:
       AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
       AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
       AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-    # Release and manual-dispatch events are the only supported triggers.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.release != null }}
+    # Rolling nightly pre-releases must never update the stable AUR package.
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.release != null && !github.event.release.prerelease) }}
     steps:
       - uses: actions/checkout@v4
 

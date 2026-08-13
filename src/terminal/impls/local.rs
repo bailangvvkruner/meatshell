@@ -15,6 +15,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::config::Session;
 use crate::i18n::t;
 use crate::ssh::{SessionCommand, SessionEvent, SessionHandle};
+use crate::terminal::Utf8StreamDecoder;
 
 pub fn spawn_local_session(
     runtime: &tokio::runtime::Handle,
@@ -108,21 +109,32 @@ async fn run_local(
         let reader_events = events.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
+            let mut decoder = Utf8StreamDecoder::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
+                        let tail = decoder.finish();
+                        if !tail.is_empty() {
+                            let _ = reader_events.send(SessionEvent::Output(tail));
+                        }
                         let _ = reader_events.send(SessionEvent::Closed(
                             t("本地终端已退出", "local terminal exited").into(),
                         ));
                         break;
                     }
                     Ok(n) => {
-                        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                        if reader_events.send(SessionEvent::Output(text)).is_err() {
+                        let text = decoder.decode(&buf[..n]);
+                        if !text.is_empty()
+                            && reader_events.send(SessionEvent::Output(text)).is_err()
+                        {
                             break;
                         }
                     }
                     Err(e) => {
+                        let tail = decoder.finish();
+                        if !tail.is_empty() {
+                            let _ = reader_events.send(SessionEvent::Output(tail));
+                        }
                         let _ = reader_events.send(SessionEvent::Closed(format!(
                             "{}: {e}",
                             t("本地终端读取失败", "local terminal read failed")
@@ -136,10 +148,26 @@ async fn run_local(
 
     while let Some(cmd) = commands.recv().await {
         match cmd {
-            SessionCommand::RawInput(bytes) => {
+            SessionCommand::RawInput(bytes) | SessionCommand::PointerInput { bytes, .. } => {
                 tracing::debug!("local pty write len={} bytes", bytes.len());
                 let mut guard = writer.lock().unwrap();
                 if guard.write_all(&bytes).and_then(|_| guard.flush()).is_err() {
+                    let _ = events.send(SessionEvent::Closed(t("写入失败", "write failed").into()));
+                    break;
+                }
+            }
+            SessionCommand::DebugInput { bytes, ack } => {
+                tracing::debug!("local debug input len={} bytes", bytes.len());
+                let result = {
+                    let mut guard = writer.lock().unwrap();
+                    guard
+                        .write_all(&bytes)
+                        .and_then(|_| guard.flush())
+                        .map_err(|error| error.to_string())
+                };
+                let failed = result.is_err();
+                let _ = ack.send(result);
+                if failed {
                     let _ = events.send(SessionEvent::Closed(t("写入失败", "write failed").into()));
                     break;
                 }

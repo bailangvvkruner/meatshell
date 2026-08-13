@@ -214,7 +214,6 @@ fn restore_user_backup_if_needed(primary_dir: &Path, backup_dir: &Path) {
     }
 }
 
-
 fn normalize_hex_color(value: &str) -> Option<String> {
     let digits = value.trim().strip_prefix('#').unwrap_or(value.trim());
     if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -284,7 +283,6 @@ fn migrate_defaults(cfg: &mut ConfigFile) -> bool {
     true
 }
 
-
 fn normalize_highlight_color(color: &str) -> &'static str {
     match color {
         "yellow" => "yellow",
@@ -295,7 +293,6 @@ fn normalize_highlight_color(color: &str) -> &'static str {
         _ => "red",
     }
 }
-
 
 /// Remove duplicate entries in place, keeping the *last* (most recent)
 /// occurrence of each and preserving relative order (#113). The list is capped
@@ -456,6 +453,9 @@ impl ConfigStore {
                     }
                     if let Some(plain) = Self::try_decrypt(&key, cfg.webdav_password.as_str()) {
                         cfg.webdav_password = Secret::new(plain);
+                    }
+                    if let Some(plain) = Self::try_decrypt(&key, cfg.debug_api_token.as_str()) {
+                        cfg.debug_api_token = Secret::new(plain);
                     }
                     // Clean up any duplicate history accumulated before #113,
                     // keeping the last (most recent) occurrence of each command.
@@ -932,6 +932,28 @@ impl ConfigStore {
         self.cache.collapse_sidebar_default = v;
     }
 
+    pub fn local_resource_refresh_secs(&self) -> u32 {
+        match self.cache.local_resource_refresh_secs {
+            0 => 1,
+            seconds => seconds.clamp(1, 30),
+        }
+    }
+
+    pub fn set_local_resource_refresh_secs(&mut self, seconds: u32) {
+        self.cache.local_resource_refresh_secs = seconds.clamp(1, 30);
+    }
+
+    pub fn remote_resource_refresh_secs(&self) -> u32 {
+        match self.cache.remote_resource_refresh_secs {
+            0 => 2,
+            seconds => seconds.clamp(1, 60),
+        }
+    }
+
+    pub fn set_remote_resource_refresh_secs(&mut self, seconds: u32) {
+        self.cache.remote_resource_refresh_secs = seconds.clamp(1, 60);
+    }
+
     /// Persisted sidebar width in logical px. Falls back to the default when the
     /// stored value is unset/zero (e.g. a config created via `Default`).
     pub fn sidebar_width(&self) -> f32 {
@@ -1018,6 +1040,18 @@ impl ConfigStore {
     }
     pub fn set_update_check_enabled(&mut self, enabled: bool) {
         self.cache.update_check_disabled = !enabled;
+    }
+    pub fn debug_api_enabled(&self) -> bool {
+        self.cache.debug_api_enabled
+    }
+    pub fn set_debug_api_enabled(&mut self, enabled: bool) {
+        self.cache.debug_api_enabled = enabled;
+    }
+    pub fn debug_api_token(&self) -> &str {
+        self.cache.debug_api_token.as_str()
+    }
+    pub fn set_debug_api_token(&mut self, token: String) {
+        self.cache.debug_api_token = Secret::new(token);
     }
     pub fn wallpaper_overlay(&self) -> f32 {
         let a = self.cache.wallpaper_overlay;
@@ -1315,6 +1349,12 @@ impl ConfigStore {
             let enc = Self::encrypt(&self.key, disk.webdav_password.as_str())?;
             disk.webdav_password = Secret::new(enc);
         }
+        if !disk.debug_api_token.is_empty()
+            && !disk.debug_api_token.as_str().starts_with(Self::ENC_PREFIX)
+        {
+            let enc = Self::encrypt(&self.key, disk.debug_api_token.as_str())?;
+            disk.debug_api_token = Secret::new(enc);
+        }
         let raw = serde_json::to_string_pretty(&disk)?;
         // Write to a sibling temp file then rename — cheap atomicity.
         let tmp = self.path.with_extension("json.tmp");
@@ -1528,6 +1568,27 @@ mod tests {
     }
 
     #[test]
+    fn resource_refresh_intervals_default_and_clamp() {
+        let mut store = temp_store();
+        assert_eq!(store.local_resource_refresh_secs(), 1);
+        assert_eq!(store.remote_resource_refresh_secs(), 2);
+
+        store.set_local_resource_refresh_secs(0);
+        store.set_remote_resource_refresh_secs(0);
+        assert_eq!(store.local_resource_refresh_secs(), 1);
+        assert_eq!(store.remote_resource_refresh_secs(), 1);
+
+        store.set_local_resource_refresh_secs(100);
+        store.set_remote_resource_refresh_secs(100);
+        assert_eq!(store.local_resource_refresh_secs(), 30);
+        assert_eq!(store.remote_resource_refresh_secs(), 60);
+
+        let legacy: ConfigFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.local_resource_refresh_secs, 0);
+        assert_eq!(legacy.remote_resource_refresh_secs, 0);
+    }
+
+    #[test]
     #[cfg(target_os = "windows")]
     fn renderer_mode_preserves_compatibility_default_and_validates() {
         let mut store = temp_store();
@@ -1595,7 +1656,12 @@ mod tests {
         default_session.group = "Default".into();
         let mut cfg = ConfigFile {
             sessions: vec![system_session, default_session],
-            groups: vec!["system".into(), "System".into(), "default".into(), "prod".into()],
+            groups: vec![
+                "system".into(),
+                "System".into(),
+                "default".into(),
+                "prod".into(),
+            ],
             collapsed_session_groups: Some(vec!["system".into(), "prod".into()]),
             ..ConfigFile::default()
         };
@@ -1845,6 +1911,28 @@ mod tests {
         assert_eq!(
             ConfigStore::try_decrypt(&store.key, encrypted).as_deref(),
             Some(password)
+        );
+
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn debug_api_token_is_encrypted_when_saved() {
+        let mut store = temp_store();
+        let token = "0123456789abcdef0123456789abcdef";
+        store.set_debug_api_enabled(true);
+        store.set_debug_api_token(token.to_string());
+
+        store.save().unwrap();
+        let raw = std::fs::read_to_string(&store.path).unwrap();
+        assert!(!raw.contains(token));
+        let disk: ConfigFile = serde_json::from_str(&raw).unwrap();
+        assert!(disk.debug_api_enabled);
+        let encrypted = disk.debug_api_token.as_str();
+        assert!(encrypted.starts_with(ConfigStore::ENC_PREFIX));
+        assert_eq!(
+            ConfigStore::try_decrypt(&store.key, encrypted).as_deref(),
+            Some(token)
         );
 
         let _ = std::fs::remove_file(&store.path);

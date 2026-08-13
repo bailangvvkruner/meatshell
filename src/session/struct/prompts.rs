@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
 use crate::config::ConfigStore;
+use crate::debug_api::DebugApiState;
 use crate::resource::{LocalSnap, NetHist, TabStatuses};
 use crate::sftp::{SftpHandles, SftpLastCwd};
 use crate::ssh::{CredentialResponder, HostKeyResponder, MfaResponder, SessionHandle};
@@ -27,7 +28,9 @@ pub(crate) struct ConnectCtx {
     pub(crate) local_net_hist: NetHist,
     pub(crate) last_term_size: Arc<Mutex<(u32, u32)>>,
     pub(crate) sftp_follow_cd: Arc<AtomicBool>,
+    pub(crate) remote_resource_refresh: tokio::sync::watch::Sender<u32>,
     pub(crate) store: Rc<RefCell<ConfigStore>>,
+    pub(crate) debug_api: DebugApiState,
 }
 
 pub(crate) struct PendingHostKey {
@@ -47,6 +50,7 @@ pub(crate) struct PendingCred {
     pub(crate) user: String,
     pub(crate) need_user: bool,
     pub(crate) need_password: bool,
+    pub(crate) retry: bool,
     pub(crate) responders: Vec<CredentialResponder>,
 }
 

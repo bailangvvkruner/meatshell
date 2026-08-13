@@ -9,12 +9,12 @@ mod auth_dialogs;
 mod port_forward;
 mod quick_commands;
 mod resource_ui;
-mod session_runtime;
 mod session_event;
 mod session_models;
-mod sidebar;
+mod session_runtime;
 mod sftp_callbacks;
 mod sftp_ui;
+mod sidebar;
 mod tab_callbacks;
 mod terminal_ui;
 mod webdav;
@@ -24,12 +24,12 @@ use self::auth_dialogs::*;
 use self::port_forward::*;
 use self::quick_commands::*;
 use self::resource_ui::*;
-use self::session_runtime::*;
 use self::session_event::*;
 use self::session_models::*;
-use self::sidebar::*;
+use self::session_runtime::*;
 use self::sftp_callbacks::*;
 use self::sftp_ui::*;
+use self::sidebar::*;
 use self::tab_callbacks::*;
 use self::terminal_ui::*;
 use self::webdav::*;
@@ -57,6 +57,18 @@ const PACED_QUEUE_EVENT_LIMIT: usize = 256;
 
 /// Max UI renders per second for a tab under sustained output (#209).
 const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+pub(crate) fn active_renderer_name() -> &'static str {
+    window::active_renderer_name()
+}
+
+pub(crate) fn active_renderer_uses_gpu() -> bool {
+    window::active_renderer_uses_gpu()
+}
+
+pub(crate) fn active_terminal_render_interval_ms() -> u64 {
+    RENDER_MIN_INTERVAL.as_millis() as u64
+}
 
 fn term_buf(bufs: &TermBuffers, tab_id: &str) -> Option<TermBufferHandle> {
     bufs.lock().unwrap().get(tab_id).cloned()
@@ -113,41 +125,49 @@ mod ingest_frame_tests;
 
 use anyhow::{Context, Result};
 use i_slint_backend_winit::WinitWindowAccessor;
-use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
 use tokio::runtime::Runtime;
 
 use crate::config::{
     is_reserved_session_group, AuthMethod, ConfigStore, OutputHighlightRule, Secret, Session,
     SessionKind,
 };
+use crate::debug_api::{
+    DebugApiController, DebugApiState, DebugPointerEvent, DebugPointerEventKind,
+    MemoryTrimDiagnostics as DebugMemoryTrimDiagnostics, RuntimeDiagnostics, ScreenshotFrame,
+    TerminalMetadata, DEFAULT_PORT as DEBUG_API_PORT,
+};
 use crate::i18n::t;
 use crate::layout::{LogicalRect, TerminalWheelHit};
+use crate::resource::system::{format_bytes_per_sec, format_mem};
 use crate::resource::{
     LocalGpuInfo, LocalHardwareInfo, LocalSnap, NetHist, TabStatus, TabStatuses,
 };
+use crate::resource::{SystemSampler, SystemSnapshot};
 use crate::session::{ConnectCtx, PendingCred, PendingHostKey, PendingMfa};
 use crate::sftp::{spawn_sftp, SftpHandles, SftpLastCwd};
 use crate::ssh::{
-    format_mtime, format_size, spawn_session, test_session_auth, ProcInfo, SessionCommand,
-    SessionEvent, SessionHandle, SystemDetails,
+    format_mtime, format_size, spawn_session, test_session_auth, PointerInputKind, ProcInfo,
+    SessionCommand, SessionEvent, SessionHandle, SystemDetails,
 };
+#[cfg(windows)]
+use crate::terminal::c0_letter_key_down;
 use crate::terminal::{
     bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
-    encode_command_bar_input, encode_pasted_text, key_to_pty_bytes, paste_requires_large_review,
-    should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste, CsiState,
-    OutputHighlightPreset, RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
+    encode_command_bar_input, encode_pasted_text, encode_terminal_mouse_event, key_to_pty_bytes,
+    paste_requires_large_review, should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste,
+    clear_pixel_pool, recycle_pixel_buffer, CsiState, OutputHighlightPreset, RasterCompletion,
+    RasterConfig, RasterJob, RasterResult, RasterResultState, RasterSpan, RenderGates,
+    TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers, TerminalMouseEventKind,
+    TerminalRasterizer,
 };
 #[cfg(test)]
 use crate::terminal::{
     build_row, highlight_plain_output, log_level_marker, normalize_pasted_newlines,
     text_cell_width, vt_span_colors, CompiledOutputRule, HistSpan, Line,
 };
-#[cfg(windows)]
-use crate::terminal::c0_letter_key_down;
 #[cfg(any(target_os = "windows", test))]
 use crate::terminal::{windows_process_ctrl_release, CtrlKeySide};
-use crate::resource::system::{format_bytes_per_sec, format_mem};
-use crate::resource::{SystemSampler, SystemSnapshot};
 use crate::ui::*;
 use crate::webdav::WebDavAcceptAnyCertVerifier;
 
@@ -158,7 +178,6 @@ fn tab_title_len(title: &str) -> i32 {
         .sum::<usize>()
         .min(i32::MAX as usize) as i32
 }
-
 
 fn should_block_close(exit_confirmed: bool, has_live_sessions: bool) -> bool {
     !exit_confirmed && has_live_sessions
@@ -374,6 +393,64 @@ pub fn run() -> Result<()> {
     let bufs: TermBuffers = Arc::new(Mutex::new(HashMap::new()));
     let render_gates: RenderGates = Arc::new(Mutex::new(HashMap::new()));
 
+    // The opt-in loopback API sees only rendered terminal text and live input
+    // channels. Saved sessions and credentials never enter this shared state.
+    let debug_api_state = {
+        let screen_bufs = bufs.clone();
+        DebugApiState::new(move |tab_id, max_lines| {
+            let handle = term_buf(&screen_bufs, tab_id)?;
+            let mut buffer = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = buffer.render();
+            Some(debug_screen_lines(&buffer.displayed_text, max_lines))
+        })
+    };
+    {
+        let pointer_bufs = bufs.clone();
+        debug_api_state.set_pointer_encoder(move |tab_id, event: DebugPointerEvent| {
+            let handle = term_buf(&pointer_bufs, tab_id)?;
+            let buffer = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let kind = match event.kind {
+                DebugPointerEventKind::Press => TerminalMouseEventKind::Press,
+                DebugPointerEventKind::Release => TerminalMouseEventKind::Release,
+                DebugPointerEventKind::Motion => TerminalMouseEventKind::Motion,
+            };
+            encode_terminal_mouse_event(
+                buffer.parser.screen(),
+                kind,
+                event.button,
+                event.col,
+                event.row,
+                event.ctrl,
+                event.alt,
+            )
+        });
+    }
+    debug_api_state.set_runtime_diagnostics_reader(|| {
+        let memory_trim = crate::memory_trim::diagnostics();
+        RuntimeDiagnostics {
+            renderer: active_renderer_name().to_string(),
+            hardware_accelerated: active_renderer_uses_gpu(),
+            terminal_render_interval_ms: active_terminal_render_interval_ms(),
+            memory_trim: DebugMemoryTrimDiagnostics {
+                enabled: memory_trim.enabled,
+                idle_delay_ms: memory_trim.idle_delay_ms,
+                gpu_trim_available: memory_trim.gpu_trim_available,
+                trim_count: memory_trim.trim_count,
+                last_gpu_trimmed: memory_trim.last_gpu_trimmed,
+                last_reclaimed_bytes: memory_trim.last_reclaimed_bytes,
+                last_working_set_bytes: memory_trim.last_working_set_bytes,
+            },
+        }
+    });
+    let debug_api = Rc::new(RefCell::new(DebugApiController::new(
+        runtime.handle().clone(),
+        debug_api_state.clone(),
+    )));
+
     // Last-known terminal pixel dimensions, updated by every terminal-resize
     // callback.  Shared so on_connect_session can pass a sensible initial PTY
     // size to spawn_session before the first resize callback fires.
@@ -392,6 +469,24 @@ pub fn run() -> Result<()> {
     // otherwise they overwrite the persisted size before restoration (#278).
     let window_size_tracking_ready = Rc::new(Cell::new(false));
     let pending_window_size_restore = Rc::new(Cell::new(None::<(f32, f32)>));
+
+    // Renderer readback must happen on Slint's event loop. Scaling and PNG
+    // encoding continue on Tokio's blocking pool in the HTTP service.
+    {
+        let weak = window.as_weak();
+        debug_api_state.set_screenshot_requester(move |reply| {
+            weak.upgrade_in_event_loop(move |win| {
+                let frame = win
+                    .window()
+                    .take_snapshot()
+                    .map(|pixels| ScreenshotFrame { pixels })
+                    .map_err(|error| error.to_string());
+                let _ = reply.send(frame);
+                crate::memory_trim::request_idle_trim();
+            })
+            .map_err(|error| error.to_string())
+        });
+    }
 
     // Show the crate version (from Cargo.toml at compile time) in the sidebar,
     // so the footer never drifts out of sync with the actual build.
@@ -568,6 +663,69 @@ pub fn run() -> Result<()> {
     crate::i18n::apply_to_slint();
     window.set_lang_en(crate::i18n::is_en());
 
+    // Generate the bearer token once, persist it encrypted with the rest of
+    // the config, and keep the listener off until the user explicitly opts in.
+    let debug_token = {
+        let existing = store.borrow().debug_api_token().to_string();
+        if existing.len() >= 24 {
+            existing
+        } else {
+            let token = crate::debug_api::generate_token();
+            let mut config = store.borrow_mut();
+            config.set_debug_api_token(token.clone());
+            if let Err(error) = config.save() {
+                tracing::warn!("failed to save Debug API token: {error:#}");
+            }
+            token
+        }
+    };
+    window.set_debug_api_token(debug_token.clone().into());
+    window.set_debug_api_enabled(store.borrow().debug_api_enabled());
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let controller = debug_api.clone();
+        window.on_set_debug_api_enabled(move |enabled| {
+            let Some(win) = weak.upgrade() else { return };
+            configure_debug_api(
+                &win,
+                &controller,
+                enabled,
+                win.get_debug_api_token().as_str(),
+            );
+            win.set_debug_api_enabled(enabled);
+            let mut config = store.borrow_mut();
+            config.set_debug_api_enabled(enabled);
+            if let Err(error) = config.save() {
+                tracing::warn!("failed to save Debug API setting: {error:#}");
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let controller = debug_api.clone();
+        window.on_regenerate_debug_api_token(move || {
+            let Some(win) = weak.upgrade() else { return };
+            let token = crate::debug_api::generate_token();
+            win.set_debug_api_token(token.clone().into());
+            let enabled = win.get_debug_api_enabled();
+            configure_debug_api(&win, &controller, enabled, &token);
+            let mut config = store.borrow_mut();
+            config.set_debug_api_token(token);
+            config.set_debug_api_enabled(enabled);
+            if let Err(error) = config.save() {
+                tracing::warn!("failed to save regenerated Debug API token: {error:#}");
+            }
+        });
+    }
+    configure_debug_api(
+        &window,
+        &debug_api,
+        store.borrow().debug_api_enabled(),
+        &debug_token,
+    );
+
     // Apply the saved (or system-detected) theme.
     // "dark" / "light" → use that directly; "system" or unset → ask the OS;
     // OS unknown → fall back to dark.
@@ -654,6 +812,12 @@ pub fn run() -> Result<()> {
             let _ = s.save();
         });
     }
+
+    let initial_local_resource_refresh = store.borrow().local_resource_refresh_secs();
+    let initial_remote_resource_refresh = store.borrow().remote_resource_refresh_secs();
+    window.set_local_resource_refresh_secs(initial_local_resource_refresh as i32);
+    window.set_remote_resource_refresh_secs(initial_remote_resource_refresh as i32);
+    let (remote_resource_refresh, _) = tokio::sync::watch::channel(initial_remote_resource_refresh);
 
     // Interface setting: always ask where to save on download (#87). Read live
     // by the download handler from the window property, so just set + persist.
@@ -1386,62 +1550,80 @@ pub fn run() -> Result<()> {
         let handles = handles.clone();
         let statuses = tab_statuses.clone();
         let runtime = runtime.clone();
-        proc_win.on_terminate_process(move |tab_id: SharedString, pid: SharedString, password: SharedString| {
-            let tab_id = tab_id.to_string();
-            let Ok(pid) = pid.parse::<u32>() else {
-                set_process_action_error(&proc_weak, t("无效的 PID", "Invalid PID"));
-                return;
-            };
+        proc_win.on_terminate_process(
+            move |tab_id: SharedString, pid: SharedString, password: SharedString| {
+                let tab_id = tab_id.to_string();
+                let Ok(pid) = pid.parse::<u32>() else {
+                    set_process_action_error(&proc_weak, t("无效的 PID", "Invalid PID"));
+                    return;
+                };
 
-            // Re-check the source tab, PID, and owner against the latest sample;
-            // the main window may have switched tabs since the menu was opened.
-            let ownership = {
-                let states = statuses.lock().unwrap();
-                states.get(&tab_id).map_or_else(
-                    || Err(t("当前会话不可用", "The current session is unavailable")),
-                    |status| status.procs.iter().find(|p| p.pid == pid)
-                        .map(|process| process_needs_root(&status.user, &process.user))
-                        .ok_or_else(|| t("进程已退出", "The process has already exited")),
-                )
-            };
-            let needs_root = match ownership {
-                Ok(value) => value,
-                Err(message) => {
-                    set_process_action_error(&proc_weak, message);
+                // Re-check the source tab, PID, and owner against the latest sample;
+                // the main window may have switched tabs since the menu was opened.
+                let ownership = {
+                    let states = statuses.lock().unwrap();
+                    states.get(&tab_id).map_or_else(
+                        || Err(t("当前会话不可用", "The current session is unavailable")),
+                        |status| {
+                            status
+                                .procs
+                                .iter()
+                                .find(|p| p.pid == pid)
+                                .map(|process| process_needs_root(&status.user, &process.user))
+                                .ok_or_else(|| t("进程已退出", "The process has already exited"))
+                        },
+                    )
+                };
+                let needs_root = match ownership {
+                    Ok(value) => value,
+                    Err(message) => {
+                        set_process_action_error(&proc_weak, message);
+                        return;
+                    }
+                };
+                if needs_root && password.is_empty() {
+                    set_process_action_error(
+                        &proc_weak,
+                        t(
+                            "请输入管理员（sudo）密码",
+                            "Enter the administrator (sudo) password",
+                        ),
+                    );
                     return;
                 }
-            };
-            if needs_root && password.is_empty() {
-                set_process_action_error(
-                    &proc_weak,
-                    t("请输入管理员（sudo）密码", "Enter the administrator (sudo) password"),
-                );
-                return;
-            }
 
-            let root_password = needs_root.then(|| crate::config::Secret::new(password.to_string()));
-            let response = handles.borrow().get(&tab_id)
-                .map(|handle| handle.kill_process(pid, root_password));
-            let Some(response) = response else {
-                set_process_action_error(&proc_weak, t("SSH 会话不可用", "The SSH session is unavailable"));
-                return;
-            };
+                let root_password =
+                    needs_root.then(|| crate::config::Secret::new(password.to_string()));
+                let response = handles
+                    .borrow()
+                    .get(&tab_id)
+                    .map(|handle| handle.kill_process(pid, root_password));
+                let Some(response) = response else {
+                    set_process_action_error(
+                        &proc_weak,
+                        t("SSH 会话不可用", "The SSH session is unavailable"),
+                    );
+                    return;
+                };
 
-            let done_weak = proc_weak.clone();
-            runtime.spawn(async move {
-                let result = response.await.unwrap_or_else(|_| crate::ssh::ProcessKillResult {
-                    success: false,
-                    message: t("SSH 会话已关闭", "The SSH session has closed").to_string(),
+                let done_weak = proc_weak.clone();
+                runtime.spawn(async move {
+                    let result = response
+                        .await
+                        .unwrap_or_else(|_| crate::ssh::ProcessKillResult {
+                            success: false,
+                            message: t("SSH 会话已关闭", "The SSH session has closed").to_string(),
+                        });
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(pw) = done_weak.upgrade() {
+                            pw.set_action_busy(false);
+                            pw.set_action_error(!result.success);
+                            pw.set_action_status(result.message.into());
+                        }
+                    });
                 });
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(pw) = done_weak.upgrade() {
-                        pw.set_action_busy(false);
-                        pw.set_action_error(!result.success);
-                        pw.set_action_status(result.message.into());
-                    }
-                });
-            });
-        });
+            },
+        );
     }
 
     // --- Wire callbacks --------------------------------------------------
@@ -1466,6 +1648,8 @@ pub fn run() -> Result<()> {
         local_snap.clone(),
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
+        remote_resource_refresh.clone(),
+        debug_api_state.clone(),
     );
 
     // Recompute the sidebar whenever the active tab changes (fired from Slint's
@@ -1811,6 +1995,7 @@ pub fn run() -> Result<()> {
         render_gates.clone(),
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
+        debug_api_state.clone(),
     );
     wire_sftp_callbacks(&window, sftp_handles.clone(), sftp_last_cwd.clone());
     wire_key_input(
@@ -1832,7 +2017,9 @@ pub fn run() -> Result<()> {
             local_net_hist: local_net_hist.clone(),
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
+            remote_resource_refresh: remote_resource_refresh.clone(),
             store: store.clone(),
+            debug_api: debug_api_state.clone(),
         },
     );
 
@@ -1855,7 +2042,7 @@ pub fn run() -> Result<()> {
     // the executable (#267).
     let exit_confirmed = Rc::new(Cell::new(false));
 
-    // --- System sampler (1 Hz) ------------------------------------------
+    // --- Configurable local system sampler -------------------------------
     let sampler = Rc::new(Mutex::new(SystemSampler::new()));
     let weak = window.as_weak();
     let tick_sampler = sampler.clone();
@@ -1863,19 +2050,20 @@ pub fn run() -> Result<()> {
     let tick_local = local_snap.clone();
     let tick_net = local_net_hist.clone();
     let tick_activity = activity.clone();
-    let mut bg_tick = 0u32;
-    let timer = slint::Timer::default();
+    let mut last_sample_at = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(5))
+        .unwrap_or_else(std::time::Instant::now);
+    let timer: &'static slint::Timer = Box::leak(Box::new(slint::Timer::default()));
     timer.start(
         slint::TimerMode::Repeated,
-        SystemSampler::recommended_interval(),
+        std::time::Duration::from_secs(initial_local_resource_refresh as u64),
         move || {
             // Skip the (non-trivial) sysinfo refresh + sidebar repaint when no one
             // is looking, and back off to ~5 s when the window is in the background.
             match tick_activity.get() {
                 WinActivity::Hidden => return,
                 WinActivity::Background => {
-                    bg_tick = bg_tick.wrapping_add(1);
-                    if bg_tick % 5 != 0 {
+                    if last_sample_at.elapsed() < std::time::Duration::from_secs(5) {
                         return;
                     }
                 }
@@ -1885,6 +2073,7 @@ pub fn run() -> Result<()> {
                 let mut s = tick_sampler.lock().expect("sampler poisoned");
                 s.sample()
             };
+            last_sample_at = std::time::Instant::now();
             // Append the raw local throughput to the bottom-graph ring buffer
             // (normalisation happens at display time so the graph auto-scales).
             push_ring(&mut tick_net.lock().unwrap(), snap.net_bytes_per_sec as f32);
@@ -1899,10 +2088,63 @@ pub fn run() -> Result<()> {
             }
         },
     );
-    // Keep the timer alive for the entire event loop by parking it on a
-    // leaked Box. Slint timers drop themselves on Drop, and we don't want
-    // that here.
-    Box::leak(Box::new(timer));
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_local_resource_refresh_secs(move |seconds| {
+            let (old, applied, save_result) = {
+                let mut config = store.borrow_mut();
+                let old = config.local_resource_refresh_secs();
+                config.set_local_resource_refresh_secs(seconds.max(1) as u32);
+                let applied = config.local_resource_refresh_secs();
+                let result = config.save();
+                if result.is_err() {
+                    config.set_local_resource_refresh_secs(old);
+                }
+                (old, applied, result)
+            };
+            if let Err(error) = save_result {
+                tracing::warn!("failed to save local resource refresh interval: {error:#}");
+                if let Some(win) = weak.upgrade() {
+                    win.set_local_resource_refresh_secs(old as i32);
+                }
+                return;
+            }
+            timer.set_interval(std::time::Duration::from_secs(applied as u64));
+            if let Some(win) = weak.upgrade() {
+                win.set_local_resource_refresh_secs(applied as i32);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let remote_resource_refresh = remote_resource_refresh.clone();
+        window.on_set_remote_resource_refresh_secs(move |seconds| {
+            let (old, applied, save_result) = {
+                let mut config = store.borrow_mut();
+                let old = config.remote_resource_refresh_secs();
+                config.set_remote_resource_refresh_secs(seconds.max(1) as u32);
+                let applied = config.remote_resource_refresh_secs();
+                let result = config.save();
+                if result.is_err() {
+                    config.set_remote_resource_refresh_secs(old);
+                }
+                (old, applied, result)
+            };
+            if let Err(error) = save_result {
+                tracing::warn!("failed to save remote resource refresh interval: {error:#}");
+                if let Some(win) = weak.upgrade() {
+                    win.set_remote_resource_refresh_secs(old as i32);
+                }
+                return;
+            }
+            remote_resource_refresh.send_replace(applied);
+            if let Some(win) = weak.upgrade() {
+                win.set_remote_resource_refresh_secs(applied as i32);
+            }
+        });
+    }
 
     // OS file drag-and-drop → upload to the active session's SFTP directory,
     // but only when the file is dropped over the file-list area.
@@ -1924,292 +2166,312 @@ pub fn run() -> Result<()> {
         let mut focused = true;
         let mut minimized = false;
         let mut occluded = false;
+        let mut last_terminal_raster_refresh =
+            std::time::Instant::now() - std::time::Duration::from_secs(1);
         // Apply the Win11 rounded-corner hint once, on the first event (the HWND
         // reliably exists by then, unlike a pre-run timer) (#166).
         let mut chrome_done = false;
-        window.window().on_winit_window_event(move |slint_window, event| {
-            if !chrome_done {
-                chrome_done = true;
-                if let Some(win) = weak.upgrade() {
-                    apply_window_chrome(win.window());
+        window
+            .window()
+            .on_winit_window_event(move |slint_window, event| {
+                if !chrome_done {
+                    chrome_done = true;
+                    if let Some(win) = weak.upgrade() {
+                        apply_window_chrome(win.window());
+                    }
                 }
-            }
-            // Recompute window activity, push it to the shared cell, and update
-            // Theme.window-focused (gates the cursor blink) (#127).
-            let apply_activity = |focused: bool, minimized: bool, occluded: bool| {
-                let act = if minimized || occluded {
-                    WinActivity::Hidden
-                } else if focused {
-                    WinActivity::Active
-                } else {
-                    WinActivity::Background
-                };
-                let prev = ev_activity.get();
-                ev_activity.set(act);
-                if let Some(win) = weak.upgrade() {
-                    win.set_window_focused(act == WinActivity::Active);
-                    if prev == WinActivity::Hidden && act != WinActivity::Hidden {
-                        win.set_terminal_restore_cover(true);
-                        let weak2 = weak.clone();
-                        slint::Timer::single_shot(
-                            std::time::Duration::from_millis(120),
-                            move || {
+                // Recompute window activity, push it to the shared cell, and update
+                // Theme.window-focused (gates the cursor blink) (#127).
+                let mut apply_activity = |focused: bool, minimized: bool, occluded: bool| {
+                    let act = if minimized || occluded {
+                        WinActivity::Hidden
+                    } else if focused {
+                        WinActivity::Active
+                    } else {
+                        WinActivity::Background
+                    };
+                    let prev = ev_activity.get();
+                    ev_activity.set(act);
+                    if let Some(win) = weak.upgrade() {
+                        win.set_window_focused(act == WinActivity::Active);
+                        let raster_surface_may_be_stale = terminal_row_images_enabled()
+                            && ((prev == WinActivity::Hidden && act != WinActivity::Hidden)
+                                || (prev != WinActivity::Active && act == WinActivity::Active));
+                        if raster_surface_may_be_stale
+                            && last_terminal_raster_refresh.elapsed()
+                                >= std::time::Duration::from_millis(100)
+                        {
+                            last_terminal_raster_refresh = std::time::Instant::now();
+                            let weak2 = weak.clone();
+                            let bufs = wheel_bufs.clone();
+                            slint::Timer::single_shot(std::time::Duration::ZERO, move || {
                                 if let Some(w) = weak2.upgrade() {
-                                    w.set_terminal_restore_cover(false);
+                                    refresh_visible_terminal_rasters(&w, &bufs);
                                 }
-                            },
-                        );
-                    }
-                }
-            };
-            match event {
-                #[cfg(target_os = "windows")]
-                WEvent::KeyboardInput { event, .. } => {
-                    // Microsoft IME can relabel a Ctrl key-up as Process while
-                    // retaining the physical Ctrl scan code. Slint drops Process,
-                    // so deliver the missing modifier release directly.
-                    if let Some(side) = windows_process_ctrl_release(
-                        event.state,
-                        &event.logical_key,
-                        &event.physical_key,
-                    ) {
-                        let key = match side {
-                            CtrlKeySide::Left => slint::platform::Key::Control,
-                            CtrlKeySide::Right => slint::platform::Key::ControlR,
-                        };
-                        slint_window.dispatch_event(
-                            slint::platform::WindowEvent::KeyReleased { text: key.into() },
-                        );
-                        tracing::debug!(
-                            "restored Windows IME Process-key Ctrl release side={side:?}"
-                        );
-                        return EventResult::PreventDefault;
-                    }
-                }
-                #[cfg(target_os = "windows")]
-                WEvent::Ime(i_slint_backend_winit::winit::event::Ime::Disabled) => {
-                    // Windows emits Ime::Disabled when a composition ends, including
-                    // while switching between Chinese and English input methods. The
-                    // Slint winit backend intentionally ignores this notification, so
-                    // after several switches the native input context can remain
-                    // detached and every TextInput appears to stop accepting keys
-                    // (#236). Re-associate the window with its current default IME;
-                    // the focused Slint TextInput keeps owning text input as before.
-                    slint_window.with_winit_window(|window| window.set_ime_allowed(true));
-                }
-                WEvent::DroppedFile(path) => {
-                    if let Some(win) = weak.upgrade() {
-                        handle_file_drop(&win, &sh, path.clone());
-                    }
-                }
-                WEvent::CursorMoved { position, .. } => {
-                    if let Some(win) = weak.upgrade() {
-                        let scale = win.window().scale_factor().max(0.01) as f64;
-                        let p = position.to_logical::<f64>(scale);
-                        last_cursor_logical = Some((p.x as f32, p.y as f32));
-                    }
-                }
-                WEvent::MouseWheel { delta, .. } if cfg!(target_os = "macos") => {
-                    let Some((x, y)) = last_cursor_logical else {
-                        return EventResult::Propagate;
-                    };
-                    let Some(win) = weak.upgrade() else {
-                        return EventResult::Propagate;
-                    };
-                    let wheel_lines = match delta {
-                        MouseScrollDelta::LineDelta(_, dy) => dy * 3.0,
-                        MouseScrollDelta::PixelDelta(p) => {
-                            let scale = win.window().scale_factor().max(0.01) as f64;
-                            let p = p.to_logical::<f64>(scale);
-                            p.y as f32 / 18.0
+                            });
                         }
-                    };
-                    if wheel_lines.abs() < f32::EPSILON {
-                        return EventResult::Propagate;
+                        if prev == WinActivity::Hidden && act != WinActivity::Hidden {
+                            win.set_terminal_restore_cover(true);
+                            let weak2 = weak.clone();
+                            slint::Timer::single_shot(
+                                std::time::Duration::from_millis(120),
+                                move || {
+                                    if let Some(w) = weak2.upgrade() {
+                                        w.set_terminal_restore_cover(false);
+                                    }
+                                },
+                            );
+                        }
                     }
-                    macos_wheel_accum += wheel_lines;
-                    let whole = macos_wheel_accum.trunc() as i32;
-                    if whole == 0 {
-                        return EventResult::Propagate;
+                };
+                match event {
+                    #[cfg(target_os = "windows")]
+                    WEvent::KeyboardInput { event, .. } => {
+                        // Microsoft IME can relabel a Ctrl key-up as Process while
+                        // retaining the physical Ctrl scan code. Slint drops Process,
+                        // so deliver the missing modifier release directly.
+                        if let Some(side) = windows_process_ctrl_release(
+                            event.state,
+                            &event.logical_key,
+                            &event.physical_key,
+                        ) {
+                            let key = match side {
+                                CtrlKeySide::Left => slint::platform::Key::Control,
+                                CtrlKeySide::Right => slint::platform::Key::ControlR,
+                            };
+                            slint_window.dispatch_event(
+                                slint::platform::WindowEvent::KeyReleased { text: key.into() },
+                            );
+                            tracing::debug!(
+                                "restored Windows IME Process-key Ctrl release side={side:?}"
+                            );
+                            return EventResult::PreventDefault;
+                        }
                     }
-                    macos_wheel_accum -= whole as f32;
-                    if handle_macos_terminal_wheel(&win, &wheel_bufs, x, y, whole) {
-                        return EventResult::PreventDefault;
-                    }
-                }
-                WEvent::Focused(f) => {
-                    focused = *f;
-                    apply_activity(focused, minimized, occluded);
-                    if *f {
-                        #[cfg(target_os = "windows")]
+                    #[cfg(target_os = "windows")]
+                    WEvent::Ime(i_slint_backend_winit::winit::event::Ime::Disabled) => {
+                        // Windows emits Ime::Disabled when a composition ends, including
+                        // while switching between Chinese and English input methods. The
+                        // Slint winit backend intentionally ignores this notification, so
+                        // after several switches the native input context can remain
+                        // detached and every TextInput appears to stop accepting keys
+                        // (#236). Re-associate the window with its current default IME;
+                        // the focused Slint TextInput keeps owning text input as before.
                         slint_window.with_winit_window(|window| window.set_ime_allowed(true));
+                    }
+                    WEvent::DroppedFile(path) => {
+                        if let Some(win) = weak.upgrade() {
+                            handle_file_drop(&win, &sh, path.clone());
+                        }
+                    }
+                    WEvent::CursorMoved { position, .. } => {
+                        if let Some(win) = weak.upgrade() {
+                            let scale = win.window().scale_factor().max(0.01) as f64;
+                            let p = position.to_logical::<f64>(scale);
+                            last_cursor_logical = Some((p.x as f32, p.y as f32));
+                        }
+                    }
+                    WEvent::MouseWheel { delta, .. } if cfg!(target_os = "macos") => {
+                        let Some((x, y)) = last_cursor_logical else {
+                            return EventResult::Propagate;
+                        };
+                        let Some(win) = weak.upgrade() else {
+                            return EventResult::Propagate;
+                        };
+                        let wheel_lines = match delta {
+                            MouseScrollDelta::LineDelta(_, dy) => dy * 3.0,
+                            MouseScrollDelta::PixelDelta(p) => {
+                                let scale = win.window().scale_factor().max(0.01) as f64;
+                                let p = p.to_logical::<f64>(scale);
+                                p.y as f32 / 18.0
+                            }
+                        };
+                        if wheel_lines.abs() < f32::EPSILON {
+                            return EventResult::Propagate;
+                        }
+                        macos_wheel_accum += wheel_lines;
+                        let whole = macos_wheel_accum.trunc() as i32;
+                        if whole == 0 {
+                            return EventResult::Propagate;
+                        }
+                        macos_wheel_accum -= whole as f32;
+                        if handle_macos_terminal_wheel(&win, &wheel_bufs, x, y, whole) {
+                            return EventResult::PreventDefault;
+                        }
+                    }
+                    WEvent::Focused(f) => {
+                        focused = *f;
+                        apply_activity(focused, minimized, occluded);
+                        if *f {
+                            #[cfg(target_os = "windows")]
+                            slint_window.with_winit_window(|window| window.set_ime_allowed(true));
 
-                        // Some window managers deliver the first Resized event
-                        // before the native window belongs to a monitor. Focus
-                        // is a reliable second opportunity to seed restoration;
-                        // request_inner_size will produce the Resized event that
-                        // verifies the native window actually reached the target.
-                        if !ev_window_size_tracking_ready.get() {
-                            if let Some(win) = weak.upgrade() {
-                                if is_wayland_window(&win.window()) {
-                                    ev_pending_window_size_restore.set(None);
-                                    ev_window_size_tracking_ready.set(true);
-                                    tracing::info!(
+                            // Some window managers deliver the first Resized event
+                            // before the native window belongs to a monitor. Focus
+                            // is a reliable second opportunity to seed restoration;
+                            // request_inner_size will produce the Resized event that
+                            // verifies the native window actually reached the target.
+                            if !ev_window_size_tracking_ready.get() {
+                                if let Some(win) = weak.upgrade() {
+                                    if is_wayland_window(&win.window()) {
+                                        ev_pending_window_size_restore.set(None);
+                                        ev_window_size_tracking_ready.set(true);
+                                        tracing::info!(
                                         "[WINDOW_SIZE] skipped persisted-size restore on Wayland"
                                     );
-                                } else if let Some(preferred) =
-                                    ev_pending_window_size_restore.get()
-                                {
-                                    if let Some(target) = clamp_window_size_to_monitor(
-                                        &win.window(),
-                                        Some(preferred),
-                                    ) {
-                                        tracing::info!(
-                                            "[WINDOW_SIZE] focus retry saved={:.0}x{:.0} \
+                                    } else if let Some(preferred) =
+                                        ev_pending_window_size_restore.get()
+                                    {
+                                        if let Some(target) = clamp_window_size_to_monitor(
+                                            &win.window(),
+                                            Some(preferred),
+                                        ) {
+                                            tracing::info!(
+                                                "[WINDOW_SIZE] focus retry saved={:.0}x{:.0} \
                                              target={:.0}x{:.0}",
+                                                preferred.0,
+                                                preferred.1,
+                                                target.0,
+                                                target.1,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            refresh_revealed_main_window(weak.clone());
+                        }
+                    }
+                    WEvent::Occluded(o) => {
+                        occluded = *o;
+                        apply_activity(focused, minimized, occluded);
+                        if !*o {
+                            refresh_revealed_main_window(weak.clone());
+                        }
+                    }
+                    WEvent::ScaleFactorChanged { .. } => {
+                        // Moving a maximized frameless window between mixed-DPI
+                        // monitors can leave Win11 reporting "maximized" while the
+                        // native rectangle/render surface still has the old size.
+                        refresh_revealed_main_window(weak.clone());
+                    }
+                    WEvent::Resized(size) => {
+                        // A 0-sized resize is how Windows reports a minimize; track it
+                        // so we pause the sampler while minimized (#127).
+                        minimized = size.width == 0 || size.height == 0;
+                        apply_activity(focused, minimized, occluded);
+                        // Keep the maximize/restore icon (and resize-edge gating) in
+                        // sync when the OS changes the window state (#119).
+                        if let Some(win) = weak.upgrade() {
+                            let maxed = win
+                                .window()
+                                .with_winit_window(|ww| ww.is_maximized())
+                                .unwrap_or(false);
+                            win.set_window_maximized(maxed);
+                            if !ev_window_size_tracking_ready.get()
+                                && is_wayland_window(&win.window())
+                            {
+                                // The configure size in this event is authoritative
+                                // on Wayland. Accept and persist that actual size;
+                                // never chase the advisory saved size (#286).
+                                ev_pending_window_size_restore.set(None);
+                                ev_window_size_tracking_ready.set(true);
+                                tracing::info!(
+                                    "[WINDOW_SIZE] accepted compositor size {}x{} on Wayland",
+                                    size.width,
+                                    size.height
+                                );
+                            }
+                            if !ev_window_size_tracking_ready.get() {
+                                if let Some(preferred) = ev_pending_window_size_restore.get() {
+                                    let scale = win.window().scale_factor().max(0.01);
+                                    let actual =
+                                        (size.width as f32 / scale, size.height as f32 / scale);
+                                    if let Some(target) =
+                                        clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                    {
+                                        tracing::info!(
+                                            "[WINDOW_SIZE] restore requested saved={:.0}x{:.0} \
+                                         target={:.0}x{:.0} actual={:.0}x{:.0} scale={:.2}",
                                             preferred.0,
                                             preferred.1,
                                             target.0,
                                             target.1,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        refresh_revealed_main_window(weak.clone());
-                    }
-                }
-                WEvent::Occluded(o) => {
-                    occluded = *o;
-                    apply_activity(focused, minimized, occluded);
-                    if !*o {
-                        refresh_revealed_main_window(weak.clone());
-                    }
-                }
-                WEvent::ScaleFactorChanged { .. } => {
-                    // Moving a maximized frameless window between mixed-DPI
-                    // monitors can leave Win11 reporting "maximized" while the
-                    // native rectangle/render surface still has the old size.
-                    refresh_revealed_main_window(weak.clone());
-                }
-                WEvent::Resized(size) => {
-                    // A 0-sized resize is how Windows reports a minimize; track it
-                    // so we pause the sampler while minimized (#127).
-                    minimized = size.width == 0 || size.height == 0;
-                    apply_activity(focused, minimized, occluded);
-                    // Keep the maximize/restore icon (and resize-edge gating) in
-                    // sync when the OS changes the window state (#119).
-                    if let Some(win) = weak.upgrade() {
-                        let maxed = win
-                            .window()
-                            .with_winit_window(|ww| ww.is_maximized())
-                            .unwrap_or(false);
-                        win.set_window_maximized(maxed);
-                        if !ev_window_size_tracking_ready.get()
-                            && is_wayland_window(&win.window())
-                        {
-                            // The configure size in this event is authoritative
-                            // on Wayland. Accept and persist that actual size;
-                            // never chase the advisory saved size (#286).
-                            ev_pending_window_size_restore.set(None);
-                            ev_window_size_tracking_ready.set(true);
-                            tracing::info!(
-                                "[WINDOW_SIZE] accepted compositor size {}x{} on Wayland",
-                                size.width,
-                                size.height
-                            );
-                        }
-                        if !ev_window_size_tracking_ready.get() {
-                            if let Some(preferred) = ev_pending_window_size_restore.get() {
-                                let scale = win.window().scale_factor().max(0.01);
-                                let actual =
-                                    (size.width as f32 / scale, size.height as f32 / scale);
-                                if let Some(target) =
-                                    clamp_window_size_to_monitor(&win.window(), Some(preferred))
-                                {
-                                    tracing::info!(
-                                        "[WINDOW_SIZE] restore requested saved={:.0}x{:.0} \
-                                         target={:.0}x{:.0} actual={:.0}x{:.0} scale={:.2}",
-                                        preferred.0,
-                                        preferred.1,
-                                        target.0,
-                                        target.1,
-                                        actual.0,
-                                        actual.1,
-                                        scale,
-                                    );
-                                    if (actual.0 - target.0).abs() <= 2.0
-                                        && (actual.1 - target.1).abs() <= 2.0
-                                    {
-                                        ev_pending_window_size_restore.set(None);
-                                        ev_window_size_tracking_ready.set(true);
-                                        tracing::info!(
-                                            "[WINDOW_SIZE] restore settled at {:.0}x{:.0}",
                                             actual.0,
-                                            actual.1
+                                            actual.1,
+                                            scale,
+                                        );
+                                        if (actual.0 - target.0).abs() <= 2.0
+                                            && (actual.1 - target.1).abs() <= 2.0
+                                        {
+                                            ev_pending_window_size_restore.set(None);
+                                            ev_window_size_tracking_ready.set(true);
+                                            tracing::info!(
+                                                "[WINDOW_SIZE] restore settled at {:.0}x{:.0}",
+                                                actual.0,
+                                                actual.1
+                                            );
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            "[WINDOW_SIZE] restore deferred: no monitor available \
+                                         saved={:.0}x{:.0}",
+                                            preferred.0,
+                                            preferred.1,
                                         );
                                     }
                                 } else {
-                                    tracing::warn!(
-                                        "[WINDOW_SIZE] restore deferred: no monitor available \
-                                         saved={:.0}x{:.0}",
-                                        preferred.0,
-                                        preferred.1,
+                                    // First run: accept the initialized size as the
+                                    // baseline, but do not persist this startup event.
+                                    ev_window_size_tracking_ready.set(true);
+                                }
+                                return EventResult::Propagate;
+                            }
+                            // Record the last user-adjusted windowed size while the
+                            // resize event still carries authoritative native
+                            // geometry. Persisting only during CloseRequested can
+                            // observe an installer/minimize transition instead
+                            // (#278). Keep writes in memory here; save_layout flushes
+                            // the config on exit.
+                            if ev_window_size_tracking_ready.get() && !maxed && !minimized {
+                                let scale = win.window().scale_factor().max(0.01);
+                                let width = size.width as f32 / scale;
+                                let height = size.height as f32 / scale;
+                                if width > 200.0 && height > 200.0 {
+                                    ev_store.borrow_mut().set_window_size(width, height);
+                                    tracing::debug!(
+                                        "[WINDOW_SIZE] recorded user size {:.0}x{:.0}",
+                                        width,
+                                        height
                                     );
                                 }
-                            } else {
-                                // First run: accept the initialized size as the
-                                // baseline, but do not persist this startup event.
-                                ev_window_size_tracking_ready.set(true);
-                            }
-                            return EventResult::Propagate;
-                        }
-                        // Record the last user-adjusted windowed size while the
-                        // resize event still carries authoritative native
-                        // geometry. Persisting only during CloseRequested can
-                        // observe an installer/minimize transition instead
-                        // (#278). Keep writes in memory here; save_layout flushes
-                        // the config on exit.
-                        if ev_window_size_tracking_ready.get() && !maxed && !minimized {
-                            let scale = win.window().scale_factor().max(0.01);
-                            let width = size.width as f32 / scale;
-                            let height = size.height as f32 / scale;
-                            if width > 200.0 && height > 200.0 {
-                                ev_store.borrow_mut().set_window_size(width, height);
-                                tracing::debug!(
-                                    "[WINDOW_SIZE] recorded user size {:.0}x{:.0}",
-                                    width,
-                                    height
-                                );
                             }
                         }
                     }
-                }
-                WEvent::CloseRequested => {
-                    // Confirm before closing if there are open session tabs (#88),
-                    // so a stray double-click on the title-bar icon / X / Alt+F4
-                    // doesn't silently drop live sessions. Installer/Restart
-                    // Manager may send repeated requests, so never intercept
-                    // again after the user has confirmed shutdown (#267).
-                    if should_block_close(
-                        ev_exit_confirmed.get(),
-                        !close_handles.borrow().is_empty(),
-                    ) {
+                    WEvent::CloseRequested => {
+                        // Confirm before closing if there are open session tabs (#88),
+                        // so a stray double-click on the title-bar icon / X / Alt+F4
+                        // doesn't silently drop live sessions. Installer/Restart
+                        // Manager may send repeated requests, so never intercept
+                        // again after the user has confirmed shutdown (#267).
+                        if should_block_close(
+                            ev_exit_confirmed.get(),
+                            !close_handles.borrow().is_empty(),
+                        ) {
+                            if let Some(win) = weak.upgrade() {
+                                win.set_confirm_close_open(true);
+                            }
+                            return EventResult::PreventDefault;
+                        }
+                        ev_exit_confirmed.set(true);
+                        // No sessions → the window is about to close; persist layout.
                         if let Some(win) = weak.upgrade() {
-                            win.set_confirm_close_open(true);
+                            save_layout(&win, &ev_store);
                         }
-                        return EventResult::PreventDefault;
                     }
-                    ev_exit_confirmed.set(true);
-                    // No sessions → the window is about to close; persist layout.
-                    if let Some(win) = weak.upgrade() {
-                        save_layout(&win, &ev_store);
-                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            EventResult::Propagate
-        });
+                EventResult::Propagate
+            });
     }
     // Confirm-close dialog "Close" → actually quit the event loop (#88).
     {
@@ -2289,10 +2551,8 @@ pub fn run() -> Result<()> {
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 // Mirror the native-X behaviour: confirm if sessions are open.
-                if !should_block_close(
-                    wc_exit_confirmed.get(),
-                    !close_handles.borrow().is_empty(),
-                ) {
+                if !should_block_close(wc_exit_confirmed.get(), !close_handles.borrow().is_empty())
+                {
                     wc_exit_confirmed.set(true);
                     save_layout(&w, &wc_store);
                     let _ = slint::quit_event_loop();
@@ -2347,8 +2607,86 @@ pub fn run() -> Result<()> {
         });
     }
 
-    window.run().context("event loop exited with error")?;
+    #[cfg(windows)]
+    {
+        // Auto/winit does not reveal its chosen renderer until setup. Start
+        // conservative, then let the notifier record the actual graphics API.
+        record_actual_renderer_uses_gpu(false);
+    }
+    #[cfg(windows)]
+    if let Err(error) = window
+        .window()
+        .set_rendering_notifier(|state, graphics_api| {
+            use slint::{GraphicsAPI, RenderingState};
+            match (state, graphics_api) {
+                (
+                    RenderingState::RenderingSetup,
+                    GraphicsAPI::NativeOpenGL { get_proc_address },
+                ) => {
+                    record_actual_renderer_uses_gpu(true);
+                    let available = unsafe {
+                        crate::memory_trim::register_angle_graphics_device(*get_proc_address)
+                    };
+                    tracing::debug!(available, "registered ANGLE D3D11 idle trim device");
+                }
+                (RenderingState::RenderingSetup, _) => {
+                    record_actual_renderer_uses_gpu(false);
+                    crate::memory_trim::clear_graphics_device();
+                }
+                (RenderingState::RenderingTeardown, _) => {
+                    record_actual_renderer_uses_gpu(false);
+                    crate::memory_trim::clear_graphics_device();
+                }
+                _ => {}
+            }
+        })
+    {
+        tracing::debug!(%error, "renderer does not expose graphics memory trimming");
+    }
+    crate::memory_trim::initialize();
+    let run_result = window.run();
+    save_layout(&window, &store);
+    run_result.context("event loop exited with error")?;
     Ok(())
+}
+
+fn debug_screen_lines(displayed_text: &[String], max_lines: usize) -> Vec<String> {
+    let end = displayed_text
+        .iter()
+        .rposition(|line| !line.is_empty())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let start = end.saturating_sub(max_lines);
+    displayed_text[start..end].to_vec()
+}
+
+fn configure_debug_api(
+    window: &AppWindow,
+    controller: &Rc<RefCell<DebugApiController>>,
+    enabled: bool,
+    token: &str,
+) {
+    let default_url = format!("http://127.0.0.1:{DEBUG_API_PORT}");
+    window.set_debug_api_address(default_url.into());
+    if !enabled {
+        controller.borrow_mut().stop();
+        window.set_debug_api_status(t("已关闭", "Disabled").into());
+        return;
+    }
+
+    match controller.borrow_mut().start(DEBUG_API_PORT, token) {
+        Ok(address) => {
+            let url = format!("http://{address}");
+            window.set_debug_api_address(url.clone().into());
+            window.set_debug_api_status(format!("{}: {url}", t("监听中", "Listening")).into());
+        }
+        Err(error) => {
+            tracing::warn!("failed to start Debug API: {error:#}");
+            window.set_debug_api_status(
+                format!("{}: {error:#}", t("启动失败", "Failed to start")).into(),
+            );
+        }
+    }
 }
 
 /// Center the window on the primary monitor's work area (Windows).
@@ -2447,7 +2785,14 @@ fn terminal_wheel_hit(
     } else {
         term_state.sftp_panel_height + 4.0
     };
-    shrink_edge(&mut term_x, &mut term_y, &mut term_w, &mut term_h, &sftp_dock, sftp_take);
+    shrink_edge(
+        &mut term_x,
+        &mut term_y,
+        &mut term_w,
+        &mut term_h,
+        &sftp_dock,
+        sftp_take,
+    );
 
     // Leave the command bar to TextInput/history handling; wheel fallback is for
     // terminal output only.
@@ -2766,6 +3111,8 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    remote_resource_refresh: tokio::sync::watch::Sender<u32>,
+    debug_api: DebugApiState,
 ) {
     // Working set of port forwards (#56) for the session being created/edited.
     // The forward add/delete callbacks mutate it; saving reads it into
@@ -3166,10 +3513,7 @@ fn wire_session_callbacks(
                 if trimmed.is_empty() {
                     Some(t("请输入分组名称", "Enter a group name"))
                 } else if is_reserved_session_group(trimmed) {
-                    Some(t(
-                        "该名称为系统保留分组",
-                        "This group name is reserved",
-                    ))
+                    Some(t("该名称为系统保留分组", "This group name is reserved"))
                 } else if (orig.is_empty() || !trimmed.eq_ignore_ascii_case(orig.as_str()))
                     && s.session_group_exists(trimmed)
                 {
@@ -3428,6 +3772,7 @@ fn wire_session_callbacks(
                                                 user,
                                                 need_user,
                                                 need_password,
+                                                retry,
                                                 responder,
                                             } => enqueue_cred_prompt(
                                                 &w,
@@ -3436,6 +3781,7 @@ fn wire_session_callbacks(
                                                 user,
                                                 need_user,
                                                 need_password,
+                                                retry,
                                                 responder,
                                             ),
                                             SessionEvent::MfaPrompt {
@@ -3510,13 +3856,9 @@ fn wire_session_callbacks(
     {
         let weak = window.as_weak();
         window.on_session_dialog_pick_key(move || {
-            let mut dialog =
-                rfd::FileDialog::new()
-                    .set_title(t("选择私钥文件", "Choose private key file"))
-                    .add_filter(
-                        t("SSH 私钥", "SSH private keys"),
-                        &["ppk", "pem", "key"],
-                    );
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(t("选择私钥文件", "Choose private key file"))
+                .add_filter(t("SSH 私钥", "SSH private keys"), &["ppk", "pem", "key"]);
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -3595,6 +3937,8 @@ fn wire_session_callbacks(
         let local_snap = local_snap.clone();
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
+        let remote_resource_refresh = remote_resource_refresh.clone();
+        let debug_api = debug_api.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
             let session = if id.starts_with("system:") {
@@ -3620,6 +3964,17 @@ fn wire_session_callbacks(
                 SessionKind::Telnet => format!("telnet {}:{}", session.host, session.port),
                 SessionKind::Local => format!("local {}", session.name),
             };
+            let api_title = if tab_title.trim().is_empty() {
+                conn_label.clone()
+            } else {
+                tab_title.clone()
+            };
+            debug_api.upsert_terminal(TerminalMetadata::new(
+                tab_id.clone(),
+                api_title,
+                conn_label.clone(),
+                "connecting",
+            ));
             // Serial / Telnet have no SFTP side-channel.
             let has_sftp = session.kind == SessionKind::Ssh;
 
@@ -3662,6 +4017,12 @@ fn wire_session_callbacks(
                 id: tab_id.clone().into(),
                 status: t("连接中...", "Connecting...").into(),
                 spans: ModelRc::from(std::rc::Rc::new(VecModel::<TermSpan>::default())),
+                row_images: ModelRc::from(std::rc::Rc::new(VecModel::<TermRowImage>::default())),
+                row_images_ready: false,
+                row_image_columns: 0,
+                row_image_cell_width: 0.0,
+                row_image_cell_height: 0.0,
+                render_revision: 0,
                 cursor_row: 0,
                 cursor_col: 0,
                 rows_used: 0,
@@ -3713,6 +4074,8 @@ fn wire_session_callbacks(
                 tab_id.clone(),
                 Arc::new(Mutex::new(TermBuffer {
                     parser: vt100::Parser::new(24, 80, 5000),
+                    raster_cell_width: 8.0,
+                    raster_cell_height: 16.0,
                     find_query: String::new(),
                     is_dark: is_dark_now,
                     output_highlight,
@@ -3729,13 +4092,10 @@ fn wire_session_callbacks(
                     raw: std::collections::VecDeque::new(),
                 })),
             );
-            render_gates
-                .lock()
-                .unwrap()
-                .insert(
-                    tab_id.clone(),
-                    Arc::new(TabRenderGate::new(RENDER_MIN_INTERVAL)),
-                );
+            render_gates.lock().unwrap().insert(
+                tab_id.clone(),
+                Arc::new(TabRenderGate::new(RENDER_MIN_INTERVAL)),
+            );
             // No followed-cwd yet: the first OSC 7 always triggers a follow.
             sftp_last_cwd.lock().unwrap().remove(&tab_id);
             // Add the new tab to the focused pane and re-flatten (this also sets
@@ -3767,7 +4127,9 @@ fn wire_session_callbacks(
                 local_net_hist: local_net_hist.clone(),
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
+                remote_resource_refresh: remote_resource_refresh.clone(),
                 store: store.clone(),
+                debug_api: debug_api.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -3835,11 +4197,7 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
         .with_winit_window(|ww| ww.is_maximized())
         .unwrap_or_else(|| win.get_window_maximized());
     let (saved_w, saved_h) = s.window_size();
-    if !native_maximized
-        && (saved_w <= 0.0 || saved_h <= 0.0)
-        && w > 200.0
-        && h > 200.0
-    {
+    if !native_maximized && (saved_w <= 0.0 || saved_h <= 0.0) && w > 200.0 && h > 200.0 {
         // Normal resize events keep this cache current. Only fall back to the
         // close-time geometry for a first run where no valid resize was seen;
         // do not issue a new native resize while the window is shutting down.
@@ -4751,7 +5109,11 @@ fn wire_key_input(
         let pending_size: Rc<RefCell<HashMap<String, (u32, u32)>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let resize_debounce = Rc::new(slint::Timer::default());
-        window.on_terminal_resize(move |tab_id: SharedString, cols_f: f32, rows_f: f32| {
+        window.on_terminal_resize(move |tab_id: SharedString,
+                                        cols_f: f32,
+                                        rows_f: f32,
+                                        cell_width: f32,
+                                        cell_height: f32| {
             // A hidden terminal (inactive tab, or a split sibling not currently
             // shown) reports 0 width/height. Ignore those: flooring 0 to the 10-col
             // minimum and applying it would shrink that tab's PTY *and* poison
@@ -4760,6 +5122,11 @@ fn wire_key_input(
             // Only genuine, visible sizes drive a resize.
             if cols_f < 1.0 || rows_f < 1.0 {
                 return;
+            }
+            if let Some(buffer) = term_buf(&bufs_resize, tab_id.as_str()) {
+                let mut buffer = buffer.lock().unwrap();
+                buffer.raster_cell_width = cell_width.max(1.0);
+                buffer.raster_cell_height = cell_height.max(1.0);
             }
             let cols = (cols_f as u32).max(10);
             let rows = (rows_f as u32).max(5);
@@ -4780,6 +5147,7 @@ fn wire_key_input(
                     let settled: Vec<(String, (u32, u32))> = pending.borrow_mut().drain().collect();
                     for (tab, (cols, rows)) in settled {
                         tracing::debug!("terminal_resize tab={} cols={} rows={}", tab, cols, rows);
+                        forget_terminal_raster(&tab);
                         apply_terminal_resize(&handles, &bufs, &last, &tab, cols, rows);
                         // Re-render so the reflowed (or resized) grid shows at once
                         // instead of waiting for the next remote output (#169).
@@ -4894,6 +5262,7 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_clear_terminal(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
+            forget_terminal_raster(&tid);
             if let Some(h) = term_buf(&bufs_clear, &tid) {
                 let mut buf = h.lock().unwrap();
                 let (rows, cols) = buf.parser.screen().size();
@@ -4910,14 +5279,35 @@ fn wire_key_input(
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
-                    row.spans = ModelRc::from(Rc::new(VecModel::<TermSpan>::default()));
-                    row.find_matches = ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
-                    row.selection = ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
-                    row.cursor_row = 0;
-                    row.cursor_col = 0;
-                    row.rows_used = 0;
-                    row.scroll_max = 0;
-                    row.scroll_offset = 0;
+                    let model_changed = sync_term_span_rows(&row.spans, &[])
+                        | sync_vec_model_rows(&row.find_matches, &[], term_match_eq)
+                        | sync_vec_model_rows(&row.selection, &[], term_match_eq);
+                    if let Some(images) = row
+                        .row_images
+                        .as_any()
+                        .downcast_ref::<VecModel<TermRowImage>>()
+                    {
+                        clear_terminal_row_images(images);
+                    }
+                    row.row_images_ready = false;
+                    row.row_image_columns = 0;
+                    row.row_image_cell_width = 0.0;
+                    row.row_image_cell_height = 0.0;
+                    let scalar_changed = row.cursor_row != 0
+                        || row.cursor_col != 0
+                        || row.rows_used != 0
+                        || row.scroll_max != 0
+                        || row.scroll_offset != 0;
+                    if scalar_changed {
+                        row.cursor_row = 0;
+                        row.cursor_col = 0;
+                        row.rows_used = 0;
+                        row.scroll_max = 0;
+                        row.scroll_offset = 0;
+                    }
+                    if model_changed || scalar_changed {
+                        row.render_revision = row.render_revision.wrapping_add(1);
+                    }
                 });
             }
             if let Some(h) = handles_clear.borrow().get(&tid) {
@@ -4949,9 +5339,8 @@ fn wire_key_input(
                     rebuild_tab_display(&win, &bufs_find, &tid);
                     return;
                 }
-                let model = ModelRc::from(Rc::new(VecModel::from(matches)));
                 set_terminal_row(&win, &tid, |row| {
-                    row.find_matches = model.clone();
+                    sync_vec_model_rows(&row.find_matches, &matches, term_match_eq);
                 });
             }
         });
@@ -4990,21 +5379,17 @@ fn wire_key_input(
             let bytes = term_buf(&bufs_wheel, &tid).map(|h| {
                 let buf = h.lock().unwrap();
                 let screen = buf.parser.screen();
-                if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
-                    // 1-based cell under the cursor, clamped to the screen.
-                    let (rows, cols) = screen.size();
-                    let c = (col.clamp(0, cols.saturating_sub(1) as i32) as u16) + 1;
-                    let r = (row.clamp(0, rows.saturating_sub(1) as i32) as u16) + 1;
-                    let btn: u16 = if dir > 0 { 64 } else { 65 }; // wheel up / down
-                    if screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr {
-                        format!("\x1b[<{btn};{c};{r}M").into_bytes()
-                    } else {
-                        // Legacy X10 encoding: ESC [ M  Cb Cx Cy  (each value + 32).
-                        let cb = (btn + 32) as u8;
-                        let cx = (c.min(223) + 32) as u8;
-                        let cy = (r.min(223) + 32) as u8;
-                        vec![0x1b, b'[', b'M', cb, cx, cy]
-                    }
+                let button = if dir > 0 { 64 } else { 65 };
+                if let Some(bytes) = encode_terminal_mouse_event(
+                    screen,
+                    TerminalMouseEventKind::Press,
+                    button,
+                    col,
+                    row,
+                    false,
+                    false,
+                ) {
+                    bytes
                 } else {
                     // alternate-scroll: 3 arrow presses per notch, app-cursor aware.
                     let one: &[u8] = if dir > 0 {
@@ -5027,6 +5412,59 @@ fn wire_key_input(
         });
     }
 
+    // Forward presses, releases, and motion only while the terminal application
+    // has enabled an xterm mouse mode. A false result leaves the gesture with
+    // Slint's local text selection and context-menu behavior.
+    {
+        let bufs_pointer = bufs.clone();
+        let handles_pointer = handles.clone();
+        window.on_terminal_pointer(
+            move |tab_id: SharedString,
+                  kind: i32,
+                  button: i32,
+                  col: i32,
+                  row: i32,
+                  ctrl: bool,
+                  alt: bool| {
+                let kind = match kind {
+                    0 => TerminalMouseEventKind::Press,
+                    1 => TerminalMouseEventKind::Release,
+                    2 => TerminalMouseEventKind::Motion,
+                    _ => return false,
+                };
+                let tid = tab_id.to_string();
+                let bytes = term_buf(&bufs_pointer, &tid).and_then(|buffer| {
+                    let buffer = buffer.lock().unwrap();
+                    encode_terminal_mouse_event(
+                        buffer.parser.screen(),
+                        kind,
+                        button.clamp(0, 3) as u16,
+                        col,
+                        row,
+                        ctrl,
+                        alt,
+                    )
+                });
+                let Some(bytes) = bytes else {
+                    return false;
+                };
+                let handles = handles_pointer.borrow();
+                let Some(handle) = handles.get(&tid) else {
+                    return false;
+                };
+                if !bytes.is_empty() {
+                    let input_kind = match kind {
+                        TerminalMouseEventKind::Press => PointerInputKind::Press,
+                        TerminalMouseEventKind::Release => PointerInputKind::Release,
+                        TerminalMouseEventKind::Motion => PointerInputKind::Motion,
+                    };
+                    handle.send_pointer(bytes, input_kind);
+                }
+                true
+            },
+        );
+    }
+
     // Scrollbar drag → jump to an absolute scrollback offset (#103).
     {
         let bufs_scroll = bufs.clone();
@@ -5047,34 +5485,36 @@ fn wire_key_input(
     {
         let bufs_sel = bufs.clone();
         let weak = window.as_weak();
-        window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32, ctrl: bool, shift: bool| {
-            let tid = tab_id.to_string();
-            with_term_buf(&bufs_sel, &tid, |buf| {
-                let (rows, cols) = buf.parser.screen().size();
-                let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
-                let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
-                // Anchor + focus in absolute scrollback coordinates.
-                let abs = buf.vis_to_abs(r);
-                let point = (abs, c);
-                if ctrl && !shift {
-                    buf.sel_ranges.push((point, point));
-                } else if shift && !buf.sel_ranges.is_empty() {
-                    let anchor = buf.sel_ranges.last().map(|range| range.0).unwrap_or(point);
-                    if let Some(range) = buf.sel_ranges.last_mut() {
-                        *range = (anchor, point);
+        window.on_term_select_start(
+            move |tab_id: SharedString, row: i32, col: i32, ctrl: bool, shift: bool| {
+                let tid = tab_id.to_string();
+                with_term_buf(&bufs_sel, &tid, |buf| {
+                    let (rows, cols) = buf.parser.screen().size();
+                    let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
+                    let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
+                    // Anchor + focus in absolute scrollback coordinates.
+                    let abs = buf.vis_to_abs(r);
+                    let point = (abs, c);
+                    if ctrl && !shift {
+                        buf.sel_ranges.push((point, point));
+                    } else if shift && !buf.sel_ranges.is_empty() {
+                        let anchor = buf.sel_ranges.last().map(|range| range.0).unwrap_or(point);
+                        if let Some(range) = buf.sel_ranges.last_mut() {
+                            *range = (anchor, point);
+                        }
+                    } else {
+                        buf.sel_ranges.clear();
+                        buf.sel_ranges.push((point, point));
                     }
-                } else {
-                    buf.sel_ranges.clear();
-                    buf.sel_ranges.push((point, point));
+                    let (anchor, focus) = buf.sel_ranges.last().copied().unwrap_or((point, point));
+                    buf.sel_anchor = Some(anchor);
+                    buf.sel_focus = Some(focus);
+                });
+                if let Some(win) = weak.upgrade() {
+                    refresh_terminal_selection(&win, &bufs_sel, &tid);
                 }
-                let (anchor, focus) = buf.sel_ranges.last().copied().unwrap_or((point, point));
-                buf.sel_anchor = Some(anchor);
-                buf.sel_focus = Some(focus);
-            });
-            if let Some(win) = weak.upgrade() {
-                refresh_terminal_selection(&win, &bufs_sel, &tid);
-            }
-        });
+            },
+        );
     }
     {
         let bufs_sel = bufs.clone();
@@ -5199,7 +5639,7 @@ fn wire_key_input(
     }
 }
 
-fn set_terminal_row(win: &AppWindow, tab_id: &str, mutator: impl Fn(&mut TerminalState)) {
+fn set_terminal_row(win: &AppWindow, tab_id: &str, mut mutator: impl FnMut(&mut TerminalState)) {
     let terminals = win.get_terminals();
     let Some(model) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() else {
         return;
@@ -5207,8 +5647,11 @@ fn set_terminal_row(win: &AppWindow, tab_id: &str, mutator: impl Fn(&mut Termina
     for i in 0..model.row_count() {
         if let Some(mut row) = model.row_data(i) {
             if row.id.as_str() == tab_id {
+                let previous = row.clone();
                 mutator(&mut row);
-                model.set_row_data(i, row);
+                if row != previous {
+                    model.set_row_data(i, row);
+                }
                 break;
             }
         }

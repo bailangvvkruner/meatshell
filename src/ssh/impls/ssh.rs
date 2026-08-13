@@ -8,24 +8,52 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
+use futures::future::BoxFuture;
 use russh::client::{self, Handle, Handler, Msg};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{decode_secret_key, load_secret_key, PrivateKey};
-use russh::{Channel, ChannelId, ChannelMsg, Disconnect};
+use russh::{Channel, ChannelId, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind};
 use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::{AuthMethod, PortForward, Session};
 use crate::i18n::t;
+use crate::terminal::Utf8StreamDecoder;
 
 use super::structs::*;
+
+/// Keep consecutive presses in separate remote input polls. Some terminal
+/// applications otherwise read a double click as one combined report.
+pub(crate) const MIN_POINTER_PRESS_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(120);
+
+fn pointer_press_deadline(
+    kind: PointerInputKind,
+    last_press: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    if kind != PointerInputKind::Press {
+        return None;
+    }
+    last_press
+        .map(|last| last + MIN_POINTER_PRESS_INTERVAL)
+        .filter(|deadline| *deadline > now)
+}
+
+async fn write_ssh_pointer(
+    channel: &Channel<Msg>,
+    bytes: &[u8],
+    kind: PointerInputKind,
+) -> Result<(), String> {
+    tracing::debug!("ssh pointer input kind={kind:?} len={} bytes", bytes.len());
+    channel.data(bytes).await.map_err(|error| error.to_string())
+}
 
 // ---------------------------------------------------------------------------
 // SFTP-related shared types
 // ---------------------------------------------------------------------------
-
 
 pub(crate) fn load_session_private_key(session: &Session, pass: &str) -> Result<PrivateKey> {
     let pass = if pass.is_empty() { None } else { Some(pass) };
@@ -357,7 +385,6 @@ fn url_decode(s: &str) -> String {
     result
 }
 
-
 async fn kill_remote_process(
     handle: Arc<Handle<ClientHandler>>,
     pid: u32,
@@ -625,6 +652,7 @@ pub fn spawn_session(
     jump: Option<Session>,
     initial_cols: u32,
     initial_rows: u32,
+    remote_resource_refresh: watch::Receiver<u32>,
 ) -> (SessionHandle, UnboundedReceiver<SessionEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<SessionEvent>();
@@ -638,6 +666,7 @@ pub fn spawn_session(
             evt_tx_for_task.clone(),
             initial_cols,
             initial_rows,
+            remote_resource_refresh,
         )
         .await
         {
@@ -810,42 +839,187 @@ pub(crate) enum AuthResult {
     Failed,
 }
 
-/// Authenticate an already-connected SSH handle using the session's method,
-/// prompting for missing credentials and supporting explicit / fallback
-/// `keyboard-interactive` auth (#86, #249). Shared by the shell, SFTP and
-/// jump-host paths. On the keyboard-interactive fallback it reconnects, updating
-/// both `handle` and `jump_handle` in place so the caller keeps the live tunnel.
-pub(crate) async fn authenticate_session(
-    handle: &mut Handle<ClientHandler>,
+const MAX_CREDENTIAL_REPROMPTS: usize = 3;
+
+pub(crate) type AuthReconnectFuture<H> =
+    BoxFuture<'static, Result<(Handle<H>, Option<Handle<ClientHandler>>)>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasswordAuthDecision {
+    Success,
+    Rejected,
+    KeyboardInteractive { reconnect: bool },
+}
+
+fn password_auth_decision(result: &client::AuthResult) -> PasswordAuthDecision {
+    match result {
+        client::AuthResult::Success => PasswordAuthDecision::Success,
+        client::AuthResult::Failure {
+            remaining_methods,
+            partial_success,
+        } if remaining_methods.contains(&MethodKind::KeyboardInteractive) => {
+            PasswordAuthDecision::KeyboardInteractive {
+                // A normal rejection starts the fallback on a fresh transport.
+                // Partial success must stay on this handle to complete MFA.
+                reconnect: !partial_success,
+            }
+        }
+        client::AuthResult::Failure { .. } => PasswordAuthDecision::Rejected,
+    }
+}
+
+async fn reconnect_auth_handle<H, F>(
+    handle: &mut Handle<H>,
+    jump_handle: &mut Option<Handle<ClientHandler>>,
+    reconnect: &mut F,
+) -> Result<()>
+where
+    H: Handler + 'static,
+    H::Error: std::error::Error + Send + Sync + 'static,
+    F: FnMut() -> AuthReconnectFuture<H>,
+{
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+    let (next, next_jump) = reconnect().await?;
+    *handle = next;
+    *jump_handle = next_jump;
+    Ok(())
+}
+
+async fn authenticate_password_with_fallback<H, F>(
+    handle: &mut Handle<H>,
     jump_handle: &mut Option<Handle<ClientHandler>>,
     session: &Session,
-    jump: Option<&Session>,
-    config: Arc<client::Config>,
     events: &UnboundedSender<SessionEvent>,
-) -> Result<AuthResult> {
-    let (user, password) = match resolve_credentials(session, events).await {
+    user: &str,
+    password: &str,
+    reconnect: &mut F,
+) -> Result<bool>
+where
+    H: Handler + 'static,
+    H::Error: std::error::Error + Send + Sync + 'static,
+    F: FnMut() -> AuthReconnectFuture<H>,
+{
+    let result = handle
+        .authenticate_password(user, password)
+        .await
+        .context("password auth failed")?;
+    match password_auth_decision(&result) {
+        PasswordAuthDecision::Success => Ok(true),
+        PasswordAuthDecision::Rejected => {
+            tracing::debug!("password rejected and keyboard-interactive was not advertised");
+            Ok(false)
+        }
+        PasswordAuthDecision::KeyboardInteractive {
+            reconnect: needs_reconnect,
+        } => {
+            if needs_reconnect {
+                reconnect_auth_handle(handle, jump_handle, reconnect).await?;
+            }
+            keyboard_interactive_auth(handle, user, password, &session.id, &session.host, events)
+                .await
+                .context("keyboard-interactive auth failed")
+        }
+    }
+}
+
+/// Authenticate an already-connected transport. Every rejected password is
+/// followed by a UI prompt, and every newly entered password is tried on a new
+/// transport. Shell, SFTP and jump-host paths all use this state machine.
+pub(crate) async fn authenticate_connected_session<H, F>(
+    handle: &mut Handle<H>,
+    jump_handle: &mut Option<Handle<ClientHandler>>,
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+    mut reconnect: F,
+) -> Result<AuthResult>
+where
+    H: Handler + 'static,
+    H::Error: std::error::Error + Send + Sync + 'static,
+    F: FnMut() -> AuthReconnectFuture<H>,
+{
+    let (user, mut password) = match resolve_credentials(session, events).await {
         Some(c) => c,
         None => return Ok(AuthResult::Cancelled),
     };
 
     let authed = match session.auth {
         AuthMethod::Password => {
-            let mut ok = handle
-                .authenticate_password(&user, password.as_str())
+            let mut ok = authenticate_password_with_fallback(
+                handle,
+                jump_handle,
+                session,
+                events,
+                &user,
+                &password,
+                &mut reconnect,
+            )
+            .await?;
+            for _ in 0..MAX_CREDENTIAL_REPROMPTS {
+                if ok {
+                    break;
+                }
+                let Some((_next_user, next_password, _remember)) = request_credential_prompt(
+                    &session.id,
+                    &session.host,
+                    &user,
+                    false,
+                    true,
+                    true,
+                    events,
+                )
                 .await
-                .context("password auth failed")?;
-            if !ok {
-                // russh can't switch auth methods on a handle whose first attempt
-                // already failed (it hangs), so reconnect on a fresh handle before
-                // trying keyboard-interactive (#86).
-                let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-                let (h, jh) = Box::pin(connect_ssh(session, jump, config.clone(), events)).await?;
-                *handle = h;
-                *jump_handle = jh;
+                else {
+                    return Ok(AuthResult::Cancelled);
+                };
+                password = next_password;
+                reconnect_auth_handle(handle, jump_handle, &mut reconnect).await?;
+                ok = authenticate_password_with_fallback(
+                    handle,
+                    jump_handle,
+                    session,
+                    events,
+                    &user,
+                    &password,
+                    &mut reconnect,
+                )
+                .await?;
+            }
+            ok
+        }
+        AuthMethod::KeyboardInteractive => {
+            let mut ok = keyboard_interactive_auth(
+                handle,
+                &user,
+                &password,
+                &session.id,
+                &session.host,
+                events,
+            )
+            .await
+            .context("keyboard-interactive auth failed")?;
+            for _ in 0..MAX_CREDENTIAL_REPROMPTS {
+                if ok {
+                    break;
+                }
+                let Some((_next_user, next_password, _remember)) = request_credential_prompt(
+                    &session.id,
+                    &session.host,
+                    &user,
+                    false,
+                    true,
+                    true,
+                    events,
+                )
+                .await
+                else {
+                    return Ok(AuthResult::Cancelled);
+                };
+                password = next_password;
+                reconnect_auth_handle(handle, jump_handle, &mut reconnect).await?;
                 ok = keyboard_interactive_auth(
                     handle,
                     &user,
-                    password.as_str(),
+                    &password,
                     &session.id,
                     &session.host,
                     events,
@@ -855,16 +1029,6 @@ pub(crate) async fn authenticate_session(
             }
             ok
         }
-        AuthMethod::KeyboardInteractive => keyboard_interactive_auth(
-            handle,
-            &user,
-            password.as_str(),
-            &session.id,
-            &session.host,
-            events,
-        )
-        .await
-        .context("keyboard-interactive auth failed")?,
         AuthMethod::Key => {
             // An encrypted private key needs its passphrase; we reuse the
             // session's password field for it (empty = unencrypted key) (#90).
@@ -873,12 +1037,12 @@ pub(crate) async fn authenticate_session(
             // RSA keys must be signed with an explicit SHA-2 hash; every other
             // key type carries its own algorithm, so no override is needed.
             let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
-                .context("invalid private key / hash algorithm combination")?;
+            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash);
             handle
                 .authenticate_publickey(&user, key_with_hash)
                 .await
                 .context("publickey auth failed")?
+                .success()
         }
     };
 
@@ -887,6 +1051,31 @@ pub(crate) async fn authenticate_session(
     } else {
         Ok(AuthResult::Failed)
     }
+}
+
+/// Shell/jump-host wrapper around the generic authentication state machine.
+pub(crate) fn authenticate_session<'a>(
+    handle: &'a mut Handle<ClientHandler>,
+    jump_handle: &'a mut Option<Handle<ClientHandler>>,
+    session: &'a Session,
+    jump: Option<&'a Session>,
+    config: Arc<client::Config>,
+    events: &'a UnboundedSender<SessionEvent>,
+) -> BoxFuture<'a, Result<AuthResult>> {
+    Box::pin(async move {
+        let reconnect_session = session.clone();
+        let reconnect_jump = jump.cloned();
+        let reconnect_config = config.clone();
+        let reconnect_events = events.clone();
+        authenticate_connected_session(handle, jump_handle, session, events, move || {
+            let session = reconnect_session.clone();
+            let jump = reconnect_jump.clone();
+            let config = reconnect_config.clone();
+            let events = reconnect_events.clone();
+            Box::pin(async move { connect_ssh(&session, jump.as_ref(), config, &events).await })
+        })
+        .await
+    })
 }
 
 /// Connect + authenticate a jump/bastion session, open a `direct-tcpip` channel
@@ -984,6 +1173,240 @@ pub(crate) const COMPAT_CIPHER: &[russh::cipher::Name] = &[
     russh::cipher::TRIPLE_DES_CBC, // legacy fallback
 ];
 
+const RESOURCE_MONITOR_COMMAND: &[u8] = concat!(
+    "PATH=/usr/bin:/bin:/usr/sbin:/sbin; LC_ALL=C; export PATH LC_ALL; ",
+    "while IFS= read -r __ms_tick; do ",
+    "awk '/^cpu /{print}' /proc/stat; ",
+    "awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; ",
+    "cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; ",
+    "echo __MSTICK__; done\n",
+)
+.as_bytes();
+
+const PROCESS_MONITOR_COMMAND: &[u8] = concat!(
+    "PATH=/usr/bin:/bin:/usr/sbin:/sbin; LC_ALL=C; export PATH LC_ALL; ",
+    "if ps -eo pid,user,pcpu,pmem,args --sort=-pcpu >/dev/null 2>&1; then __ms_ps=gnu; ",
+    "elif top -bn1 >/dev/null 2>&1; then __ms_ps=top; ",
+    "elif ps ww >/dev/null 2>&1; then __ms_ps=basic_wide; ",
+    "elif ps >/dev/null 2>&1; then __ms_ps=basic; else __ms_ps=none; fi; ",
+    "while :; do echo __ME__; id -un 2>/dev/null; echo __PS__; ",
+    "case \"$__ms_ps\" in ",
+    "gnu) echo __PS_GNU__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200;; ",
+    "top) echo __PS_TOP__; top -bn1 2>/dev/null | head -n 48 | cut -c -200;; ",
+    "basic_wide) echo __PS_BASIC__; ps ww 2>/dev/null | head -n 41 | cut -c -200;; ",
+    "basic) echo __PS_BASIC__; ps 2>/dev/null | head -n 41 | cut -c -200;; ",
+    "*) echo __PS_NONE__;; esac; ",
+    "echo __PSTICK__; sleep 2; done\n",
+)
+.as_bytes();
+
+const RESOURCE_MONITOR_TRIGGER: &[u8] = b"\n";
+const RESOURCE_MONITOR_END_MARKER: &[u8] = b"__MSTICK__";
+const PROCESS_MONITOR_END_MARKER: &[u8] = b"__PSTICK__";
+
+fn find_delimited_sample_end(buffer: &[u8], marker: &[u8]) -> Option<(usize, usize)> {
+    let mut line_start = 0;
+    for (index, byte) in buffer.iter().enumerate() {
+        if *byte == b'\n' {
+            let line_end = if index > line_start && buffer[index - 1] == b'\r' {
+                index - 1
+            } else {
+                index
+            };
+            if &buffer[line_start..line_end] == marker {
+                return Some((line_start, index + 1));
+            }
+            line_start = index + 1;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn find_resource_monitor_sample_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    find_delimited_sample_end(buffer, RESOURCE_MONITOR_END_MARKER)
+}
+
+fn take_delimited_sample(buffer: &mut Vec<u8>, marker: &[u8]) -> Option<Vec<u8>> {
+    let (block_end, next_sample_start) = find_delimited_sample_end(buffer, marker)?;
+    let mut framed: Vec<u8> = buffer.drain(..next_sample_start).collect();
+    framed.truncate(block_end);
+    Some(framed)
+}
+
+fn take_resource_monitor_sample(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    take_delimited_sample(buffer, RESOURCE_MONITOR_END_MARKER)
+}
+
+fn normalize_remote_resource_refresh_secs(seconds: u32) -> u32 {
+    seconds.clamp(1, 60)
+}
+
+fn resource_monitor_retry_delay(attempt: u32) -> std::time::Duration {
+    const DELAYS: [u64; 5] = [1, 2, 5, 10, 30];
+    std::time::Duration::from_secs(DELAYS[(attempt as usize).min(DELAYS.len() - 1)])
+}
+
+fn resource_monitor_sample_timeout(seconds: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((u64::from(seconds) * 2).max(10))
+}
+
+fn process_monitor_sample_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(10)
+}
+
+fn schedule_resource_monitor_retry(retry_at: &mut Option<tokio::time::Instant>, attempt: &mut u32) {
+    *retry_at = Some(tokio::time::Instant::now() + resource_monitor_retry_delay(*attempt));
+    *attempt = attempt.saturating_add(1);
+}
+
+fn mark_resource_monitor_sample_complete(
+    pending: &mut bool,
+    deadline: &mut Option<tokio::time::Instant>,
+    retry_attempt: &mut u32,
+) {
+    *pending = false;
+    *deadline = None;
+    *retry_attempt = 0;
+}
+
+fn mark_process_monitor_sample_complete(
+    deadline: &mut Option<tokio::time::Instant>,
+    retry_attempt: &mut u32,
+) {
+    *deadline = Some(tokio::time::Instant::now() + process_monitor_sample_timeout());
+    *retry_attempt = 0;
+}
+
+fn mark_process_monitor_failed(
+    buffer: &mut Vec<u8>,
+    deadline: &mut Option<tokio::time::Instant>,
+    retry_at: &mut Option<tokio::time::Instant>,
+    retry_attempt: &mut u32,
+    events: &UnboundedSender<SessionEvent>,
+) {
+    buffer.clear();
+    *deadline = None;
+    let _ = events.send(SessionEvent::ProcessStats {
+        current_user: String::new(),
+        procs: Vec::new(),
+    });
+    schedule_resource_monitor_retry(retry_at, retry_attempt);
+}
+
+async fn open_resource_monitor(handle: &Handle<ClientHandler>) -> Option<Channel<Msg>> {
+    let mut channel = match handle.channel_open_session().await {
+        Ok(channel) => channel,
+        Err(error) => {
+            tracing::warn!("monitor channel open failed: {error}");
+            return None;
+        }
+    };
+    if let Err(error) = channel.exec(true, RESOURCE_MONITOR_COMMAND).await {
+        tracing::warn!("monitor exec request failed: {error}");
+        let _ = channel.close().await;
+        return None;
+    }
+
+    let confirmation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(()),
+                Some(ChannelMsg::Failure) => return Err("server rejected the exec request"),
+                Some(ChannelMsg::Eof)
+                | Some(ChannelMsg::Close)
+                | Some(ChannelMsg::ExitStatus { .. })
+                | Some(ChannelMsg::ExitSignal { .. })
+                | None => return Err("channel closed before exec confirmation"),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    match confirmation {
+        Ok(Ok(())) => Some(channel),
+        Ok(Err(reason)) => {
+            tracing::warn!("monitor exec failed: {reason}");
+            let _ = channel.close().await;
+            None
+        }
+        Err(_) => {
+            tracing::warn!("monitor exec confirmation timed out");
+            let _ = channel.close().await;
+            None
+        }
+    }
+}
+
+async fn open_process_monitor(handle: &Handle<ClientHandler>) -> Option<Channel<Msg>> {
+    let mut channel = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.channel_open_session(),
+    )
+    .await
+    {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(error)) => {
+            tracing::warn!("process monitor channel open failed: {error}");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("process monitor channel open timed out");
+            return None;
+        }
+    };
+    if let Err(error) = channel.exec(true, PROCESS_MONITOR_COMMAND).await {
+        tracing::warn!("process monitor exec request failed: {error}");
+        let _ = channel.close().await;
+        return None;
+    }
+
+    let confirmation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(()),
+                Some(ChannelMsg::Failure) => return Err("server rejected the exec request"),
+                Some(ChannelMsg::Eof)
+                | Some(ChannelMsg::Close)
+                | Some(ChannelMsg::ExitStatus { .. })
+                | Some(ChannelMsg::ExitSignal { .. })
+                | None => return Err("channel closed before exec confirmation"),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    match confirmation {
+        Ok(Ok(())) => Some(channel),
+        Ok(Err(reason)) => {
+            tracing::warn!("process monitor exec failed: {reason}");
+            let _ = channel.close().await;
+            None
+        }
+        Err(_) => {
+            tracing::warn!("process monitor exec confirmation timed out");
+            let _ = channel.close().await;
+            None
+        }
+    }
+}
+
+async fn close_resource_monitor(channel: &mut Option<Channel<Msg>>) {
+    if let Some(channel) = channel.take() {
+        if let Err(error) = channel.close().await {
+            tracing::warn!("monitor channel close failed: {error}");
+        }
+    }
+}
+
+async fn close_process_monitor(channel: &mut Option<Channel<Msg>>) {
+    if let Some(channel) = channel.take() {
+        if let Err(error) = channel.close().await {
+            tracing::warn!("process monitor channel close failed: {error}");
+        }
+    }
+}
+
 fn ssh_client_config() -> Arc<client::Config> {
     Arc::new(client::Config {
         // Keep idle connections alive (#160). The terminal usually has the
@@ -1049,6 +1472,7 @@ async fn run_session(
     events: UnboundedSender<SessionEvent>,
     initial_cols: u32,
     initial_rows: u32,
+    mut remote_resource_refresh: watch::Receiver<u32>,
 ) -> Result<()> {
     let session_started = std::time::Instant::now();
     let _ = events.send(SessionEvent::Status(format!(
@@ -1179,6 +1603,10 @@ async fn run_session(
     // session makes recalling an accidentally saved setup command clear normal
     // terminal rows (#289).
     let mut late_prompt_echo_pending = false;
+    // SSH packet boundaries are arbitrary and may split a multibyte scalar.
+    // Keep stdout and stderr state separate so neither stream corrupts the other.
+    let mut stdout_decoder = Utf8StreamDecoder::default();
+    let mut stderr_decoder = Utf8StreamDecoder::default();
     // After a ZMODEM transfer finishes we briefly ignore ZMODEM detection so the
     // sender's lingering close frames can't spawn a spurious second receive (#76).
     let mut zmodem_done_at: Option<std::time::Instant> = None;
@@ -1216,23 +1644,10 @@ async fn run_session(
     // (see the suppress block below), so it doesn't matter that the long line
     // wraps — we never substring-match it.
     let prompt_setup = format!(" {}\r", PROMPT_BODY);
-    // --- Remote resource monitor (separate exec channel) ----------------
-    // A tiny remote loop streams /proc/stat + /proc/meminfo every 2s; we parse
-    // it into CPU% / mem / swap for the sidebar.  Best-effort: if the channel
-    // or exec fails (e.g. a non-Linux host without /proc), monitoring is
-    // silently skipped and the interactive shell is unaffected.
-    // Reset PATH to the standard system directories first (#27): the monitor
-    // runs over an exec channel, so a server with a hijacked PATH (or a
-    // BASH_ENV pointing at a malicious file) could otherwise shadow awk/cat/df/
-    // sleep with arbitrary binaries. A fixed PATH covering /usr/bin and /bin is
-    // more portable than hardcoding one absolute path per tool (their location
-    // differs across distros). Monitoring is best-effort, so even if this shell
-    // is unusual and the reset finds nothing, only the sidebar stats are lost.
-    // The `ps` section feeds the process monitor (#23): top-40 by CPU, columns
-    // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
-    // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
-    // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __MSTICK__; sleep 2; done\n";
+    // Client-side triggers let every connected session apply interval changes
+    // immediately. A stalled or closed monitor is bounded and reopened below.
+    let mut monitor_seconds =
+        normalize_remote_resource_refresh_secs(*remote_resource_refresh.borrow_and_update());
     // Detailed system information is intentionally one-shot and last priority.
     // It includes commands such as lspci/hostname that may be slow on some hosts
     // and must never delay either the terminal or the lightweight sidebar sample.
@@ -1241,8 +1656,17 @@ async fn run_session(
     // non-POSIX / Windows server) — the /proc-based loop only spews errors there
     // (#140).
     let mut mon_channel: Option<Channel<Msg>> = None;
-    let mut mon_buf = String::new();
-    let mut sys_buf = String::new();
+    let mut monitor_settings_open = true;
+    let mut monitor_opening: Option<JoinHandle<Option<Channel<Msg>>>> = None;
+    let mut monitor_retry_at: Option<tokio::time::Instant> = None;
+    let mut monitor_retry_attempt = 0u32;
+    let mut monitor_tick =
+        tokio::time::interval(std::time::Duration::from_secs(monitor_seconds as u64));
+    monitor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut monitor_sample_pending = false;
+    let mut monitor_sample_deadline: Option<tokio::time::Instant> = None;
+    let mut mon_buf: Vec<u8> = Vec::new();
+    let mut sys_buf: Vec<u8> = Vec::new();
     let mut prev_cpu: Option<(u64, u64)> = None; // (total jiffies, idle jiffies)
     let mut prev_net: std::collections::HashMap<String, (u64, u64)> =
         std::collections::HashMap::new(); // iface -> (rx_bytes, tx_bytes)
@@ -1251,10 +1675,13 @@ async fn run_session(
     // Process sampling has its own channel. The broader resource command above
     // includes probes such as `df` which can block indefinitely on a stale NFS
     // mount; that must not leave dead PIDs frozen in the process window.
-    const PROC_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do echo __ME__; id -un 2>/dev/null; echo __PS__; ps -eo pid,user:32,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __PSTICK__; sleep 2; done\n";
     let mut proc_channel: Option<Channel<Msg>> = None;
+    let mut proc_opening: Option<JoinHandle<Option<Channel<Msg>>>> = None;
+    let mut proc_retry_at: Option<tokio::time::Instant> = None;
+    let mut proc_retry_attempt = 0u32;
+    let mut proc_sample_deadline: Option<tokio::time::Instant> = None;
     let mut sys_channel: Option<Channel<Msg>> = None;
-    let mut proc_buf = String::new();
+    let mut proc_buf: Vec<u8> = Vec::new();
 
     // --- Port forwarding / tunnels (#56) --------------------------------
     // Remote (-R) first, while we still hold `handle` mutably (tcpip_forward
@@ -1305,54 +1732,26 @@ async fn run_session(
         }
     }
     let handle = Arc::new(handle);
+    if !session.disable_shell_integration {
+        let monitor_handle = handle.clone();
+        monitor_opening = Some(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            open_resource_monitor(monitor_handle.as_ref()).await
+        }));
+    }
 
     // Auxiliary channels are deliberately outside the terminal-ready critical
     // path. SFTP gets the first opportunity after Connected; lightweight
     // resources follow, and process/system enrichment starts last.
-    let (mon_ready_tx, mut mon_ready_rx) = tokio::sync::oneshot::channel();
-    let (proc_ready_tx, mut proc_ready_rx) = tokio::sync::oneshot::channel();
     let (sys_ready_tx, mut sys_ready_rx) = tokio::sync::oneshot::channel();
     if session.disable_shell_integration {
-        let _ = mon_ready_tx.send(None);
-        let _ = proc_ready_tx.send(None);
         let _ = sys_ready_tx.send(None);
     } else {
-        let mon_handle = handle.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-            let channel = match mon_handle.channel_open_session().await {
-                Ok(ch) => match ch.exec(true, MON_CMD).await {
-                    Ok(()) => Some(ch),
-                    Err(error) => {
-                        tracing::warn!("monitor exec failed: {error}");
-                        None
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!("monitor channel open failed: {error}");
-                    None
-                }
-            };
-            let _ = mon_ready_tx.send(channel);
-        });
         let proc_handle = handle.clone();
-        tokio::spawn(async move {
+        proc_opening = Some(tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-            let channel = match proc_handle.channel_open_session().await {
-                Ok(ch) => match ch.exec(true, PROC_CMD).await {
-                    Ok(()) => Some(ch),
-                    Err(error) => {
-                        tracing::warn!("process monitor exec failed: {error}");
-                        None
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!("process monitor channel open failed: {error}");
-                    None
-                }
-            };
-            let _ = proc_ready_tx.send(channel);
-        });
+            open_process_monitor(proc_handle.as_ref()).await
+        }));
         let sys_handle = handle.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
@@ -1372,8 +1771,6 @@ async fn run_session(
             let _ = sys_ready_tx.send(channel);
         });
     }
-    let mut mon_start_pending = true;
-    let mut proc_start_pending = true;
     let mut sys_start_pending = true;
     let mut first_terminal_output = true;
     // Local (-L) and dynamic (-D) listen client-side; their tasks are aborted
@@ -1393,26 +1790,11 @@ async fn run_session(
     emit_tunnel_update(&runtime_forwards, &events);
 
     // --- Main pump ------------------------------------------------------
+    let mut last_pointer_press: Option<tokio::time::Instant> = None;
+    let mut pending_pointer: Option<(Vec<u8>, PointerInputKind)> = None;
+    let mut pending_pointer_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
-            ready = &mut mon_ready_rx, if mon_start_pending => {
-                mon_start_pending = false;
-                mon_channel = ready.unwrap_or(None);
-                tracing::debug!(
-                    "[SESSION_START] id={} stage=resources-started elapsed_ms={}",
-                    session.id,
-                    session_started.elapsed().as_millis()
-                );
-            }
-            ready = &mut proc_ready_rx, if proc_start_pending => {
-                proc_start_pending = false;
-                proc_channel = ready.unwrap_or(None);
-                tracing::debug!(
-                    "[SESSION_START] id={} stage=process-monitor-started elapsed_ms={}",
-                    session.id,
-                    session_started.elapsed().as_millis()
-                );
-            }
             ready = &mut sys_ready_rx, if sys_start_pending => {
                 sys_start_pending = false;
                 sys_channel = ready.unwrap_or(None);
@@ -1422,7 +1804,7 @@ async fn run_session(
                     session_started.elapsed().as_millis()
                 );
             }
-            cmd = commands.recv() => {
+            cmd = commands.recv(), if pending_pointer.is_none() => {
                 match cmd {
                     Some(SessionCommand::RawInput(bytes)) => {
                         // Only log the byte count — never the bytes themselves,
@@ -1431,6 +1813,40 @@ async fn run_session(
                         if let Err(err) = channel.data(&bytes[..]).await {
                             let _ = events.send(SessionEvent::Closed(format!("{}: {err}", t("写入失败", "write failed"))));
                             break;
+                        }
+                    }
+                    Some(SessionCommand::DebugInput { bytes, ack }) => {
+                        tracing::debug!("ssh debug input len={} bytes", bytes.len());
+                        match channel.data(&bytes[..]).await {
+                            Ok(()) => {
+                                let _ = ack.send(Ok(()));
+                            }
+                            Err(err) => {
+                                let reason = format!("{}: {err}", t("写入失败", "write failed"));
+                                let _ = ack.send(Err(reason.clone()));
+                                let _ = events.send(SessionEvent::Closed(reason));
+                                break;
+                            }
+                        }
+                    }
+                    Some(SessionCommand::PointerInput { bytes, kind }) => {
+                        let now = tokio::time::Instant::now();
+                        if let Some(deadline) =
+                            pointer_press_deadline(kind, last_pointer_press, now)
+                        {
+                            pending_pointer = Some((bytes, kind));
+                            pending_pointer_at = Some(deadline);
+                            continue;
+                        }
+                        if let Err(err) = write_ssh_pointer(&channel, &bytes, kind).await {
+                            let _ = events.send(SessionEvent::Closed(format!(
+                                "{}: {err}",
+                                t("写入失败", "write failed")
+                            )));
+                            break;
+                        }
+                        if kind == PointerInputKind::Press {
+                            last_pointer_press = Some(tokio::time::Instant::now());
                         }
                     }
                     Some(SessionCommand::Resize(cols, rows)) => {
@@ -1471,6 +1887,24 @@ async fn run_session(
                         let _ = channel.eof().await;
                         break;
                     }
+                }
+            }
+            _ = tokio::time::sleep_until(
+                pending_pointer_at.unwrap_or_else(tokio::time::Instant::now)
+            ), if pending_pointer.is_some() => {
+                pending_pointer_at = None;
+                let (bytes, kind) = pending_pointer
+                    .take()
+                    .expect("pending pointer exists while its timer is enabled");
+                if let Err(err) = write_ssh_pointer(&channel, &bytes, kind).await {
+                    let _ = events.send(SessionEvent::Closed(format!(
+                        "{}: {err}",
+                        t("写入失败", "write failed")
+                    )));
+                    break;
+                }
+                if kind == PointerInputKind::Press {
+                    last_pointer_press = Some(tokio::time::Instant::now());
                 }
             }
             // Suppression safety net: if the injected hook hasn't echoed its OSC 7
@@ -1518,13 +1952,14 @@ async fn run_session(
                                     // run them through the normal output path so
                                     // the prompt shows and the cwd updates.
                                     if !leftover.is_empty() {
-                                        let text =
-                                            String::from_utf8_lossy(&leftover).into_owned();
+                                        let text = stdout_decoder.decode(&leftover);
                                         if let Some(cwd) = extract_osc7_path(&text) {
                                             let _ =
                                                 events.send(SessionEvent::CwdChanged(cwd));
                                         }
-                                        let _ = events.send(SessionEvent::Output(text));
+                                        if !text.is_empty() {
+                                            let _ = events.send(SessionEvent::Output(text));
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1539,7 +1974,7 @@ async fn run_session(
                             continue;
                         }
 
-                        let chunk = String::from_utf8_lossy(&data).into_owned();
+                        let chunk = stdout_decoder.decode(&data);
 
                         if first_terminal_output {
                             first_terminal_output = false;
@@ -1652,8 +2087,10 @@ async fn run_session(
                         let _ = events.send(SessionEvent::Output(text));
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
-                        let text = String::from_utf8_lossy(&data).into_owned();
-                        let _ = events.send(SessionEvent::Output(text));
+                        let text = stderr_decoder.decode(&data);
+                        if !text.is_empty() {
+                            let _ = events.send(SessionEvent::Output(text));
+                        }
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         let _ = events.send(SessionEvent::Status(
@@ -1664,6 +2101,173 @@ async fn run_session(
                         break;
                     }
                     _ => {}
+                }
+            }
+            opened = async {
+                match monitor_opening.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if monitor_opening.is_some() => {
+                monitor_opening = None;
+                match opened {
+                    Ok(Some(opened_channel)) => {
+                        mon_channel = Some(opened_channel);
+                        monitor_retry_at = None;
+                        monitor_sample_pending = false;
+                        monitor_sample_deadline = None;
+                        mon_buf.clear();
+                        prev_cpu = None;
+                        prev_net.clear();
+                        prev_net_at = std::time::Instant::now();
+                        monitor_tick = tokio::time::interval(std::time::Duration::from_secs(
+                            monitor_seconds as u64,
+                        ));
+                        monitor_tick.set_missed_tick_behavior(
+                            tokio::time::MissedTickBehavior::Skip,
+                        );
+                    }
+                    Ok(None) => schedule_resource_monitor_retry(
+                        &mut monitor_retry_at,
+                        &mut monitor_retry_attempt,
+                    ),
+                    Err(error) => {
+                        tracing::warn!("monitor open task failed: {error}");
+                        schedule_resource_monitor_retry(
+                            &mut monitor_retry_at,
+                            &mut monitor_retry_attempt,
+                        );
+                    }
+                }
+            }
+            opened = async {
+                match proc_opening.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if proc_opening.is_some() => {
+                proc_opening = None;
+                match opened {
+                    Ok(Some(opened_channel)) => {
+                        proc_channel = Some(opened_channel);
+                        proc_retry_at = None;
+                        proc_buf.clear();
+                        proc_sample_deadline = Some(
+                            tokio::time::Instant::now() + process_monitor_sample_timeout(),
+                        );
+                        tracing::debug!(
+                            "[SESSION_START] id={} stage=process-monitor-started elapsed_ms={}",
+                            session.id,
+                            session_started.elapsed().as_millis()
+                        );
+                    }
+                    Ok(None) => mark_process_monitor_failed(
+                        &mut proc_buf,
+                        &mut proc_sample_deadline,
+                        &mut proc_retry_at,
+                        &mut proc_retry_attempt,
+                        &events,
+                    ),
+                    Err(error) => {
+                        tracing::warn!("process monitor open task failed: {error}");
+                        mark_process_monitor_failed(
+                            &mut proc_buf,
+                            &mut proc_sample_deadline,
+                            &mut proc_retry_at,
+                            &mut proc_retry_attempt,
+                            &events,
+                        );
+                    }
+                }
+            }
+            _ = async {
+                match proc_retry_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if proc_retry_at.is_some()
+                && proc_opening.is_none()
+                && proc_channel.is_none() =>
+            {
+                proc_retry_at = None;
+                let proc_handle = handle.clone();
+                proc_opening = Some(tokio::spawn(async move {
+                    open_process_monitor(proc_handle.as_ref()).await
+                }));
+            }
+            _ = async {
+                match proc_sample_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if proc_sample_deadline.is_some() && proc_channel.is_some() => {
+                tracing::warn!("process monitor sample timed out");
+                close_process_monitor(&mut proc_channel).await;
+                mark_process_monitor_failed(
+                    &mut proc_buf,
+                    &mut proc_sample_deadline,
+                    &mut proc_retry_at,
+                    &mut proc_retry_attempt,
+                    &events,
+                );
+            }
+            _ = async {
+                match monitor_retry_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if monitor_retry_at.is_some()
+                && monitor_opening.is_none()
+                && mon_channel.is_none() =>
+            {
+                monitor_retry_at = None;
+                let monitor_handle = handle.clone();
+                monitor_opening = Some(tokio::spawn(async move {
+                    open_resource_monitor(monitor_handle.as_ref()).await
+                }));
+            }
+            _ = async {
+                match monitor_sample_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if monitor_sample_pending && mon_channel.is_some() => {
+                tracing::warn!("monitor sample timed out");
+                close_resource_monitor(&mut mon_channel).await;
+                monitor_sample_pending = false;
+                monitor_sample_deadline = None;
+                mon_buf.clear();
+                schedule_resource_monitor_retry(
+                    &mut monitor_retry_at,
+                    &mut monitor_retry_attempt,
+                );
+            }
+            _ = monitor_tick.tick(), if mon_channel.is_some() => {
+                if !monitor_sample_pending {
+                    let result = match mon_channel.as_ref() {
+                        Some(monitor) => monitor.data(RESOURCE_MONITOR_TRIGGER).await,
+                        None => Ok(()),
+                    };
+                    match result {
+                        Ok(()) => {
+                            monitor_sample_pending = true;
+                            monitor_sample_deadline = Some(
+                                tokio::time::Instant::now()
+                                    + resource_monitor_sample_timeout(monitor_seconds),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!("monitor sample trigger failed: {error}");
+                            close_resource_monitor(&mut mon_channel).await;
+                            monitor_sample_pending = false;
+                            monitor_sample_deadline = None;
+                            mon_buf.clear();
+                            schedule_resource_monitor_retry(
+                                &mut monitor_retry_at,
+                                &mut monitor_retry_attempt,
+                            );
+                        }
+                    }
                 }
             }
             // Remote resource monitor channel.  The `async { ... }` lets us poll
@@ -1677,22 +2281,23 @@ async fn run_session(
             } => {
                 match mon {
                     Some(ChannelMsg::Data { data }) => {
-                        mon_buf.push_str(&String::from_utf8_lossy(&data));
+                        mon_buf.extend_from_slice(&data);
                         // Process every complete sample terminated by the marker.
-                        while let Some(idx) = mon_buf.find("__MSTICK__") {
-                            let block = mon_buf[..idx].to_string();
-                            let rest = mon_buf[idx + "__MSTICK__".len()..]
-                                .trim_start_matches(['\r', '\n'])
-                                .to_string();
-                            mon_buf = rest;
+                        while let Some(block_bytes) = take_resource_monitor_sample(&mut mon_buf) {
+                            let block = String::from_utf8_lossy(&block_bytes);
                             if let Some(stats) = parse_monitor_block(
-                                &block,
+                                block.as_ref(),
                                 &mut prev_cpu,
                                 &mut prev_net,
                                 &mut prev_net_at,
                             ) {
                                 let _ = events.send(stats);
                             }
+                            mark_resource_monitor_sample_complete(
+                                &mut monitor_sample_pending,
+                                &mut monitor_sample_deadline,
+                                &mut monitor_retry_attempt,
+                            );
                         }
                         // Bound the leftover (incomplete) tail: a server that
                         // streams data but never emits the __MSTICK__ marker must
@@ -1700,13 +2305,72 @@ async fn run_session(
                         // A real sample is a few KiB; 1 MiB is a generous ceiling.
                         const MON_BUF_CAP: usize = 1 << 20;
                         if mon_buf.len() > MON_BUF_CAP {
+                            tracing::warn!("monitor sample exceeded the buffer limit");
+                            close_resource_monitor(&mut mon_channel).await;
+                            monitor_sample_pending = false;
+                            monitor_sample_deadline = None;
                             mon_buf.clear();
+                            schedule_resource_monitor_retry(
+                                &mut monitor_retry_at,
+                                &mut monitor_retry_attempt,
+                            );
                         }
+                    }
+                    Some(ChannelMsg::Failure)
+                    | Some(ChannelMsg::Eof)
+                    | Some(ChannelMsg::ExitStatus { .. })
+                    | Some(ChannelMsg::ExitSignal { .. }) => {
+                        tracing::warn!("monitor process stopped");
+                        close_resource_monitor(&mut mon_channel).await;
+                        monitor_sample_pending = false;
+                        monitor_sample_deadline = None;
+                        mon_buf.clear();
+                        schedule_resource_monitor_retry(
+                            &mut monitor_retry_at,
+                            &mut monitor_retry_attempt,
+                        );
                     }
                     Some(ChannelMsg::Close) | None => {
                         mon_channel = None;
+                        monitor_sample_pending = false;
+                        monitor_sample_deadline = None;
+                        mon_buf.clear();
+                        schedule_resource_monitor_retry(
+                            &mut monitor_retry_at,
+                            &mut monitor_retry_attempt,
+                        );
                     }
                     _ => {}
+                }
+            }
+            changed = remote_resource_refresh.changed(), if monitor_settings_open => {
+                match changed {
+                    Err(_) => monitor_settings_open = false,
+                    Ok(()) => {
+                        let requested = normalize_remote_resource_refresh_secs(
+                            *remote_resource_refresh.borrow_and_update(),
+                        );
+                        if requested != monitor_seconds {
+                            monitor_seconds = requested;
+                            monitor_retry_attempt = 0;
+                            monitor_tick = tokio::time::interval(std::time::Duration::from_secs(
+                                monitor_seconds as u64,
+                            ));
+                            monitor_tick.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Skip,
+                            );
+                        }
+                        if mon_channel.is_none()
+                            && monitor_opening.is_none()
+                            && !session.disable_shell_integration
+                        {
+                            monitor_retry_at = None;
+                            let monitor_handle = handle.clone();
+                            monitor_opening = Some(tokio::spawn(async move {
+                                open_resource_monitor(monitor_handle.as_ref()).await
+                            }));
+                        }
+                    }
                 }
             }
             sys = async {
@@ -1717,14 +2381,17 @@ async fn run_session(
             } => {
                 match sys {
                     Some(ChannelMsg::Data { data }) => {
-                        sys_buf.push_str(&String::from_utf8_lossy(&data));
-                        if let Some(idx) = sys_buf.find("__MSTICK__") {
-                            let block = sys_buf[..idx].to_string();
+                        sys_buf.extend_from_slice(&data);
+                        if let Some(block_bytes) = take_delimited_sample(
+                            &mut sys_buf,
+                            RESOURCE_MONITOR_END_MARKER,
+                        ) {
+                            let block = String::from_utf8_lossy(&block_bytes);
                             let mut detail_cpu = None;
                             let mut detail_net = std::collections::HashMap::new();
                             let mut detail_at = std::time::Instant::now();
                             if let Some(details) = parse_monitor_block(
-                                &block,
+                                block.as_ref(),
                                 &mut detail_cpu,
                                 &mut detail_net,
                                 &mut detail_at,
@@ -1749,29 +2416,78 @@ async fn run_session(
             } => {
                 match proc_msg {
                     Some(ChannelMsg::Data { data }) => {
-                        proc_buf.push_str(&String::from_utf8_lossy(&data));
-                        while let Some(idx) = proc_buf.find("__PSTICK__") {
-                            let block = proc_buf[..idx].to_string();
-                            proc_buf = proc_buf[idx + "__PSTICK__".len()..]
-                                .trim_start_matches(['\r', '\n'])
-                                .to_string();
-                            let (current_user, procs) = parse_process_block(&block);
+                        proc_buf.extend_from_slice(&data);
+                        while let Some(block_bytes) =
+                            take_delimited_sample(&mut proc_buf, PROCESS_MONITOR_END_MARKER)
+                        {
+                            let block = String::from_utf8_lossy(&block_bytes);
+                            let (current_user, procs) = parse_process_block(block.as_ref());
                             let _ = events.send(SessionEvent::ProcessStats {
                                 current_user,
                                 procs,
                             });
+                            mark_process_monitor_sample_complete(
+                                &mut proc_sample_deadline,
+                                &mut proc_retry_attempt,
+                            );
                         }
                         const PROC_BUF_CAP: usize = 1 << 18;
                         if proc_buf.len() > PROC_BUF_CAP {
-                            proc_buf.clear();
+                            tracing::warn!("process sample exceeded the buffer limit");
+                            close_process_monitor(&mut proc_channel).await;
+                            mark_process_monitor_failed(
+                                &mut proc_buf,
+                                &mut proc_sample_deadline,
+                                &mut proc_retry_at,
+                                &mut proc_retry_attempt,
+                                &events,
+                            );
                         }
                     }
-                    Some(ChannelMsg::Close) | None => proc_channel = None,
+                    Some(ChannelMsg::Failure)
+                    | Some(ChannelMsg::Eof)
+                    | Some(ChannelMsg::ExitStatus { .. })
+                    | Some(ChannelMsg::ExitSignal { .. }) => {
+                        tracing::warn!("process monitor stopped");
+                        close_process_monitor(&mut proc_channel).await;
+                        mark_process_monitor_failed(
+                            &mut proc_buf,
+                            &mut proc_sample_deadline,
+                            &mut proc_retry_at,
+                            &mut proc_retry_attempt,
+                            &events,
+                        );
+                    }
+                    Some(ChannelMsg::Close) | None => {
+                        proc_channel = None;
+                        mark_process_monitor_failed(
+                            &mut proc_buf,
+                            &mut proc_sample_deadline,
+                            &mut proc_retry_at,
+                            &mut proc_retry_attempt,
+                            &events,
+                        );
+                    }
                     _ => {}
                 }
             }
         }
     }
+
+    for tail in [stdout_decoder.finish(), stderr_decoder.finish()] {
+        if !tail.is_empty() {
+            let _ = events.send(SessionEvent::Output(tail));
+        }
+    }
+
+    if let Some(task) = monitor_opening.take() {
+        task.abort();
+    }
+    if let Some(task) = proc_opening.take() {
+        task.abort();
+    }
+    close_resource_monitor(&mut mon_channel).await;
+    close_process_monitor(&mut proc_channel).await;
 
     // Tear down any port-forward listeners (#56); -R forwards die with the
     // session's disconnect below.
@@ -1793,6 +2509,77 @@ async fn run_session(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ProcessSampleFormat {
+    GnuPs,
+    Top,
+    BasicPs,
+    None,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessColumns {
+    pid: usize,
+    user: usize,
+    cpu: Option<usize>,
+    mem: Option<usize>,
+    command: usize,
+}
+
+fn parse_process_columns(line: &str, format: ProcessSampleFormat) -> Option<ProcessColumns> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let find = |names: &[&str]| fields.iter().position(|field| names.contains(field));
+    let pid = find(&["PID"])?;
+    let user = find(&["USER", "UID"])?;
+    let command = find(&["COMMAND", "CMD"])?;
+    let (cpu, mem) = match format {
+        ProcessSampleFormat::Top => (find(&["%CPU", "CPU%"]), find(&["%VSZ", "%MEM", "MEM%"])),
+        ProcessSampleFormat::BasicPs => (None, None),
+        ProcessSampleFormat::GnuPs | ProcessSampleFormat::None => return None,
+    };
+    Some(ProcessColumns {
+        pid,
+        user,
+        cpu,
+        mem,
+        command,
+    })
+}
+
+fn parse_process_percent(value: &str) -> Option<f32> {
+    value
+        .trim_end_matches('%')
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(|value| value.max(0.0))
+}
+
+fn parse_columnar_process_line(line: &str, columns: ProcessColumns) -> Option<ProcInfo> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let pid: u32 = fields.get(columns.pid)?.parse().ok()?;
+    let user = fields.get(columns.user)?.to_string();
+    let cpu = columns
+        .cpu
+        .and_then(|index| fields.get(index))
+        .and_then(|value| parse_process_percent(value));
+    let mem = columns
+        .mem
+        .and_then(|index| fields.get(index))
+        .and_then(|value| parse_process_percent(value));
+    let command = fields.get(columns.command..)?.join(" ");
+    if command.is_empty() {
+        return None;
+    }
+    Some(ProcInfo {
+        pid,
+        user,
+        cpu,
+        mem,
+        command,
+    })
+}
+
 fn parse_process_block(block: &str) -> (String, Vec<ProcInfo>) {
     const MAX_PROCESS_ENTRIES: usize = 64;
     enum Section {
@@ -1803,14 +2590,63 @@ fn parse_process_block(block: &str) -> (String, Vec<ProcInfo>) {
     let mut section = Section::None;
     let mut current_user = String::new();
     let mut procs = Vec::new();
+    let mut format = ProcessSampleFormat::GnuPs;
+    let mut columns = None;
     for line in block.lines().map(str::trim).filter(|line| !line.is_empty()) {
         match line {
-            "__ME__" => section = Section::User,
-            "__PS__" => section = Section::Processes,
+            "__ME__" => {
+                section = Section::User;
+                continue;
+            }
+            "__PS__" => {
+                section = Section::Processes;
+                continue;
+            }
             _ => match section {
                 Section::User if current_user.is_empty() => current_user = line.to_string(),
                 Section::Processes if procs.len() < MAX_PROCESS_ENTRIES => {
-                    if let Some(process) = parse_ps_line(line) {
+                    match line {
+                        "__PS_GNU__" => {
+                            format = ProcessSampleFormat::GnuPs;
+                            columns = None;
+                            continue;
+                        }
+                        "__PS_TOP__" => {
+                            format = ProcessSampleFormat::Top;
+                            columns = None;
+                            continue;
+                        }
+                        "__PS_BASIC__" => {
+                            format = ProcessSampleFormat::BasicPs;
+                            columns = None;
+                            continue;
+                        }
+                        "__PS_NONE__" => {
+                            format = ProcessSampleFormat::None;
+                            columns = None;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    if columns.is_none()
+                        && matches!(
+                            format,
+                            ProcessSampleFormat::Top | ProcessSampleFormat::BasicPs
+                        )
+                    {
+                        if let Some(parsed) = parse_process_columns(line, format) {
+                            columns = Some(parsed);
+                            continue;
+                        }
+                    }
+                    let process = match format {
+                        ProcessSampleFormat::GnuPs => parse_ps_line(line),
+                        ProcessSampleFormat::Top | ProcessSampleFormat::BasicPs => {
+                            columns.and_then(|parsed| parse_columnar_process_line(line, parsed))
+                        }
+                        ProcessSampleFormat::None => None,
+                    };
+                    if let Some(process) = process {
                         procs.push(process);
                     }
                 }
@@ -1855,6 +2691,8 @@ fn parse_monitor_block(
     let mut seen_fs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     // Processes from `ps` (#23): top-by-CPU rows.
     let mut procs: Vec<ProcInfo> = Vec::new();
+    let mut process_format = ProcessSampleFormat::GnuPs;
+    let mut process_columns: Option<ProcessColumns> = None;
     let mut current_user = String::new();
     let mut sys_kv: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // The sample is split into sections by `echo` markers; everything before the
@@ -1905,9 +2743,49 @@ fn parse_monitor_block(
                 continue;
             }
             Section::Ps => {
-                if procs.len() < MAX_MON_ENTRIES {
-                    if let Some(p) = parse_ps_line(line) {
-                        procs.push(p);
+                match line {
+                    "__PS_GNU__" => {
+                        process_format = ProcessSampleFormat::GnuPs;
+                        process_columns = None;
+                        continue;
+                    }
+                    "__PS_TOP__" => {
+                        process_format = ProcessSampleFormat::Top;
+                        process_columns = None;
+                        continue;
+                    }
+                    "__PS_BASIC__" => {
+                        process_format = ProcessSampleFormat::BasicPs;
+                        process_columns = None;
+                        continue;
+                    }
+                    "__PS_NONE__" => {
+                        process_format = ProcessSampleFormat::None;
+                        process_columns = None;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if process_columns.is_none()
+                    && matches!(
+                        process_format,
+                        ProcessSampleFormat::Top | ProcessSampleFormat::BasicPs
+                    )
+                {
+                    if let Some(columns) = parse_process_columns(line, process_format) {
+                        process_columns = Some(columns);
+                        continue;
+                    }
+                }
+                if procs.len() < 40 {
+                    let process = match process_format {
+                        ProcessSampleFormat::GnuPs => parse_ps_line(line),
+                        ProcessSampleFormat::Top | ProcessSampleFormat::BasicPs => process_columns
+                            .and_then(|columns| parse_columnar_process_line(line, columns)),
+                        ProcessSampleFormat::None => None,
+                    };
+                    if let Some(process) = process {
+                        procs.push(process);
                     }
                 }
                 continue;
@@ -2208,8 +3086,8 @@ fn parse_ps_line(line: &str) -> Option<ProcInfo> {
     Some(ProcInfo {
         pid,
         user,
-        cpu,
-        mem,
+        cpu: Some(cpu),
+        mem: Some(mem),
         command,
     })
 }
@@ -2318,7 +3196,7 @@ where
     for _ in 0..16 {
         match res {
             Kb::Success => return Ok(true),
-            Kb::Failure => return Ok(false),
+            Kb::Failure { .. } => return Ok(false),
             Kb::InfoRequest { prompts, .. } => {
                 let mut responses = Vec::with_capacity(prompts.len());
                 for p in &prompts {
@@ -2418,11 +3296,43 @@ pub(crate) async fn verify_host_key(
     }
 }
 
-/// Resolve a session's username/password, prompting the UI for whatever is
-/// missing (#110). Returns the effective `(user, password)`, or `None` if the
-/// user cancelled. Both the shell and SFTP connections call this; the UI
-/// de-duplicates by session id so a single dialog serves both. A dropped reply
-/// channel (no UI) falls through with the stored values so auth fails normally.
+/// Ask the UI for connection credentials. `retry` marks a password previously
+/// rejected by the server so the UI invalidates its de-duplication cache.
+pub(crate) async fn request_credential_prompt(
+    session_id: &str,
+    host: &str,
+    user: &str,
+    need_user: bool,
+    need_password: bool,
+    retry: bool,
+    events: &UnboundedSender<SessionEvent>,
+) -> Option<CredentialReply> {
+    if retry {
+        let _ = events.send(SessionEvent::Status(
+            t(
+                "认证失败，请重新输入密码",
+                "Authentication failed; re-enter password",
+            )
+            .into(),
+        ));
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    events
+        .send(SessionEvent::CredentialPrompt {
+            session_id: session_id.to_string(),
+            host: host.to_string(),
+            user: user.to_string(),
+            need_user,
+            need_password,
+            retry,
+            responder: CredentialResponder::new(tx),
+        })
+        .ok()?;
+    rx.await.ok().flatten()
+}
+
+/// Resolve a session's username/password, prompting the UI for whichever values
+/// are missing. Returns `None` when the user cancels or the UI is unavailable.
 pub(crate) async fn resolve_credentials(
     session: &Session,
     events: &UnboundedSender<SessionEvent>,
@@ -2434,25 +3344,23 @@ pub(crate) async fn resolve_credentials(
     if !(need_user || need_password) {
         return Some((user, password));
     }
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let sent = events.send(SessionEvent::CredentialPrompt {
-        session_id: session.id.clone(),
-        host: session.host.clone(),
-        user: user.clone(),
+    match request_credential_prompt(
+        &session.id,
+        &session.host,
+        &user,
         need_user,
         need_password,
-        responder: CredentialResponder::new(tx),
-    });
-    if sent.is_err() {
-        return Some((user, password));
-    }
-    match rx.await {
-        Ok(Some((u, p, _remember))) => {
+        false,
+        events,
+    )
+    .await
+    {
+        Some((next_user, next_password, _remember)) => {
             if need_user {
-                user = u.trim().to_string();
+                user = next_user.trim().to_string();
             }
             if need_password {
-                password = p;
+                password = next_password;
             }
             Some((user, password))
         }
@@ -2460,7 +3368,6 @@ pub(crate) async fn resolve_credentials(
     }
 }
 
-#[async_trait]
 impl Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -2490,16 +3397,21 @@ impl Handler for ClientHandler {
         connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        let target = self.remote_forwards.get(&connected_port).cloned();
+        let Some((host, port)) = self.remote_forwards.get(&connected_port).cloned() else {
+            tracing::warn!(
+                "forwarded-tcpip on {connected_address}:{connected_port} with no mapping"
+            );
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        reply.accept().await;
         let events = self.events.clone();
-        let bind = connected_address.to_string();
         tokio::spawn(async move {
-            let Some((host, port)) = target else {
-                tracing::warn!("forwarded-tcpip on {bind}:{connected_port} with no mapping");
-                return;
-            };
             match tokio::net::TcpStream::connect((host.as_str(), port)).await {
                 Ok(mut tcp) => {
                     let mut stream = channel.into_stream();
@@ -2668,10 +3580,183 @@ mod osc_command_tests {
 }
 
 #[cfg(test)]
+mod pointer_pacing_tests {
+    use super::{pointer_press_deadline, PointerInputKind, MIN_POINTER_PRESS_INTERVAL};
+
+    #[test]
+    fn only_consecutive_presses_inside_the_interval_are_delayed() {
+        let first = tokio::time::Instant::now();
+        let soon = first + std::time::Duration::from_millis(35);
+        let deadline = first + MIN_POINTER_PRESS_INTERVAL;
+
+        assert_eq!(
+            pointer_press_deadline(PointerInputKind::Press, Some(first), soon),
+            Some(deadline)
+        );
+        assert_eq!(
+            pointer_press_deadline(PointerInputKind::Press, Some(first), deadline),
+            None
+        );
+        assert_eq!(
+            pointer_press_deadline(PointerInputKind::Release, Some(first), soon),
+            None
+        );
+        assert_eq!(
+            pointer_press_deadline(PointerInputKind::Motion, Some(first), soon),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
 mod monitor_hardening_tests {
-    use super::{parse_df_line, parse_monitor_block, parse_process_block};
+    use super::{
+        find_resource_monitor_sample_end, mark_process_monitor_failed,
+        mark_process_monitor_sample_complete, mark_resource_monitor_sample_complete,
+        normalize_remote_resource_refresh_secs, parse_df_line, parse_monitor_block,
+        parse_process_block, resource_monitor_retry_delay, resource_monitor_sample_timeout,
+        schedule_resource_monitor_retry, take_resource_monitor_sample, ProcInfo,
+        PROCESS_MONITOR_COMMAND, RESOURCE_MONITOR_COMMAND,
+    };
     use std::collections::HashMap;
     use std::time::Instant;
+
+    fn parsed_processes(process_section: &str) -> Vec<ProcInfo> {
+        let block = format!("__ME__\ntest-user\n__PS__\n{process_section}");
+        parse_process_block(&block).1
+    }
+
+    #[test]
+    fn monitor_interval_clamps_to_supported_range() {
+        assert_eq!(normalize_remote_resource_refresh_secs(0), 1);
+        assert_eq!(normalize_remote_resource_refresh_secs(7), 7);
+        assert_eq!(normalize_remote_resource_refresh_secs(999), 60);
+    }
+
+    #[test]
+    fn monitor_commands_keep_sampling_work_isolated() {
+        let resource = std::str::from_utf8(RESOURCE_MONITOR_COMMAND).unwrap();
+        assert!(resource.contains("while IFS= read -r __ms_tick"));
+        assert!(resource.contains("Buffers|Cached"));
+        assert!(resource.contains("__DF__"));
+        assert!(!resource.contains("ps -eo"));
+        assert!(!resource.contains("sleep "));
+
+        let process = std::str::from_utf8(PROCESS_MONITOR_COMMAND).unwrap();
+        assert!(process.contains("ps -eo pid,user,pcpu,pmem,args"));
+        assert!(process.contains("top -bn1"));
+        assert!(process.contains("ps ww"));
+        assert!(process.contains("__PS_GNU__"));
+        assert!(process.contains("__PS_TOP__"));
+        assert!(process.contains("__PS_BASIC__"));
+    }
+
+    #[test]
+    fn parses_gnu_and_busybox_process_fixtures() {
+        let gnu = parsed_processes(
+            "__PS_GNU__\n421 root 12.5 3.2 /usr/bin/python worker.py --queue high priority\n",
+        );
+        assert_eq!(gnu[0].cpu, Some(12.5));
+        assert_eq!(gnu[0].mem, Some(3.2));
+
+        let alpine = parsed_processes(
+            "__PS_TOP__\nMem: 120000K used, 8000K free\n  PID PPID USER STAT VSZ %VSZ CPU %CPU COMMAND\n73 1 app S 120m 4.2% 1 27.5% /usr/bin/python worker.py --name alpine job\n",
+        );
+        assert_eq!(alpine[0].cpu, Some(27.5));
+        assert_eq!(alpine[0].mem, Some(4.2));
+
+        let openwrt = parsed_processes(
+            "__PS_TOP__\n  PID PPID USER STAT VSZ %VSZ %CPU COMMAND\n321 1 network S 8120 7% 13% /usr/sbin/uhttpd -f -h /www local files\n",
+        );
+        assert_eq!(openwrt[0].cpu, Some(13.0));
+        assert_eq!(openwrt[0].mem, Some(7.0));
+
+        let basic = parsed_processes(
+            "__PS_BASIC__\nPID USER VSZ STAT COMMAND\n1 root 1548 S /sbin/procd --foreground mode\n",
+        );
+        assert_eq!(basic[0].cpu, None);
+        assert_eq!(basic[0].mem, None);
+        assert_eq!(basic[0].command, "/sbin/procd --foreground mode");
+    }
+
+    #[test]
+    fn monitor_marker_requires_a_complete_line_and_preserves_utf8() {
+        let embedded = "9 root 0 0 echo __MSTICK__ inside command\n";
+        assert!(find_resource_monitor_sample_end(embedded.as_bytes()).is_none());
+
+        let expected = "MemTotal: 1024 kB\n__PS__\n9 root 1 2 中文命令 --参数 值\n";
+        let wire = format!("{expected}__MSTICK__\n").into_bytes();
+        let mut buffer = Vec::new();
+        let mut framed = None;
+        for byte in wire {
+            buffer.push(byte);
+            if let Some(sample) = take_resource_monitor_sample(&mut buffer) {
+                framed = Some(sample);
+            }
+        }
+        assert_eq!(String::from_utf8(framed.unwrap()).unwrap(), expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn monitor_retry_and_sample_timeouts_are_bounded() {
+        let seconds = |duration: std::time::Duration| duration.as_secs();
+        assert_eq!(seconds(resource_monitor_retry_delay(0)), 1);
+        assert_eq!(seconds(resource_monitor_retry_delay(1)), 2);
+        assert_eq!(seconds(resource_monitor_retry_delay(2)), 5);
+        assert_eq!(seconds(resource_monitor_retry_delay(3)), 10);
+        assert_eq!(seconds(resource_monitor_retry_delay(99)), 30);
+        assert_eq!(seconds(resource_monitor_sample_timeout(1)), 10);
+        assert_eq!(seconds(resource_monitor_sample_timeout(6)), 12);
+        assert_eq!(seconds(resource_monitor_sample_timeout(60)), 120);
+    }
+
+    #[test]
+    fn monitor_backoff_resets_after_a_complete_sample() {
+        let mut retry_at = None;
+        let mut retry_attempt = 0;
+        schedule_resource_monitor_retry(&mut retry_at, &mut retry_attempt);
+        schedule_resource_monitor_retry(&mut retry_at, &mut retry_attempt);
+        assert_eq!(retry_attempt, 2);
+
+        let mut pending = true;
+        let mut deadline = Some(tokio::time::Instant::now());
+        mark_resource_monitor_sample_complete(&mut pending, &mut deadline, &mut retry_attempt);
+        assert!(!pending);
+        assert!(deadline.is_none());
+        assert_eq!(retry_attempt, 0);
+    }
+
+    #[tokio::test]
+    async fn process_monitor_sample_resets_deadline_and_backoff() {
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut retry_at = None;
+        let mut retry_attempt = 3;
+        let mut deadline = None;
+        mark_process_monitor_sample_complete(&mut deadline, &mut retry_attempt);
+        assert!(deadline.is_some());
+        assert_eq!(retry_attempt, 0);
+
+        let mut buffer = b"stale process output".to_vec();
+        mark_process_monitor_failed(
+            &mut buffer,
+            &mut deadline,
+            &mut retry_at,
+            &mut retry_attempt,
+            &events,
+        );
+        assert!(buffer.is_empty());
+        assert!(deadline.is_none());
+        assert!(retry_at.is_some());
+        assert_eq!(retry_attempt, 1);
+        assert!(matches!(
+            received.recv().await,
+            Some(super::SessionEvent::ProcessStats {
+                current_user,
+                procs
+            }) if current_user.is_empty() && procs.is_empty()
+        ));
+    }
 
     #[test]
     fn df_line_saturates_instead_of_overflowing() {
@@ -2843,5 +3928,338 @@ mod mfa_tests {
         ] {
             assert!(looks_like_mfa(p), "missed an MFA prompt: {p:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_prompt_tests {
+    use super::{
+        authenticate_connected_session, password_auth_decision, request_credential_prompt,
+        AuthReconnectFuture, AuthResult, ClientHandler, PasswordAuthDecision, SessionEvent,
+        MAX_CREDENTIAL_REPROMPTS,
+    };
+    use crate::config::{Secret, Session};
+    use russh::client::{self, AuthResult as RusshAuthResult};
+    use russh::keys::ssh_key::private::Ed25519Keypair;
+    use russh::server;
+    use russh::{MethodKind, MethodSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    const OLD_PASSWORD: &str = "rejected-test-password";
+    const NEW_PASSWORD: &str = "accepted-test-password";
+
+    #[derive(Clone)]
+    struct PasswordServer {
+        password_attempts: Arc<AtomicUsize>,
+        keyboard_interactive_attempts: Arc<AtomicUsize>,
+    }
+
+    impl server::Handler for PasswordServer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            user: &str,
+            password: &str,
+        ) -> Result<server::Auth, Self::Error> {
+            self.password_attempts.fetch_add(1, Ordering::SeqCst);
+            if user == "root" && password == NEW_PASSWORD {
+                Ok(server::Auth::Accept)
+            } else {
+                Ok(server::Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
+        }
+
+        async fn auth_keyboard_interactive<'a>(
+            &'a mut self,
+            _user: &str,
+            _submethods: &str,
+            _response: Option<server::Response<'a>>,
+        ) -> Result<server::Auth, Self::Error> {
+            self.keyboard_interactive_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(server::Auth::reject())
+        }
+    }
+
+    struct AcceptServerKey;
+
+    impl client::Handler for AcceptServerKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    fn rejected(methods: &[MethodKind], partial_success: bool) -> RusshAuthResult {
+        RusshAuthResult::Failure {
+            remaining_methods: MethodSet::from(methods),
+            partial_success,
+        }
+    }
+
+    #[test]
+    fn password_only_rejection_does_not_probe_keyboard_interactive() {
+        let result = rejected(&[MethodKind::PublicKey, MethodKind::Password], false);
+        assert_eq!(
+            password_auth_decision(&result),
+            PasswordAuthDecision::Rejected
+        );
+    }
+
+    #[test]
+    fn advertised_keyboard_interactive_reconnects_after_normal_rejection() {
+        let result = rejected(
+            &[MethodKind::Password, MethodKind::KeyboardInteractive],
+            false,
+        );
+        assert_eq!(
+            password_auth_decision(&result),
+            PasswordAuthDecision::KeyboardInteractive { reconnect: true }
+        );
+    }
+
+    #[test]
+    fn partial_password_success_completes_mfa_on_the_same_connection() {
+        let result = rejected(&[MethodKind::KeyboardInteractive], true);
+        assert_eq!(
+            password_auth_decision(&result),
+            PasswordAuthDecision::KeyboardInteractive { reconnect: false }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_password_requests_fresh_credentials() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let prompt = tokio::spawn(async move {
+            request_credential_prompt(
+                "session-1",
+                "host.example",
+                "root",
+                false,
+                true,
+                true,
+                &events,
+            )
+            .await
+        });
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("status event timed out")
+                .expect("status channel closed"),
+            SessionEvent::Status(_)
+        ));
+        match timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("credential event timed out")
+            .expect("credential channel closed")
+        {
+            SessionEvent::CredentialPrompt {
+                session_id,
+                host,
+                user,
+                need_user,
+                need_password,
+                retry,
+                responder,
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(host, "host.example");
+                assert_eq!(user, "root");
+                assert!(!need_user);
+                assert!(need_password);
+                assert!(retry);
+                responder.respond(Some(("root".into(), NEW_PASSWORD.into(), true)));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        assert_eq!(
+            prompt.await.expect("prompt task panicked"),
+            Some(("root".into(), NEW_PASSWORD.into(), true))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_credential_prompt_returns_none() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let prompt = tokio::spawn(async move {
+            request_credential_prompt(
+                "session-2",
+                "host.example",
+                "alice",
+                false,
+                true,
+                false,
+                &events,
+            )
+            .await
+        });
+
+        match timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("credential event timed out")
+            .expect("credential channel closed")
+        {
+            SessionEvent::CredentialPrompt {
+                retry, responder, ..
+            } => {
+                assert!(!retry);
+                responder.respond(None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(prompt.await.expect("prompt task panicked"), None);
+    }
+
+    #[tokio::test]
+    async fn closed_ui_channel_does_not_wait_for_credentials() {
+        let (events, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let result = timeout(
+            Duration::from_secs(1),
+            request_credential_prompt(
+                "session-3",
+                "host.example",
+                "root",
+                false,
+                true,
+                true,
+                &events,
+            ),
+        )
+        .await
+        .expect("closed channel must not block");
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn prompted_password_is_authenticated_on_a_new_connection() {
+        let password_attempts = Arc::new(AtomicUsize::new(0));
+        let keyboard_interactive_attempts = Arc::new(AtomicUsize::new(0));
+        let handler = PasswordServer {
+            password_attempts: password_attempts.clone(),
+            keyboard_interactive_attempts: keyboard_interactive_attempts.clone(),
+        };
+        let mut server_config = server::Config {
+            inactivity_timeout: None,
+            auth_rejection_time: Duration::from_millis(1),
+            auth_rejection_time_initial: Some(Duration::from_millis(1)),
+            methods: MethodSet::from(&[MethodKind::PublicKey, MethodKind::Password][..]),
+            ..server::Config::default()
+        };
+        server_config
+            .keys
+            .push(russh::keys::PrivateKey::from(Ed25519Keypair::from_seed(
+                &[42; 32],
+            )));
+        let server_config = Arc::new(server_config);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        // One initial rejected password connection, then a fresh connection for
+        // the password supplied by the prompt. Password-only servers must never
+        // receive a speculative keyboard-interactive attempt.
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_accepted = accepted.clone();
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await.expect("accept test connection");
+                server_accepted.fetch_add(1, Ordering::SeqCst);
+                let config = server_config.clone();
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let running = server::run_stream(config, socket, handler)
+                        .await
+                        .expect("start test SSH server");
+                    let _ = running.await;
+                });
+            }
+        });
+
+        let client_config = Arc::new(client::Config::default());
+        let mut handle = client::connect(client_config.clone(), address, AcceptServerKey)
+            .await
+            .expect("connect test SSH client");
+        let mut jump_handle: Option<russh::client::Handle<ClientHandler>> = None;
+        let mut session = Session::new_empty();
+        session.id = "password-retry-integration".into();
+        session.host = address.ip().to_string();
+        session.port = address.port();
+        session.user = "root".into();
+        session.password = Secret::new(OLD_PASSWORD);
+
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let prompt_task = tokio::spawn(async move {
+            assert!(matches!(
+                receiver.recv().await,
+                Some(SessionEvent::Status(_))
+            ));
+            match receiver.recv().await.expect("credential prompt") {
+                SessionEvent::CredentialPrompt {
+                    retry,
+                    need_password,
+                    responder,
+                    ..
+                } => {
+                    assert!(retry);
+                    assert!(need_password);
+                    responder.respond(Some(("root".into(), NEW_PASSWORD.into(), false)));
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+
+        let reconnect_config = client_config.clone();
+        let reconnect = move || {
+            let config = reconnect_config.clone();
+            Box::pin(async move {
+                let next = client::connect(config, address, AcceptServerKey).await?;
+                Ok((next, None))
+            }) as AuthReconnectFuture<AcceptServerKey>
+        };
+        let result = timeout(
+            Duration::from_secs(5),
+            authenticate_connected_session(
+                &mut handle,
+                &mut jump_handle,
+                &session,
+                &events,
+                reconnect,
+            ),
+        )
+        .await
+        .expect("password retry flow timed out")
+        .expect("password retry flow failed");
+
+        assert!(matches!(result, AuthResult::Success));
+        prompt_task.await.expect("prompt task panicked");
+        timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server did not accept all connections")
+            .expect("server task panicked");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        assert_eq!(password_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(keyboard_interactive_attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn password_reprompts_are_bounded() {
+        assert_eq!(MAX_CREDENTIAL_REPROMPTS, 3);
     }
 }

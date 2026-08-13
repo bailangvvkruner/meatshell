@@ -1,20 +1,44 @@
 name: Release
 
 # Build native binaries for Windows / Linux / macOS.
-#  - Push a tag like `v0.2.3`  -> builds all platforms and attaches the archives
+#  - Push to main -> updates the rolling Windows x64 `nightly` pre-release.
+#  - Push a tag like `v0.2.3` -> builds all platforms and attaches the archives
 #    to a GitHub Release.
 #  - Run manually (workflow_dispatch) -> builds all platforms and uploads them as
 #    downloadable workflow artifacts (no release created).
 
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write   # needed to create / update the GitHub Release
 
 jobs:
+  security-audit:
+    name: Dependency security audit
+    permissions:
+      contents: read
+      checks: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan Cargo.lock with RustSec
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Keep synchronized with .cargo/audit.toml. RSA has no fixed release;
+          # the remaining quick-xml exceptions are constrained to Slint's
+          # dependency graph and documented there.
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0194,RUSTSEC-2026-0195
+
   check-version:
     name: Check tag version
     runs-on: ubuntu-latest
@@ -49,7 +73,8 @@ jobs:
 
   build:
     name: ${{ matrix.name }}
-    needs: check-version
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+    needs: [check-version, security-audit]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -94,7 +119,7 @@ jobs:
             libudev-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
 
@@ -105,6 +130,11 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify bundled ANGLE runtime
+        if: matrix.name == 'windows-x86_64'
+        shell: pwsh
+        run: ./scripts/verify-angle.ps1 -BinaryDir "target/${{ matrix.target }}/release"
 
       - name: Verify binary version
         if: runner.os != 'Windows'
@@ -198,6 +228,8 @@ jobs:
           elif [ "${{ runner.os }}" = "Windows" ]; then
             mkdir "$STAGE"
             cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
+            cp "target/${{ matrix.target }}/release/libEGL.dll" "target/${{ matrix.target }}/release/libGLESv2.dll" "$STAGE/"
+            cp vendor/angle/windows-x86_64/LICENSE.txt "$STAGE/ANGLE_LICENSE.txt"
             cp README.md README.en.md CHANGELOG.md THIRD_PARTY_NOTICES.md "$STAGE/" 2>/dev/null || true
             7z a "${STAGE}.zip" "$STAGE" >/dev/null
             echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
@@ -214,21 +246,33 @@ jobs:
           fi
 
       # MSI installer with a "choose install location" wizard (WixUI_InstallDir).
-      # Best-effort: if the WiX/cargo-wix tooling hiccups it must not block the
-      # .zip release, hence continue-on-error.
+      # A Windows release is incomplete without its installer, so every command
+      # and the resulting file are checked explicitly.
+      - name: Validate WiX definition (Windows)
+        if: matrix.name == 'windows-x86_64'
+        shell: pwsh
+        run: ./scripts/verify-wix.ps1
+
       - name: Build MSI installer (Windows)
         if: matrix.name == 'windows-x86_64'
-        continue-on-error: true
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $VERSION = "$env:GITHUB_REF_NAME"; if (-not $VERSION) { $VERSION = "dev" }
+          $VERSION = $VERSION -replace '[\\/]', '-'
           # WiX 3 toolset (candle/light) that cargo-wix drives.
           choco install wixtoolset -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "WiX Toolset installation failed with exit code $LASTEXITCODE" }
           $candle = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*\bin\candle.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($candle) { $env:PATH = "$($candle.DirectoryName);$env:PATH" }
-          cargo install cargo-wix --locked
-          cargo wix --no-build --nocapture --target ${{ matrix.target }} --output "meatshell-$VERSION-windows-x86_64.msi"
-          echo "MSI=meatshell-$VERSION-windows-x86_64.msi" >> $env:GITHUB_ENV
+          if (-not $candle) { throw "candle.exe was not found after installing WiX Toolset" }
+          $env:PATH = "$($candle.DirectoryName);$env:PATH"
+          cargo install cargo-wix --version 0.3.9 --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo-wix installation failed with exit code $LASTEXITCODE" }
+          $msi = "meatshell-$VERSION-windows-x86_64.msi"
+          cargo wix --no-build --nocapture --target ${{ matrix.target }} --output $msi
+          if ($LASTEXITCODE -ne 0) { throw "MSI build failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) { throw "MSI build did not create $msi" }
+          echo "MSI=$msi" >> $env:GITHUB_ENV
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -244,11 +288,12 @@ jobs:
           path: ${{ env.APPIMAGE }}
 
       - name: Upload MSI artifact
-        if: matrix.name == 'windows-x86_64' && env.MSI != ''
+        if: matrix.name == 'windows-x86_64'
         uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64-msi
           path: ${{ env.MSI }}
+          if-no-files-found: error
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -265,15 +310,115 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Attach MSI to GitHub Release
-        if: matrix.name == 'windows-x86_64' && env.MSI != '' && startsWith(github.ref, 'refs/tags/')
+        if: matrix.name == 'windows-x86_64' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.MSI }}
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
+
+  nightly-windows:
+    name: windows-x86_64-nightly
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [check-version, security-audit]
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      ASSET: meatshell-nightly-windows-x86_64.zip
+      MSI: meatshell-nightly-windows-x86_64.msi
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}-nightly
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Verify bundled ANGLE runtime
+        shell: pwsh
+        run: ./scripts/verify-angle.ps1 -BinaryDir "target/$env:TARGET/release"
+
+      - name: Package nightly zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "meatshell-nightly-windows-x86_64"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/$env:TARGET/release/meatshell.exe" $stage
+          Copy-Item "target/$env:TARGET/release/libEGL.dll", "target/$env:TARGET/release/libGLESv2.dll" $stage
+          Copy-Item "vendor/angle/windows-x86_64/LICENSE.txt" "$stage/ANGLE_LICENSE.txt"
+          Copy-Item README.md, README.en.md, CHANGELOG.md, THIRD_PARTY_NOTICES.md $stage
+          Compress-Archive -Path $stage -DestinationPath $env:ASSET
+          if (-not (Test-Path -LiteralPath $env:ASSET -PathType Leaf)) {
+            throw "Nightly package was not created: $env:ASSET"
+          }
+
+      - name: Validate WiX definition
+        shell: pwsh
+        run: ./scripts/verify-wix.ps1
+
+      - name: Build MSI installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install wixtoolset -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "WiX Toolset installation failed with exit code $LASTEXITCODE" }
+          $candle = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*\bin\candle.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $candle) { throw "candle.exe was not found after installing WiX Toolset" }
+          $env:PATH = "$($candle.DirectoryName);$env:PATH"
+          cargo install cargo-wix --version 0.3.9 --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo-wix installation failed with exit code $LASTEXITCODE" }
+          cargo wix --no-build --nocapture --target $env:TARGET --output $env:MSI
+          if ($LASTEXITCODE -ne 0) { throw "MSI build failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath $env:MSI -PathType Leaf)) {
+            throw "MSI build did not create $env:MSI"
+          }
+
+      - name: Upload nightly zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-nightly
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+      - name: Upload nightly MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-nightly-msi
+          path: ${{ env.MSI }}
+          if-no-files-found: error
+
+      - name: Move rolling nightly tag
+        shell: bash
+        run: |
+          set -eu
+          git tag --force nightly "$GITHUB_SHA"
+          git push origin refs/tags/nightly --force
+
+      - name: Publish rolling Windows x64 nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Windows x64 nightly
+          prerelease: true
+          make_latest: false
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.MSI }}
+          fail_on_unmatched_files: true
 
   build-linux-aarch64-glibc228:
     name: linux-aarch64-glibc228
-    needs: check-version
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+    needs: [check-version, security-audit]
     runs-on: ubuntu-22.04-arm
     container: debian:10
 
@@ -306,7 +451,7 @@ jobs:
         run: |
           set -eu
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+            | sh -s -- -y --profile minimal --default-toolchain 1.97.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo build
@@ -362,7 +507,8 @@ jobs:
 
   build-linux-x86_64-glibc228:
     name: linux-x86_64-glibc228
-    needs: check-version
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+    needs: [check-version, security-audit]
     runs-on: ubuntu-22.04
     container: debian:10
 
@@ -395,7 +541,7 @@ jobs:
         run: |
           set -eu
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+            | sh -s -- -y --profile minimal --default-toolchain 1.97.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo build

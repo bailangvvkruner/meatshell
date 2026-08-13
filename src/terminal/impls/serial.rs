@@ -22,6 +22,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::config::Session;
 use crate::i18n::t;
 use crate::ssh::{SessionCommand, SessionEvent, SessionHandle};
+use crate::terminal::Utf8StreamDecoder;
 
 /// Spawn a serial-port session. See module docs for why the signature mirrors
 /// `spawn_session` (minus the PTY size, which a serial line has no notion of).
@@ -150,18 +151,25 @@ async fn run_serial(
     let reader_handle = std::thread::spawn(move || {
         let mut port = port;
         let mut buf = [0u8; 4096];
+        let mut decoder = Utf8StreamDecoder::default();
         while reader_running.load(Ordering::Relaxed) {
             match port.read(&mut buf) {
                 Ok(0) => {}
                 Ok(n) => {
-                    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    if reader_events.send(SessionEvent::Output(text)).is_err() {
+                    let text = decoder.decode(&buf[..n]);
+                    if !text.is_empty()
+                        && reader_events.send(SessionEvent::Output(text)).is_err()
+                    {
                         break;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
+                    let tail = decoder.finish();
+                    if !tail.is_empty() {
+                        let _ = reader_events.send(SessionEvent::Output(tail));
+                    }
                     let _ = reader_events.send(SessionEvent::Closed(format!(
                         "{}: {e}",
                         t("串口读取错误", "serial read error")
@@ -170,12 +178,16 @@ async fn run_serial(
                 }
             }
         }
+        let tail = decoder.finish();
+        if !tail.is_empty() {
+            let _ = reader_events.send(SessionEvent::Output(tail));
+        }
     });
 
     // --- Command pump -------------------------------------------------------
     while let Some(cmd) = commands.recv().await {
         match cmd {
-            SessionCommand::RawInput(bytes) => {
+            SessionCommand::RawInput(bytes) | SessionCommand::PointerInput { bytes, .. } => {
                 // Never log keystroke bytes — they can be passwords (#15).
                 tracing::debug!("serial write len={} bytes", bytes.len());
                 let w = writer.clone();
@@ -189,6 +201,24 @@ async fn run_serial(
                         "{}: {e}",
                         t("串口写入失败", "serial write failed")
                     )));
+                    break;
+                }
+            }
+            SessionCommand::DebugInput { bytes, ack } => {
+                tracing::debug!("serial debug input len={} bytes", bytes.len());
+                let writer = writer.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut guard = writer.lock().unwrap();
+                    guard.write_all(&bytes).and_then(|_| guard.flush())
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+                let failed = result.is_err();
+                let _ = ack.send(result);
+                if failed {
+                    let _ = events.send(SessionEvent::Closed(
+                        t("串口写入失败", "serial write failed").into()));
                     break;
                 }
             }

@@ -1,5 +1,30 @@
 use super::*;
 
+static ACTIVE_RENDERER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ACTIVE_RENDERER_USES_GPU: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn active_renderer_name() -> &'static str {
+    ACTIVE_RENDERER.get().map(String::as_str).unwrap_or("auto")
+}
+
+pub(super) fn active_renderer_uses_gpu() -> bool {
+    ACTIVE_RENDERER_USES_GPU.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+pub(super) fn record_actual_renderer_uses_gpu(uses_gpu: bool) {
+    ACTIVE_RENDERER_USES_GPU.store(uses_gpu, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn record_active_renderer(renderer: Option<&str>) {
+    let name = renderer.unwrap_or("auto");
+    let normalized = name.strip_prefix("winit-").unwrap_or(name);
+    let uses_gpu = matches!(normalized, "femtovg" | "skia" | "skia-d3d");
+    let _ = ACTIVE_RENDERER.set(name.to_string());
+    ACTIVE_RENDERER_USES_GPU.store(uses_gpu, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn set_window_icon(window: &AppWindow) {
     use i_slint_backend_winit::winit::window::Icon;
@@ -80,6 +105,7 @@ pub(super) fn setup_windows_platform(renderer_mode: &str) {
             .map(str::to_owned),
         None => configured_renderer,
     };
+    record_active_renderer(renderer.as_deref());
     if let Some(renderer) = renderer.as_ref() {
         builder = builder.with_renderer_name(renderer.clone());
     }
@@ -115,6 +141,7 @@ pub(super) fn setup_windows_platform(renderer_mode: &str) {
 #[cfg(target_os = "linux")]
 pub(super) fn setup_linux_platform(renderer_mode: &str) {
     if let Some(env_backend) = std::env::var_os("SLINT_BACKEND") {
+        record_active_renderer(Some(env_backend.to_string_lossy().as_ref()));
         tracing::info!(
             renderer_mode,
             renderer = %env_backend.to_string_lossy(),
@@ -128,6 +155,7 @@ pub(super) fn setup_linux_platform(renderer_mode: &str) {
         "gpu" => "femtovg",
         "software" => "software",
         _ => {
+            record_active_renderer(None);
             tracing::info!(
                 renderer_mode,
                 renderer = "auto",
@@ -137,6 +165,7 @@ pub(super) fn setup_linux_platform(renderer_mode: &str) {
             return;
         }
     };
+    record_active_renderer(Some(renderer));
 
     tracing::info!(
         renderer_mode,
@@ -357,6 +386,7 @@ pub(super) fn setup_macos_platform(renderer_mode: &str) {
             .map(str::to_owned),
         None => Some(renderer_mode.to_owned()),
     };
+    record_active_renderer(renderer.as_deref());
     if let Some(renderer) = renderer.as_ref() {
         builder = builder.with_renderer_name(renderer.clone());
     }

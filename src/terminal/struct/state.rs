@@ -13,6 +13,9 @@ pub(crate) enum CtrlKeySide {
 /// Per-terminal state used by normal and alternate-screen rendering.
 pub(crate) struct TermBuffer {
     pub(crate) parser: vt100::Parser,
+    /// Logical cell dimensions measured by Slint's active terminal font probe.
+    pub(crate) raster_cell_width: f32,
+    pub(crate) raster_cell_height: f32,
     pub(crate) find_query: String,
     pub(crate) is_dark: bool,
     pub(crate) output_highlight: OutputHighlightPreset,

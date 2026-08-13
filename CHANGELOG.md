@@ -5,6 +5,41 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
+### 新增 / Added
+
+- **增加可调资源刷新与自动恢复。** 设置中可分别调整本机（1-30 秒）和远端 SSH（1-60 秒）刷新间隔，修改后即时生效并持久化；远端采样超时会关闭旧监控通道，并按 1、2、5、10、30 秒退避重建。进程解析改为按表头识别，兼容常见 GNU、Alpine 和 OpenWrt BusyBox `top`/`ps` 输出。
+- **Add configurable resource refresh and automatic recovery.** Local (1-30 seconds) and remote SSH (1-60 seconds) intervals apply live and persist. A timed-out remote sample closes its old monitor channel and reconnects with 1, 2, 5, 10, and 30-second backoff. Header-driven process parsing supports common GNU, Alpine, and OpenWrt BusyBox `top`/`ps` output.
+
+- **增加完整的 xterm 鼠标转发。** 终端现支持 SGR、UTF-8 与传统编码的按下、释放和移动报告，并按应用启用的 X10、按钮或任意移动模式过滤事件；Shift 保留本地选择，SSH 连续按下事件至少间隔 120 ms，改善 btop 等 TUI 的双击识别。
+- **Add complete xterm mouse forwarding.** Terminals now encode press, release, and motion reports in SGR, UTF-8, and legacy formats while respecting the application's X10, button-motion, or any-motion mode. Shift retains local selection, and consecutive SSH presses are spaced by at least 120 ms for reliable double clicks in TUIs such as btop.
+
+- **增加有界终端行栅格缓存。** Windows GPU 模式下，稠密或备用屏幕由后台线程按行签名增量栅格化；每个标签只保留一个待处理帧，4 MiB 像素池、2,048 项字形缓存及 shaping 缓存均有上限。普通 shell、emoji、选择与查找继续使用权威文本/覆盖层路径；Windows 会在启动约 2 秒后执行一次回收，并在所有稠密终端退出且空闲 10 秒后再次回收图形、堆和工作集。
+- **Add a bounded terminal row-raster cache.** In Windows GPU mode, dense or alternate screens are rasterized off the UI thread using row signatures. Each tab keeps only one pending frame, with a 4 MiB pixel pool, 2,048-entry glyph cache, and bounded shaping cache. Normal shells, emoji, selection, and find retain the authoritative text and overlay paths. Windows performs one trim about two seconds after startup and later reclaims graphics, heap, and working-set memory after every dense terminal has exited and remained idle for ten seconds.
+
+- **增加本机鉴权 Debug API。** 默认关闭的服务固定监听 `127.0.0.1:24817`，所有路由都要求加密保存、可重新生成的 Bearer Token；接口可读取终端元数据与有界屏幕文本、发送输入和鼠标事件，并在不切换前台的情况下获取当前窗口 PNG。健康信息提供版本、构建类型、渲染器、ANGLE、内存与空闲回收状态。
+- **Add an authenticated local Debug API.** The opt-in service binds only to `127.0.0.1:24817`, and every route requires a regenerable Bearer token encrypted at rest. It exposes terminal metadata and bounded screen text, input and pointer injection, and foreground-free PNG window capture. Health reports version, build profile, renderer, ANGLE, memory, and idle-trim state.
+
+### 修复 / Fixed
+
+- **保留跨网络分包的 UTF-8 字符。** SSH 标准输出、标准错误及 ZMODEM 接收后的剩余输出改用增量解码，中文、框线和 emoji 即使拆在多个数据块中也不会被替换字符破坏。
+- **Preserve UTF-8 characters split across network packets.** SSH stdout, stderr, and output remaining after ZMODEM receive now use incremental decoding, so CJK, box drawing, and emoji remain intact across chunk boundaries.
+
+- **认证失败后可重新输入凭据。** SSH 终端、独立 SFTP 和跳板机在保存的密码被拒绝后会统一弹出重输窗口；每次重试使用新连接，最多重新提示三次，取消操作或界面通道关闭会立即结束等待。
+- **Re-prompt for rejected credentials.** SSH terminals, dedicated SFTP, and jump hosts now share credential re-entry after a saved password is rejected. Every retry uses a fresh connection, prompts are capped at three, and cancellation or UI-channel closure ends the wait immediately.
+
+- **避免异步终端旧帧覆盖新状态。** 清屏、关闭、缩放、字体/DPI 变化、退出全屏 TUI 以及新的输入/光标状态都会使旧栅格代次失效；Slint `VecModel` 原地更新只通知实际变化的 span、选择和查找行，减少不必要的组件重建。
+- **Prevent stale asynchronous frames from covering newer terminal state.** Clear, close, resize, font/DPI changes, leaving a full-screen TUI, and new input or cursor state invalidate obsolete raster epochs. In-place Slint `VecModel` synchronization notifies only changed span, selection, and find rows, reducing component rebuilds.
+
+### 构建 / Build
+
+- **增加强门禁的 Windows nightly 与 ANGLE 打包。** 推送 `main` 会更新滚动的 Windows x64 nightly ZIP 和 MSI；Windows ZIP/MSI 同时包含 ANGLE DLL、许可证与第三方声明，缺少运行库、MSI 或 Release 附件会使构建失败。正式 `v*` 标签继续构建完整平台矩阵，AUR 发布忽略预发布版本。
+- **Add gated Windows nightlies and ANGLE packaging.** A push to `main` updates rolling Windows x64 nightly ZIP and MSI artifacts. Windows ZIP/MSI packages include the ANGLE DLLs, license, and third-party notices, and missing runtime, installer, or Release assets fail the job. Formal `v*` tags retain the full platform matrix, while AUR publishing ignores prereleases.
+
+### 安全 / Security
+
+- **升级 SSH 安全依赖并把 RustSec 审计设为构建前置门禁。** SSH 栈已迁移到 `russh 0.62.6`，修复 CryptoVec 与 SSH-agent 的无界分配风险；nightly 与正式产物任务现在依赖 `Cargo.lock` 审计成功。`.cargo/audit.toml` 和 `docs/security-audit.md` 仅保留无修复的 RSA 时序风险，以及两个不处理用户 XML 的 Slint 间接依赖例外。
+- **Upgrade SSH security dependencies and gate builds on a RustSec audit.** The SSH stack now uses `russh 0.62.6`, fixing the CryptoVec and SSH-agent unbounded-allocation advisories. Nightly and formal artifact jobs depend on a successful `Cargo.lock` scan. `.cargo/audit.toml` and `docs/security-audit.md` retain only the unfixed RSA timing risk and two Slint transitive dependencies that do not process user XML.
+
 ## [0.6.10] - 2026-08-05
 
 - **修复关闭“欢迎页设为侧栏”时闪退（#323）。** 欢迎页在侧栏与标签页之间切换时，分屏模型现在会延迟到下一次界面事件循环再刷新，并跳过尺寸和内容均未变化的重复更新，避免 Windows 下递归重建界面导致当前进程及后续启动闪退。

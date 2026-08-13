@@ -21,7 +21,7 @@ import { Welcome, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton, ToolStrip } from "widgets.slint";
-import { TerminalView, TermSpan, TermMatch, QuickCmd, QuickDockPanel } from "terminal_view.slint";
+import { TerminalView, TermSpan, TermRowImage, TermMatch, QuickCmd, QuickDockPanel } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
@@ -52,6 +52,12 @@ export struct TerminalState {
     id: string,
     status: string,
     spans: [TermSpan],     // coloured runs of the visible terminal screen
+    row-images: [TermRowImage], // cached raster rows (terminal fast path)
+    row-images-ready: bool,
+    row-image-columns: int,
+    row-image-cell-width: float,
+    row-image-cell-height: float,
+    render-revision: int,  // advances when a terminal frame is applied
     cursor-row: int,       // cursor cell on the grid
     cursor-col: int,
     rows-used: int,        // content rows, for viewport sizing
@@ -499,11 +505,22 @@ export component AppWindow inherits Window {
     // Collapse-by-default settings + shared SFTP collapse state (#78).
     in-out property <bool> collapse-sidebar-default: false;
     callback set-collapse-sidebar-default(bool);   // apply + persist
+    in-out property <int> local-resource-refresh-secs: 1;
+    in-out property <int> remote-resource-refresh-secs: 2;
+    callback set-local-resource-refresh-secs(int);
+    callback set-remote-resource-refresh-secs(int);
     // Render the welcome/session list as a left sidebar instead of a tab (v0.5).
     in-out property <bool> welcome-as-sidebar: false;
     callback set-welcome-as-sidebar(bool);         // apply + persist
     in-out property <bool> update-check-enabled: true;   // startup new-version check (#184)
     callback set-update-check-enabled(bool);       // apply + persist
+    // Loopback-only authenticated API for local automation and debugging.
+    in-out property <bool> debug-api-enabled: false;
+    in-out property <string> debug-api-address: "http://127.0.0.1:24817";
+    in-out property <string> debug-api-token: "";
+    in-out property <string> debug-api-status: "";
+    callback set-debug-api-enabled(bool);
+    callback regenerate-debug-api-token();
     // Drag-resizable width of that welcome sidebar (logical px), persisted.
     in-out property <length> welcome-sidebar-width: 240px;
     callback persist-welcome-sidebar-width(float);
@@ -548,6 +565,7 @@ export component AppWindow inherits Window {
     in-out property <string> cred-host;            // host shown in the dialog title
     in-out property <bool> cred-need-user: false;
     in-out property <bool> cred-need-password: false;
+    in-out property <bool> cred-retry: false;       // saved credentials were rejected
     in-out property <string> cred-user;            // username field value
     in-out property <string> cred-password;        // password field value
     in-out property <bool> cred-remember: false;   // persist to the saved session
@@ -754,8 +772,9 @@ export component AppWindow inherits Window {
 
     // Raw keystroke forwarding: Rust converts key+modifiers to PTY bytes.
     callback send-key(string /* tab-id */, string /* key */, bool /* ctrl */, bool /* alt */, bool /* shift */);
-    // Notifies Rust of a PTY resize (pixel dimensions; Rust converts to cols/rows).
-    callback terminal-resize(string /* tab-id */, float /* width-px */, float /* height-px */);
+    // Notifies Rust of the grid and measured logical cell dimensions.
+    callback terminal-resize(string /* tab-id */, float /* cols */, float /* rows */,
+                             float /* cell-width */, float /* cell-height */);
 
     // --- SFTP callbacks ---------------------------------------------------
     // Navigate to a new remote directory (or ".." to go up).
@@ -817,6 +836,8 @@ export component AppWindow inherits Window {
     callback terminal-scroll(string /* tab-id */, int /* delta-lines */);
     // Wheel forwarded to an alt-screen program (#170): tab-id, dir (+1 up/-1 down), col, row.
     callback terminal-wheel(string, int, int, int);
+    // xterm mouse tracking: tab-id, kind, button, col, row, ctrl, alt.
+    callback terminal-pointer(string, int, int, int, int, bool, bool) -> bool;
     callback terminal-scroll-to(string /* tab-id */, int /* offset */); // scrollbar drag (#103)
     // Drag-selection lifecycle (grid row/col coordinates).
     callback term-select-start(string /* tab-id */, int /* row */, int /* col */, bool /* ctrl */, bool /* shift */);
@@ -1485,6 +1506,12 @@ export component AppWindow inherits Window {
                     tab-id: term.id;
                     status-line: term.status;
                     spans: term.spans;
+                    row-images: term.row-images;
+                    row-images-ready: term.row-images-ready;
+                    row-image-columns: term.row-image-columns;
+                    row-image-cell-width: term.row-image-cell-width;
+                    row-image-cell-height: term.row-image-cell-height;
+                    render-revision: term.render-revision;
                     cursor-row: term.cursor-row;
                     cursor-col: term.cursor-col;
                     cursor-style: root.term-cursor-style;
@@ -1567,7 +1594,9 @@ export component AppWindow inherits Window {
                     delete-quick-group(g) => { root.delete-quick-group(g); }
                     send-key(key, ctrl, alt, shift) => { root.send-key(term.id, key, ctrl, alt, shift) }
                     cycle-tab(reverse) => { root.cycle-tab(reverse); }
-                    terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
+                    terminal-resize(cols, rows, cell-w, cell-h) => {
+                        root.terminal-resize(term.id, cols, rows, cell-w, cell-h);
+                    }
                     sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
                     sftp-download(path) => { root.sftp-download(term.id, path); }
                     sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
@@ -1634,6 +1663,9 @@ export component AppWindow inherits Window {
                     find-query-changed(q) => { root.find-query-changed(term.id, q); }
                     terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
                     terminal-wheel(d, c, r) => { root.terminal-wheel(term.id, d, c, r); }
+                    terminal-pointer(k, b, c, r, ctrl, alt) => {
+                        return root.terminal-pointer(term.id, k, b, c, r, ctrl, alt);
+                    }
                     terminal-scroll-to(o) => { root.terminal-scroll-to(term.id, o); }
                     select-start(r, c, ctrl, shift) => { root.term-select-start(term.id, r, c, ctrl, shift); }
                     select-update(r, c) => { root.term-select-update(term.id, r, c); }
@@ -3701,7 +3733,9 @@ export component AppWindow inherits Window {
                 padding: 20px;
                 spacing: 12px;
                 Text {
-                    text: @tr("Login");
+                    text: root.cred-retry
+                        ? (root.lang-en ? "Authentication failed" : "认证失败")
+                        : @tr("Login");
                     color: Theme.text-primary;
                     font-size: Theme.fs-xl;
                     font-weight: 600;
@@ -3711,6 +3745,14 @@ export component AppWindow inherits Window {
                     color: Theme.text-secondary;
                     font-family: Theme.font-mono;
                     font-size: Theme.fs-sm;
+                }
+                if root.cred-retry : Text {
+                    text: root.lang-en
+                        ? "The password was rejected. Enter the current password."
+                        : "密码已被服务器拒绝，请输入当前密码。";
+                    color: Theme.warning;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
                 }
                 if root.cred-need-user : LabeledInput {
                     label: @tr("Username");
@@ -3739,7 +3781,9 @@ export component AppWindow inherits Window {
                         clicked => { root.cred-reject(); }
                     }
                     PrimaryButton {
-                        text: @tr("Connect");
+                        text: root.cred-retry
+                            ? (root.lang-en ? "Retry" : "重试")
+                            : @tr("Connect");
                         clicked => { root.cred-accept(); }
                     }
                 }
@@ -3937,6 +3981,8 @@ export component AppWindow inherits Window {
                     sftp-follow-cd <=> root.sftp-follow-cd;
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
                     collapse-sftp-default <=> root.collapse-sftp-default;
+                    local-resource-refresh-secs <=> root.local-resource-refresh-secs;
+                    remote-resource-refresh-secs <=> root.remote-resource-refresh-secs;
                     sync-upload-enabled <=> root.sync-upload-enabled;
                     webdav-enabled <=> root.webdav-enabled;
                     webdav-url <=> root.webdav-url;
@@ -3949,6 +3995,9 @@ export component AppWindow inherits Window {
                     welcome-as-sidebar <=> root.welcome-as-sidebar;
                     quick-commands-as-sidebar <=> root.quick-commands-as-sidebar;
                     update-check-enabled <=> root.update-check-enabled;
+                    debug-api-enabled <=> root.debug-api-enabled;
+                    debug-api-address: root.debug-api-address;
+                    debug-api-status: root.debug-api-status;
                     wallpaper-overlay <=> root.wallpaper-overlay;
                     current-wallpaper: root.current-wallpaper;
                     custom-wallpaper-name: root.custom-wallpaper-name;
@@ -3978,6 +4027,8 @@ export component AppWindow inherits Window {
                     set-sftp-follow-cd(v) => { root.set-sftp-follow-cd(v); }
                     set-collapse-sidebar-default(v) => { root.set-collapse-sidebar-default(v); }
                     set-collapse-sftp-default(v) => { root.set-collapse-sftp-default(v); }
+                    set-local-resource-refresh-secs(v) => { root.set-local-resource-refresh-secs(v); }
+                    set-remote-resource-refresh-secs(v) => { root.set-remote-resource-refresh-secs(v); }
                     set-sync-upload-enabled(v) => { root.set-sync-upload-enabled(v); }
                     save-webdav-settings(enabled, url, username, password, remote-path, accept-invalid-certs) => {
                         root.save-webdav-settings(enabled, url, username, password, remote-path, accept-invalid-certs);
@@ -3995,6 +4046,10 @@ export component AppWindow inherits Window {
                         root.set-quick-commands-as-sidebar(v);
                     }
                     set-update-check-enabled(v) => { root.set-update-check-enabled(v); }
+                    set-debug-api-enabled(v) => { root.set-debug-api-enabled(v); }
+                    copy-debug-api-address() => { root.copy-text(root.debug-api-address); }
+                    copy-debug-api-token() => { root.copy-text(root.debug-api-token); }
+                    regenerate-debug-api-token() => { root.regenerate-debug-api-token(); }
                     persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
                 }
             }

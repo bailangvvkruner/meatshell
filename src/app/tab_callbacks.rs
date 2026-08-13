@@ -13,6 +13,7 @@ pub(super) fn wire_tab_callbacks(
     render_gates: RenderGates,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
+    debug_api: DebugApiState,
 ) {
     // Ctrl+Tab / Ctrl+Shift+Tab cycle within the currently focused pane (#294).
     {
@@ -132,6 +133,7 @@ pub(super) fn wire_tab_callbacks(
         let render_gates = render_gates.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
+        let debug_api = debug_api.clone();
         let panes_model = panes_model.clone();
         let splitters_model = splitters_model.clone();
         window.on_pane_tab_closed(move |_pane_id: i32, id: SharedString| {
@@ -149,6 +151,9 @@ pub(super) fn wire_tab_callbacks(
             if let Some(gate) = render_gates.lock().unwrap().remove(&id) {
                 gate.close();
             }
+            forget_terminal_raster(&id);
+            crate::memory_trim::forget_terminal(&id);
+            debug_api.remove_terminal(&id);
             bufs.lock().unwrap().remove(&id);
 
             // Remove from tabs + terminals models.

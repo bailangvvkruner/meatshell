@@ -141,6 +141,12 @@ pub struct ConfigFile {
     /// Collapse the left resource sidebar on startup (#78).
     #[serde(default)]
     pub collapse_sidebar_default: bool,
+    /// Local resource sampling interval in seconds. 0 keeps the legacy default.
+    #[serde(default)]
+    pub local_resource_refresh_secs: u32,
+    /// Remote SSH resource sampling interval in seconds. 0 keeps the legacy default.
+    #[serde(default)]
+    pub remote_resource_refresh_secs: u32,
     /// Last resource-sidebar collapsed state. None means fall back to
     /// `collapse_sidebar_default` for older configs.
     #[serde(default)]
@@ -215,6 +221,14 @@ pub struct ConfigFile {
     /// it on stops the GitHub releases query and the banner.
     #[serde(default)]
     pub update_check_disabled: bool,
+    /// Authenticated loopback API for local debugging and tool integrations.
+    /// It remains disabled until the user explicitly opts in.
+    #[serde(default)]
+    pub debug_api_enabled: bool,
+    /// Bearer token for the Debug API. ConfigStore encrypts it at rest just
+    /// like saved session and WebDAV credentials.
+    #[serde(default)]
+    pub debug_api_token: Secret,
     /// One-time default-layout migration marker (#new-user-defaults). 0 = config
     /// predates the migration. `migrate_defaults` bumps it to `DEFAULTS_REV` after
     /// pushing the new look (default wallpaper / welcome-as-sidebar / right-docked
@@ -236,4 +250,3 @@ pub(crate) struct ExportFile {
     pub(crate) meatshell_export: u32,
     pub(crate) sessions: Vec<Session>,
 }
-

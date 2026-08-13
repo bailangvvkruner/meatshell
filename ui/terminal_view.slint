@@ -29,6 +29,11 @@ export struct TermSpan {
     emoji-image: image,
 }
 
+export struct TermRowImage {
+    source: image,
+    valid: bool,
+}
+
 // A find-match highlight rectangle on the terminal grid.
 export struct TermMatch {
     row: int,
@@ -244,6 +249,12 @@ export component TerminalView inherits Rectangle {
     in property <string> tab-id;
     in property <string> status-line: @tr("Not connected");
     in property <[TermSpan]> spans;     // coloured runs of the visible screen
+    in property <[TermRowImage]> row-images; // cached raster rows (fast path)
+    in property <bool> row-images-ready;
+    in property <int> row-image-columns;
+    in property <float> row-image-cell-width;
+    in property <float> row-image-cell-height;
+    in property <int> render-revision;  // changes while the spans model stays stable
     in property <int> cursor-row;       // cursor cell (grid coords)
     in property <int> cursor-col;
     in property <string> cursor-style: "block";
@@ -327,7 +338,7 @@ export component TerminalView inherits Rectangle {
 
     callback send-key(string, bool, bool, bool);
     callback cycle-tab(bool /* reverse */);
-    callback terminal-resize(float, float);
+    callback terminal-resize(float, float, float, float);
     callback sftp-navigate(string);
     callback sftp-download(string);
     callback sftp-upload-clicked(string, bool);
@@ -364,6 +375,9 @@ export component TerminalView inherits Rectangle {
     // mouse cell. Rust sends a mouse-wheel event if the app tracks the mouse, else
     // arrow keys (alternate-scroll).
     callback terminal-wheel(int /* dir */, int /* col */, int /* row */);
+    // kind: 0 press / 1 release / 2 motion; button: 0 left / 1 middle /
+    // 2 right / 3 none. True means the remote application owns the gesture.
+    callback terminal-pointer(int, int, int, int, bool, bool) -> bool;
     callback terminal-scroll-to(int);       // jump to an absolute scrollback offset (#103)
     callback select-start(int, int, bool, bool); // row, col, ctrl, shift
     callback select-update(int, int);       // extend drag-selection to (row, col)
@@ -375,6 +389,13 @@ export component TerminalView inherits Rectangle {
     property <length> ctx-y;
     property <bool> find-active: false;
     property <bool> selecting: false;
+    property <bool> remote-left-down: false;
+    property <bool> remote-middle-down: false;
+    property <bool> remote-right-down: false;
+    property <bool> remote-ctrl: false;
+    property <bool> remote-alt: false;
+    property <int> last-pointer-col: -1;
+    property <int> last-pointer-row: -1;
     // Auto-scroll direction while drag-selecting past the visible edge.
     // 0 = none, -1 = above top (scroll to older), +1 = below bottom (newer).
     property <int> autoscroll-dir: 0;
@@ -429,31 +450,39 @@ export component TerminalView inherits Rectangle {
         width: 0px; // zero out layout contribution
         height: 0px;
     }
-    // cell-w / cell-h come straight from the probe so they ALWAYS match the
+    // measured-cell-w / measured-cell-h come straight from the probe so they
     // font the spans below are actually rendered with.  (Forcing a hard-coded
     // minimum here is dangerous: if the spans fall back to a system font, a
     // mismatched cell-w garbles the grid.  Keep them derived from one source.)
-    property <length> cell-w: max(1px, cell-probe.preferred-width / 50);
-    property <length> cell-h: max(1px, cell-probe.preferred-height);
+    property <length> measured-cell-w: max(1px, cell-probe.preferred-width / 50);
+    property <length> measured-cell-h: max(1px, cell-probe.preferred-height);
+    // Overlays and pointer math use the exact logical geometry represented by
+    // the currently visible asynchronous raster frame.
+    property <length> cell-w: root.row-images-ready && root.row-image-cell-width > 0
+        ? root.row-image-cell-width * 1px : root.measured-cell-w;
+    property <length> cell-h: root.row-images-ready && root.row-image-cell-height > 0
+        ? root.row-image-cell-height * 1px : root.measured-cell-h;
     // Usable text box = root.width minus the 10px left/right padding of
     // output-text; usable height = key-capture height minus the 8px top pad.
     // The old 16px bottom focus-recovery strip was redundant once body-touch
     // covered the full output and visibly stole one terminal row.
-    property <float> term-cols: max(10, floor((root.width - 20px) / cell-w));
-    property <float> term-rows: max(5,  floor((key-capture.height - 8px) / cell-h));
+    property <float> term-cols: max(10, floor((root.width - 20px) / measured-cell-w));
+    property <float> term-rows: max(5,  floor((key-capture.height - 8px) / measured-cell-h));
     // Only resize the PTY while this tab is visible.  Inactive tabs are laid
     // out at width 0 (→ term-cols collapses to 10); resizing the remote to 10
     // columns reflows the vt100 screen and destroys the scrollback, so when you
     // switch back the output is gone.  Guarding on `visible` keeps each hidden
     // session frozen at its real size; `changed visible` re-syncs on return.
     property <bool> has-real-size: root.width >= 80px && key-capture.height >= 80px;
-    changed term-cols => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
-    changed term-rows => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
-    changed has-real-size => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    changed term-cols => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
+    changed term-rows => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
+    changed measured-cell-w => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
+    changed measured-cell-h => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
+    changed has-real-size => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
 
-    init => { if (root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    init => { if (root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px); } }
 
-    changed spans => {
+    changed render-revision => {
         // Bash: keep the latest output pinned to the bottom.
         // Alt-screen (nano/vim/htop/btop): the program owns a fixed full screen,
         // so the viewport must stay top-aligned (viewport-y = 0).  Scrolling to
@@ -486,7 +515,7 @@ export component TerminalView inherits Rectangle {
             root.focus-pending = true;
             // Re-sync the PTY size on return (it was frozen while hidden).
             if (root.has-real-size) {
-                root.terminal-resize(root.term-cols, root.term-rows);
+                root.terminal-resize(root.term-cols, root.term-rows, root.measured-cell-w / 1px, root.measured-cell-h / 1px);
             }
         }
     }
@@ -641,19 +670,73 @@ export component TerminalView inherits Rectangle {
                                     // Any button press re-takes keyboard focus.
                                     ime-input.focus();
                                     if (ev.button == PointerEventButton.right) {
-                                        root.ctx-x = self.mouse-x;
-                                        root.ctx-y = self.mouse-y;
-                                        ctx-menu.show();
+                                        root.remote-right-down = false;
+                                        if (!ev.modifiers.shift && root.terminal-pointer(
+                                                0, 2,
+                                                floor(self.mouse-x / root.cell-w),
+                                                floor(self.mouse-y / root.cell-h),
+                                                Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control,
+                                                ev.modifiers.alt)) {
+                                            root.remote-right-down = true;
+                                            root.remote-ctrl = Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control;
+                                            root.remote-alt = ev.modifiers.alt;
+                                        } else {
+                                            root.ctx-x = self.mouse-x;
+                                            root.ctx-y = self.mouse-y;
+                                            ctx-menu.show();
+                                        }
                                     } else if (ev.button == PointerEventButton.left) {
-                                        root.selecting = true;
-                                        root.select-start(
-                                            floor(self.mouse-y / root.cell-h),
-                                            floor(self.mouse-x / root.cell-w),
-                                            ev.modifiers.control,
-                                            ev.modifiers.shift);
+                                        root.remote-left-down = false;
+                                        if (!ev.modifiers.shift && root.terminal-pointer(
+                                                0, 0,
+                                                floor(self.mouse-x / root.cell-w),
+                                                floor(self.mouse-y / root.cell-h),
+                                                Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control,
+                                                ev.modifiers.alt)) {
+                                            root.remote-left-down = true;
+                                            root.remote-ctrl = Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control;
+                                            root.remote-alt = ev.modifiers.alt;
+                                        } else {
+                                            root.selecting = true;
+                                            root.select-start(
+                                                floor(self.mouse-y / root.cell-h),
+                                                floor(self.mouse-x / root.cell-w),
+                                                ev.modifiers.control,
+                                                ev.modifiers.shift);
+                                        }
+                                    } else if (ev.button == PointerEventButton.middle) {
+                                        root.remote-middle-down = false;
+                                        if (!ev.modifiers.shift && root.terminal-pointer(
+                                                0, 1,
+                                                floor(self.mouse-x / root.cell-w),
+                                                floor(self.mouse-y / root.cell-h),
+                                                Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control,
+                                                ev.modifiers.alt)) {
+                                            root.remote-middle-down = true;
+                                            root.remote-ctrl = Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control;
+                                            root.remote-alt = ev.modifiers.alt;
+                                        }
                                     }
                                 } else if (ev.kind == PointerEventKind.up) {
-                                    if (ev.button == PointerEventButton.middle) {
+                                    if (ev.button == PointerEventButton.left && root.remote-left-down) {
+                                        root.terminal-pointer(1, 0,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                        root.remote-left-down = false;
+                                    } else if (ev.button == PointerEventButton.middle && root.remote-middle-down) {
+                                        root.terminal-pointer(1, 1,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                        root.remote-middle-down = false;
+                                    } else if (ev.button == PointerEventButton.right && root.remote-right-down) {
+                                        root.terminal-pointer(1, 2,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                        root.remote-right-down = false;
+                                    } else if (ev.button == PointerEventButton.middle) {
                                         root.paste-from-clipboard();
                                         ime-input.focus();
                                     } else if (ev.button == PointerEventButton.left
@@ -662,9 +745,55 @@ export component TerminalView inherits Rectangle {
                                         root.autoscroll-dir = 0;
                                         root.select-end();
                                     }
+                                    if (!root.remote-left-down && !root.remote-middle-down
+                                            && !root.remote-right-down) {
+                                        root.remote-ctrl = false;
+                                        root.remote-alt = false;
+                                    }
+                                } else if (ev.kind == PointerEventKind.cancel) {
+                                    if (root.remote-left-down) {
+                                        root.terminal-pointer(1, 0,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                    }
+                                    if (root.remote-middle-down) {
+                                        root.terminal-pointer(1, 1,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                    }
+                                    if (root.remote-right-down) {
+                                        root.terminal-pointer(1, 2,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                    }
+                                    root.remote-left-down = false;
+                                    root.remote-middle-down = false;
+                                    root.remote-right-down = false;
+                                    root.remote-ctrl = false;
+                                    root.remote-alt = false;
+                                    if (root.selecting) {
+                                        root.selecting = false;
+                                        root.autoscroll-dir = 0;
+                                        root.select-end();
+                                    }
                                 }
                             }
                             moved => {
+                                if (floor(self.mouse-x / root.cell-w) != root.last-pointer-col
+                                        || floor(self.mouse-y / root.cell-h) != root.last-pointer-row) {
+                                    root.last-pointer-col = floor(self.mouse-x / root.cell-w);
+                                    root.last-pointer-row = floor(self.mouse-y / root.cell-h);
+                                    if (!root.selecting) {
+                                        root.terminal-pointer(
+                                            2,
+                                            root.remote-left-down ? 0 : root.remote-middle-down ? 1 : root.remote-right-down ? 2 : 3,
+                                            root.last-pointer-col, root.last-pointer-row,
+                                            root.remote-ctrl, root.remote-alt);
+                                    }
+                                }
                                 if (root.selecting) {
                                     // Position of the cursor within the *visible*
                                     // viewport (body-touch sits on the grid Rectangle
@@ -729,11 +858,27 @@ export component TerminalView inherits Rectangle {
                             border-radius: 2px;
                         }
 
-                        // Each span = a background fill (transparent for the
-                        // default bg) with its text on top.  Wrapping the Text in
-                        // the bg Rectangle keeps one element per span and renders
-                        // btop/htop/mc panels, meter bars and graph fills.
-                        for span in root.spans : Rectangle {
+                        // Fast path: one cached image per visible terminal row.
+                        // Selection, search, cursor, and input remain native overlays.
+                        if root.row-images-ready : Rectangle {
+                            x: 0px; y: 0px;
+                            width: parent.width; height: parent.height;
+                            for row[i] in root.row-images : Image {
+                                x: 0px;
+                                y: i * root.cell-h;
+                                width: root.row-image-columns * root.cell-w;
+                                height: root.cell-h;
+                                source: row.source;
+                                image-fit: fill;
+                            }
+                        }
+
+                        // Compatibility path and immediate fallback while a row
+                        // image frame is being rasterized.
+                        if !root.row-images-ready : Rectangle {
+                            x: 0px; y: 0px;
+                            width: parent.width; height: parent.height;
+                            for span in root.spans : Rectangle {
                             x: span.col * root.cell-w;
                             y: span.row * root.cell-h;
                             width: span.cells * root.cell-w;
@@ -765,6 +910,7 @@ export component TerminalView inherits Rectangle {
                                 source: span.emoji-image;
                                 image-fit: contain;
                             }
+                        }
                         }
 
                         // Blinking cursor (overlay, decoupled from text). Its
@@ -802,19 +948,73 @@ export component TerminalView inherits Rectangle {
                                 if (ev.kind == PointerEventKind.down) {
                                     ime-input.focus();
                                     if (ev.button == PointerEventButton.right) {
-                                        root.ctx-x = self.mouse-x;
-                                        root.ctx-y = self.mouse-y;
-                                        ctx-menu.show();
+                                        root.remote-right-down = false;
+                                        if (!ev.modifiers.shift && root.terminal-pointer(
+                                                0, 2,
+                                                floor(self.mouse-x / root.cell-w),
+                                                floor(self.mouse-y / root.cell-h),
+                                                Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control,
+                                                ev.modifiers.alt)) {
+                                            root.remote-right-down = true;
+                                            root.remote-ctrl = Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control;
+                                            root.remote-alt = ev.modifiers.alt;
+                                        } else {
+                                            root.ctx-x = self.mouse-x;
+                                            root.ctx-y = self.mouse-y;
+                                            ctx-menu.show();
+                                        }
                                     } else if (ev.button == PointerEventButton.left) {
-                                        root.selecting = true;
-                                        root.select-start(
-                                            floor(self.mouse-y / root.cell-h),
-                                            floor(self.mouse-x / root.cell-w),
-                                            ev.modifiers.control,
-                                            ev.modifiers.shift);
+                                        root.remote-left-down = false;
+                                        if (!ev.modifiers.shift && root.terminal-pointer(
+                                                0, 0,
+                                                floor(self.mouse-x / root.cell-w),
+                                                floor(self.mouse-y / root.cell-h),
+                                                Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control,
+                                                ev.modifiers.alt)) {
+                                            root.remote-left-down = true;
+                                            root.remote-ctrl = Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control;
+                                            root.remote-alt = ev.modifiers.alt;
+                                        } else {
+                                            root.selecting = true;
+                                            root.select-start(
+                                                floor(self.mouse-y / root.cell-h),
+                                                floor(self.mouse-x / root.cell-w),
+                                                ev.modifiers.control,
+                                                ev.modifiers.shift);
+                                        }
+                                    } else if (ev.button == PointerEventButton.middle) {
+                                        root.remote-middle-down = false;
+                                        if (!ev.modifiers.shift && root.terminal-pointer(
+                                                0, 1,
+                                                floor(self.mouse-x / root.cell-w),
+                                                floor(self.mouse-y / root.cell-h),
+                                                Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control,
+                                                ev.modifiers.alt)) {
+                                            root.remote-middle-down = true;
+                                            root.remote-ctrl = Theme.is-mac ? ev.modifiers.meta : ev.modifiers.control;
+                                            root.remote-alt = ev.modifiers.alt;
+                                        }
                                     }
                                 } else if (ev.kind == PointerEventKind.up) {
-                                    if (ev.button == PointerEventButton.middle) {
+                                    if (ev.button == PointerEventButton.left && root.remote-left-down) {
+                                        root.terminal-pointer(1, 0,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                        root.remote-left-down = false;
+                                    } else if (ev.button == PointerEventButton.middle && root.remote-middle-down) {
+                                        root.terminal-pointer(1, 1,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                        root.remote-middle-down = false;
+                                    } else if (ev.button == PointerEventButton.right && root.remote-right-down) {
+                                        root.terminal-pointer(1, 2,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                        root.remote-right-down = false;
+                                    } else if (ev.button == PointerEventButton.middle) {
                                         root.paste-from-clipboard();
                                         ime-input.focus();
                                     } else if (ev.button == PointerEventButton.left
@@ -823,9 +1023,55 @@ export component TerminalView inherits Rectangle {
                                         root.autoscroll-dir = 0;
                                         root.select-end();
                                     }
+                                    if (!root.remote-left-down && !root.remote-middle-down
+                                            && !root.remote-right-down) {
+                                        root.remote-ctrl = false;
+                                        root.remote-alt = false;
+                                    }
+                                } else if (ev.kind == PointerEventKind.cancel) {
+                                    if (root.remote-left-down) {
+                                        root.terminal-pointer(1, 0,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                    }
+                                    if (root.remote-middle-down) {
+                                        root.terminal-pointer(1, 1,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                    }
+                                    if (root.remote-right-down) {
+                                        root.terminal-pointer(1, 2,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h),
+                                            root.remote-ctrl, root.remote-alt);
+                                    }
+                                    root.remote-left-down = false;
+                                    root.remote-middle-down = false;
+                                    root.remote-right-down = false;
+                                    root.remote-ctrl = false;
+                                    root.remote-alt = false;
+                                    if (root.selecting) {
+                                        root.selecting = false;
+                                        root.autoscroll-dir = 0;
+                                        root.select-end();
+                                    }
                                 }
                             }
                             moved => {
+                                if (floor(self.mouse-x / root.cell-w) != root.last-pointer-col
+                                        || floor(self.mouse-y / root.cell-h) != root.last-pointer-row) {
+                                    root.last-pointer-col = floor(self.mouse-x / root.cell-w);
+                                    root.last-pointer-row = floor(self.mouse-y / root.cell-h);
+                                    if (!root.selecting) {
+                                        root.terminal-pointer(
+                                            2,
+                                            root.remote-left-down ? 0 : root.remote-middle-down ? 1 : root.remote-right-down ? 2 : 3,
+                                            root.last-pointer-col, root.last-pointer-row,
+                                            root.remote-ctrl, root.remote-alt);
+                                    }
+                                }
                                 if (root.selecting) {
                                     root.select-update(
                                         floor(self.mouse-y / root.cell-h),

@@ -19,6 +19,8 @@ fn make_buf(
     parser.process(live_lines.join("\r\n").as_bytes());
     TermBuffer {
         parser,
+        raster_cell_width: 8.0,
+        raster_cell_height: 16.0,
         find_query: String::new(),
         is_dark: false,
         output_highlight: OutputHighlightPreset::Log,

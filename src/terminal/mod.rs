@@ -5,10 +5,14 @@ mod state;
 mod input;
 #[path = "impls/local.rs"]
 pub(crate) mod local;
+#[path = "impls/mouse.rs"]
+mod mouse;
 #[path = "impls/output_highlight.rs"]
 mod output_highlight;
 #[path = "impls/presentation.rs"]
 mod presentation;
+#[path = "impls/raster.rs"]
+mod raster;
 #[path = "impls/render.rs"]
 mod render;
 #[path = "impls/render_gate.rs"]
@@ -19,6 +23,8 @@ pub(crate) mod serial;
 pub(crate) mod telnet;
 #[path = "impls/term_buffer.rs"]
 mod term_buffer;
+#[path = "impls/utf8_stream.rs"]
+mod utf8_stream;
 #[path = "impls/zmodem.rs"]
 pub(crate) mod zmodem;
 
@@ -26,24 +32,30 @@ pub(crate) mod zmodem;
 pub(crate) use input::c0_letter_key_down;
 #[cfg(test)]
 pub(crate) use input::normalize_pasted_newlines;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) use input::windows_process_ctrl_release;
 pub(crate) use input::{
     bare_ctrl_marker_workaround_enabled, encode_command_bar_input, encode_pasted_text,
     key_to_pty_bytes, paste_requires_large_review, should_drop_bare_ctrl_marker,
     terminal_uses_bracketed_paste,
 };
-#[cfg(any(target_os = "windows", test))]
-pub(crate) use input::windows_process_ctrl_release;
-#[cfg(any(target_os = "windows", test))]
-pub(crate) use state::CtrlKeySide;
+pub(crate) use mouse::{encode_terminal_mouse_event, TerminalMouseEventKind};
 pub(crate) use output_highlight::compile_output_rules;
 pub(crate) use presentation::{highlight_plain_output, render_term_span};
 #[cfg(test)]
 pub(crate) use presentation::{log_level_marker, text_cell_width, vt_span_colors};
+pub(crate) use raster::{
+    clear_pixel_pool, recycle_pixel_buffer, RasterCompletion, RasterConfig, RasterJob,
+    RasterResult, RasterResultState, RasterSpan, TerminalRasterizer,
+};
 pub(crate) use render::{
     build_row, cell_prefix, char_after_cell_end, char_at_cell_start, detect_scroll, MAX_HISTORY,
     RAW_CAP,
 };
+#[cfg(any(target_os = "windows", test))]
+pub(crate) use state::CtrlKeySide;
 pub(crate) use state::{
     BuiltScreen, CompiledOutputRule, CsiState, HistSpan, Line, OutputHighlightPreset, RenderGates,
     TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
 };
+pub(crate) use utf8_stream::Utf8StreamDecoder;

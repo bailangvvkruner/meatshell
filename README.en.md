@@ -2,6 +2,21 @@
 
 [简体中文](./README.md) | **English**
 
+> [!IMPORTANT]
+>
+> ## Changes from upstream v0.6.10
+>
+> This fork includes upstream v0.6.10 and carries these additions on top of its
+> current module layout:
+>
+> - Local (1-30 seconds) and remote SSH (1-60 seconds) resource intervals are independently configurable, apply live, and persist. Timed-out remote collectors reconnect automatically, and process parsing supports BusyBox `top`/`ps`.
+> - SSH stdout, stderr, and post-ZMODEM output use incremental UTF-8 decoding, preserving CJK, box drawing, and emoji split across network packets.
+> - xterm SGR, UTF-8, and legacy mouse reports support press, release, and motion. Shift keeps local selection available, while SSH pointer presses are paced for reliable TUI double clicks.
+> - Rejected passwords prompt again for SSH terminals, SFTP, and jump hosts. Each bounded retry uses a fresh connection instead of reusing a failed transport.
+> - Dense terminals use a bounded background row-raster cache in Windows GPU mode, while normal shells retain the lower-memory text path. Epoch checks prevent stale frames after close, clear, resize, or renderer changes.
+> - An opt-in Debug API is restricted to `127.0.0.1` and requires a Bearer token; see the [API guide](docs/debug-api.md).
+> - Windows x64 packages include an optional ANGLE/EGL D3D11 runtime and its license. Software remains the compatibility default; select GPU under **Settings > Rendering** and restart to use it.
+
 A lightweight, low-memory SSH / terminal client inspired by FinalShell, but
 written entirely in **Rust + [Slint](https://slint.dev)**. The goal is to keep
 FinalShell's core experience (resource-monitor sidebar, session management,
@@ -22,13 +37,16 @@ the tens-of-MB range of a native binary.
 
 ## Download & install
 
-Every `v*` tag triggers a GitHub Actions build that produces native binaries for
-**Windows / Linux / macOS**, published on the
-[Releases](https://github.com/jeff141/meatshell/releases) page.
+Every push to `main` builds a Windows x64 nightly ZIP and MSI and updates the
+rolling [nightly Release](https://github.com/bailangvvkruner/meatshell/releases/tag/nightly).
+Every `v*` tag still builds formal **Windows / Linux / macOS** artifacts on this
+fork's [Releases](https://github.com/bailangvvkruner/meatshell/releases) page.
 
 ### Windows
 
-Download `meatshell-*-windows-x86_64.zip`, unzip, and run `meatshell.exe`.
+Download `meatshell-*-windows-x86_64.zip`, unzip, and run `meatshell.exe`, or use
+the `.msi` from the same Release. Keep `libEGL.dll`, `libGLESv2.dll`, and
+`ANGLE_LICENSE.txt` beside the executable; they support the optional GPU mode.
 
 ### Linux
 
@@ -82,16 +100,17 @@ open /Applications/meatshell.app
 ### Done
 
 - [x] FinalShell-style UI with dark / light / follow-system themes
-- [x] Local + remote resource monitoring (CPU / memory / swap / network / disk)
-- [x] Remote process monitor (CPU-sorted table with PID copy and permission-aware termination)
-- [x] Full VT/ANSI terminal emulation (btop / htop / vim render correctly)
+- [x] Local + remote resource monitoring (CPU / memory / swap / network / disk) with separate intervals and automatic remote-monitor recovery
+- [x] Remote process monitor (CPU-sorted table with PID copy and permission-aware termination), including GNU and BusyBox output
+- [x] Full VT/ANSI terminal emulation (btop / htop / vim render correctly) with incremental UTF-8 and xterm mouse reporting
+- [x] Background row-raster cache for dense terminals plus a text fast path for normal shells ([performance and acceptance notes](docs/terminal-rendering-performance.md))
 - [x] Color emoji, including skin tones, flags, and ZWJ sequences
 - [x] Tabs (welcome page + multiple sessions)
 - [x] Session management: create / edit / delete / groups, local JSON, export / import
   - Config location: `%APPDATA%/meatshell/sessions.json` (Windows)
     / `~/.config/meatshell/sessions.json` (Linux)
     / `~/Library/Application Support/meatshell/sessions.json` (macOS)
-- [x] SSH (`russh`, pure Rust): password / private key / encrypted key (passphrase)
+- [x] SSH (`russh`, pure Rust): password / private key / encrypted key (passphrase), with credential re-entry after rejection
 - [x] SFTP browser + upload / download (drag-and-drop) + in-terminal ZMODEM (`sz`) receive
 - [x] SSH port forwarding / tunnels: local -L / remote -R / dynamic -D (SOCKS5)
 - [x] Quick commands + command box (broadcast to all sessions) + command history
@@ -101,6 +120,7 @@ open /Applications/meatshell.app
 - [x] Session passwords encrypted at rest (ChaCha20-Poly1305)
 - [x] Known-hosts (`known_hosts`) verification + first-connect confirmation
 - [x] Split panes for tabbed terminals
+- [x] Opt-in loopback Debug API (Bearer auth, terminal screen/input/pointer, and window screenshots)
 
 Color emoji graphics are provided by [Twemoji](https://github.com/jdecked/twemoji)
 under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See
@@ -118,6 +138,8 @@ under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See
 | Async runtime | [`tokio`](https://tokio.rs)                                       |
 | SSH protocol  | [`russh`](https://crates.io/crates/russh) (no libssh dependency)  |
 | System metrics| [`sysinfo`](https://crates.io/crates/sysinfo)                     |
+| Row rasterizer| [`cosmic-text`](https://crates.io/crates/cosmic-text)             |
+| Debug API     | [`axum`](https://crates.io/crates/axum)                           |
 | Serialization | `serde` + `serde_json`                                            |
 | Logging       | `tracing` + `tracing-subscriber`                                  |
 
@@ -142,16 +164,17 @@ meatshell/
 │   ├── theme.slint          # design tokens
 │   ├── widgets.slint        # reusable buttons / inputs / sparkline
 │   ├── sidebar.slint        # left-hand system monitor panel
-│   ├── tabs.slint           # top tab bar
 │   ├── welcome.slint        # welcome page / quick connect
 │   ├── session_dialog.slint # new / edit session dialog
-│   └── terminal_view.slint  # terminal view (v0.1 line-buffered)
+│   └── terminal_view.slint  # text and row-image terminal view
 └── src/
-    ├── main.rs
-    ├── app.rs               # UI ↔ backend bridge
-    ├── config.rs            # session JSON persistence
-    ├── system.rs            # CPU / memory / network sampling
-    └── ssh.rs               # SSH session worker
+    ├── main.rs              # process entry and runtime
+    ├── app.rs + app/        # UI/backend bridge and callback modules
+    ├── config/              # sessions, settings, encrypted persistence
+    ├── ssh/ + sftp/         # SSH, authentication, monitoring, file transfer
+    ├── terminal/            # VT state, input, mouse, and row rasterization
+    ├── debug_api.rs         # loopback HTTP Debug API
+    └── memory_trim.rs       # Windows idle-memory reclamation
 ```
 
 ## Development notes
@@ -162,6 +185,12 @@ meatshell/
   cross-thread UI updates go through `slint::invoke_from_event_loop` callbacks.
 - SSH / SFTP share the `known_hosts` verification path: first contact asks for
   trust and remembers the host key, while later key changes prompt again.
+- See [docs/debug-api.md](docs/debug-api.md) for the local API, request limits,
+  and PowerShell examples.
+- Renderer boundaries and regression gates are in
+  [docs/terminal-rendering-performance.md](docs/terminal-rendering-performance.md);
+  dependency-audit exceptions are documented in
+  [docs/security-audit.md](docs/security-audit.md).
 
 ## Release
 

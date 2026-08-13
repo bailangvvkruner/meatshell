@@ -1,13 +1,18 @@
 // Entry point. Wires the Slint UI to the config store, system sampler and
 // SSH session manager.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(windows, not(test), not(feature = "dev-console")),
+    windows_subsystem = "windows"
+)]
 
 mod app;
 mod config;
+mod debug_api;
 mod i18n;
 mod layout;
 mod logging;
+mod memory_trim;
 mod resource;
 mod session;
 mod sftp;
@@ -41,6 +46,7 @@ fn main() -> anyhow::Result<()> {
     // on macOS (see Cargo.toml), so switching does not require a rebuild.
 
     init_tracing();
+    harden_dll_search_path();
 
     // ── IME policy ───────────────────────────────────────────────────────────
     // NOTE: We deliberately DO **NOT** call `ImmDisableIME` here.
@@ -59,6 +65,24 @@ fn main() -> anyhow::Result<()> {
 
     app::run()
 }
+
+#[cfg(windows)]
+fn harden_dll_search_path() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetDefaultDllDirectories(directory_flags: u32) -> i32;
+    }
+
+    // Search the application directory, System32 and explicitly registered
+    // user directories, but never load libEGL.dll from the working directory.
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
+        tracing::warn!("failed to restrict the Windows DLL search path");
+    }
+}
+
+#[cfg(not(windows))]
+fn harden_dll_search_path() {}
 
 /// Set up tracing: stderr (honours RUST_LOG, default info) **plus** a capped
 /// `error.log` file at WARN and above so users can send diagnostics — e.g. a

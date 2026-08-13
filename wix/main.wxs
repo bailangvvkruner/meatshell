@@ -30,8 +30,13 @@
             InstallScope="perMachine"
             SummaryCodepage="1252"/>
 
-        <!-- Replace an older install in place instead of erroring out. -->
+        <!--
+          Replace an older install in place instead of erroring out. MSI only
+          compares the first three ProductVersion fields, so rolling nightly
+          packages need same-version replacement; build ordering is not implied.
+        -->
         <MajorUpgrade
+            AllowSameVersionUpgrades="yes"
             Schedule="afterInstallInitialize"
             DowngradeErrorMessage="A newer version of meatshell is already installed. Setup will now exit."/>
 
@@ -73,6 +78,24 @@
                         <File Id="meatshellEXE"
                               Name="meatshell.exe"
                               Source="$(var.CargoTargetBinDir)\meatshell.exe"
+                              KeyPath="yes"/>
+                    </Component>
+                    <Component Id="AngleEglRuntime" Guid="*">
+                        <File Id="AngleEglDll"
+                              Name="libEGL.dll"
+                              Source="$(var.CargoTargetBinDir)\libEGL.dll"
+                              KeyPath="yes"/>
+                    </Component>
+                    <Component Id="AngleGlesRuntime" Guid="*">
+                        <File Id="AngleGlesDll"
+                              Name="libGLESv2.dll"
+                              Source="$(var.CargoTargetBinDir)\libGLESv2.dll"
+                              KeyPath="yes"/>
+                    </Component>
+                    <Component Id="AngleLicense" Guid="*">
+                        <File Id="AngleLicenseFile"
+                              Name="ANGLE_LICENSE.txt"
+                              Source="vendor\angle\windows-x86_64\LICENSE.txt"
                               KeyPath="yes"/>
                     </Component>
                     <Component Id="ThirdPartyNotices" Guid="*">
@@ -131,6 +154,9 @@
 
         <Feature Id="MainProgram" Title="meatshell" Level="1">
             <ComponentRef Id="MainExecutable"/>
+            <ComponentRef Id="AngleEglRuntime"/>
+            <ComponentRef Id="AngleGlesRuntime"/>
+            <ComponentRef Id="AngleLicense"/>
             <ComponentRef Id="ThirdPartyNotices"/>
             <ComponentRef Id="InstallLocationRegistry"/>
             <ComponentRef Id="ApplicationShortcut"/>

@@ -1,11 +1,11 @@
-/// One process row sampled from the remote `ps` (#23). CPU/mem are percentages
-/// as reported by `ps` (pcpu/pmem); `command` is the (width-truncated) args.
+/// One process row sampled from the remote process collector (#23). CPU/mem are
+/// unavailable on minimal BusyBox `ps` builds.
 #[derive(Debug, Clone)]
 pub struct ProcInfo {
     pub pid: u32,
     pub user: String,
-    pub cpu: f32,
-    pub mem: f32,
+    pub cpu: Option<f32>,
+    pub mem: Option<f32>,
     pub command: String,
 }
 

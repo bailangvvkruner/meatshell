@@ -63,10 +63,16 @@ pub(super) fn proc_rows(procs: &[ProcInfo], current_user: &str, tab_id: &str) ->
             tab_id: tab_id.into(),
             pid: p.pid.to_string().into(),
             user: p.user.clone().into(),
-            cpu: format!("{:.1}", p.cpu).into(),
-            mem: format!("{:.1}", p.mem).into(),
+            cpu: p
+                .cpu
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.1}"))
+                .into(),
+            mem: p
+                .mem
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.1}"))
+                .into(),
             command: p.command.clone().into(),
-            cpu_frac: (p.cpu / 100.0).clamp(0.0, 1.0),
+            cpu_frac: p.cpu.map_or(0.0, |value| (value / 100.0).clamp(0.0, 1.0)),
             own_process: !process_needs_root(current_user, &p.user),
         })
         .collect()

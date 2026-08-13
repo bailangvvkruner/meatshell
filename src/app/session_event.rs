@@ -380,6 +380,7 @@ pub(super) fn apply_session_event_to_window(
             user,
             need_user,
             need_password,
+            retry,
             responder,
         } => {
             enqueue_cred_prompt(
@@ -389,6 +390,7 @@ pub(super) fn apply_session_event_to_window(
                 user,
                 need_user,
                 need_password,
+                retry,
                 responder,
             );
         }
