@@ -5208,18 +5208,9 @@ fn wire_key_input(
         });
     }
 
-    // Propagate PTY resize to the SSH worker and vt100 parser. Pixel
-    // dimensions come from Slint; we approximate col/row counts using
-    // Consolas 13px metrics.
-    //
-    // terminal_view.slint now passes the FocusScope height (not the full
-    // TerminalView height), so the SFTP panel is already excluded.
-    // Layout breakdown for the FocusScope:
-    //   16 px  – bottom strip (TouchArea for focus-regain)
-    //    8 px  – y-offset of the output Text element inside the Flickable
-    // = 24 px  total vertical chrome within FocusScope
-    //
-    // Consolas 13 px renders at ≈ 8 px wide × 16 px tall per cell.
+    // Propagate PTY resize to the SSH worker and vt100 parser. Slint reports
+    // whole cell counts from the actual terminal FocusScope, so docked SFTP
+    // chrome is already excluded from both dimensions.
     {
         let handles = handles.clone();
         let bufs_resize = bufs.clone(); // keep bufs alive for the copy handler below
