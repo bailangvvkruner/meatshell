@@ -21,6 +21,10 @@ pub(super) fn start_session_in_tab(
     initial_rows: u32,
 ) {
     let has_sftp = session.kind == SessionKind::Ssh;
+    with_term_buf(&ctx.bufs, tab_id, |buffer| {
+        buffer.requested_pty_cols = initial_cols;
+        buffer.requested_pty_rows = initial_rows;
+    });
     // Resolve the optional SSH jump host now (on the UI thread, where the store
     // lives) so the owned Session can be handed to the worker threads (#211).
     let jump = resolve_jump(&ctx.store, &session);

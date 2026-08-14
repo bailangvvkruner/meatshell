@@ -10,7 +10,7 @@ pub(super) fn wire_tab_callbacks(
     splitters_model: Rc<VecModel<SplitterInfo>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
-    pending_initial_term_sizes: Rc<RefCell<HashMap<String, (u32, u32)>>>,
+    pending_initial_term_sizes: PendingInitialTermSizes,
     render_gates: RenderGates,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,

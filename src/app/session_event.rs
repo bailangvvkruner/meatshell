@@ -90,6 +90,10 @@ pub(super) fn apply_session_event_to_window(
             }
         }
         SessionEvent::Closed(reason) => {
+            // A producer can disappear mid `CSI ? 2026 h` frame. Fail open so
+            // the final parser state and the synthetic disconnect hint are not
+            // hidden forever waiting for a terminator that cannot arrive.
+            let _ = with_term_buf(bufs, tab_id, |buf| buf.abort_synchronized_output());
             // Print the hint into the terminal itself (FinalShell-style), via a
             // synthetic Output event so it reuses the normal render path (#79).
             apply_session_event_to_window(

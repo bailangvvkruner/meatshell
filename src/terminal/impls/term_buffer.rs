@@ -12,6 +12,41 @@ enum TerminalQuery {
     PrimaryDeviceAttributes,
 }
 
+// btop emits this alternate-screen/mouse-mode preamble before its first
+// synchronized frame. Affected versions can copy C0 bytes from process argv
+// directly into the stream (btop issue #1080, fixed in v1.4.2). The preamble
+// alone is not application-unique, so the process-table header is also required.
+const LEGACY_BTOP_STARTUP: [&[u8]; 6] = [
+    b"\x1b[?1049h",
+    b"\x1b[?25l",
+    b"\x1b[?1002h",
+    b"\x1b[?1015h",
+    b"\x1b[?1006h",
+    b"\x1b[?2026h",
+];
+const LEGACY_BTOP_PROCESS_HEADER: &[u8] = b"Pid: Program:";
+const LEGACY_BTOP_TREE_HEADER: &[u8] = b"Tree:";
+
+fn advance_legacy_btop_probe(progress: usize, sequence: &[u8]) -> usize {
+    if LEGACY_BTOP_STARTUP.get(progress).copied() == Some(sequence) {
+        progress + 1
+    } else if sequence == LEGACY_BTOP_STARTUP[0] {
+        1
+    } else {
+        0
+    }
+}
+
+fn advance_byte_probe(progress: usize, signature: &[u8], byte: u8) -> usize {
+    if signature.get(progress).copied() == Some(byte) {
+        progress + 1
+    } else if signature.first().copied() == Some(byte) {
+        1
+    } else {
+        0
+    }
+}
+
 fn terminal_query(sequence: &[u8]) -> Option<TerminalQuery> {
     match sequence {
         b"\x1b[5n" => Some(TerminalQuery::Status),
@@ -23,6 +58,49 @@ fn terminal_query(sequence: &[u8]) -> Option<TerminalQuery> {
 }
 
 impl TermBuffer {
+    /// Replace the terminal parser and discard scanner state that belongs to
+    /// the previous screen/session. Keeping a split CSI or synchronized-output
+    /// flag across reconnect/clear can suppress every later presentation.
+    pub(crate) fn reset_parser(&mut self, rows: u16, cols: u16) {
+        self.parser = vt100::Parser::new(rows, cols, 5000);
+        self.synchronized_output = false;
+        self.synchronized_output_started_at = None;
+        self.synchronized_output_timeout_scheduled = false;
+        self.legacy_btop_probe = 0;
+        self.legacy_btop_candidate = false;
+        self.legacy_btop_text_probe = 0;
+        self.legacy_btop_tree_probe = 0;
+        self.legacy_btop_compat = false;
+        self.sync_frame_has_hvp = false;
+        self.legacy_btop_pending_cr = false;
+        self.sanitized_btop_control_bytes = 0;
+        self.csi_state = CsiState::Normal;
+        self.csi_pending.clear();
+    }
+
+    /// Make a partial synchronized frame presentable when its producer exits
+    /// before sending `CSI ? 2026 l` (for example, on a dropped SSH session).
+    pub(crate) fn abort_synchronized_output(&mut self) {
+        let cancel_parser = self.csi_state != CsiState::Normal || !self.csi_pending.is_empty();
+        let pending_cr = std::mem::take(&mut self.legacy_btop_pending_cr);
+        self.synchronized_output = false;
+        self.synchronized_output_started_at = None;
+        self.synchronized_output_timeout_scheduled = false;
+        self.sync_frame_has_hvp = false;
+        self.legacy_btop_text_probe = 0;
+        self.legacy_btop_tree_probe = 0;
+        self.csi_state = CsiState::Normal;
+        self.csi_pending.clear();
+        if cancel_parser {
+            // The scanner normally withholds incomplete escapes from vt100.
+            // CAN also clears a prior CSI that was fed before a replacement ESC.
+            self.ingest_display_bytes(b"\x18");
+        }
+        if pending_cr {
+            self.ingest_display_bytes(b"\r");
+        }
+    }
+
     // ---- Absolute-coordinate selection helpers (#18 follow-up) -------------
     //
     // The "combined" buffer is `history` (oldest first) followed by the live
@@ -253,14 +331,64 @@ impl TermBuffer {
         let mut display = Vec::with_capacity(input.len());
 
         for &byte in input {
+            if self.legacy_btop_pending_cr {
+                self.legacy_btop_pending_cr = false;
+                if byte == b'\n'
+                    && self.legacy_btop_compat
+                    && self.synchronized_output
+                    && self.sync_frame_has_hvp
+                {
+                    // Match btop v1.4.2's width-preserving replacement: one
+                    // space for each byte in the embedded CRLF pair.
+                    display.extend_from_slice(b"  ");
+                    self.sanitized_btop_control_bytes += 2;
+                    continue;
+                }
+                display.push(b'\r');
+            }
             match self.csi_state {
                 CsiState::Normal => {
                     if byte == 0x1b {
+                        self.legacy_btop_text_probe = 0;
+                        self.legacy_btop_tree_probe = 0;
                         self.csi_pending.clear();
                         self.csi_pending.push(byte);
                         self.csi_state = CsiState::Esc;
                     } else {
-                        display.push(byte);
+                        if self.legacy_btop_candidate
+                            && !self.legacy_btop_compat
+                            && self.synchronized_output
+                            && self.sync_frame_has_hvp
+                        {
+                            self.legacy_btop_text_probe = advance_byte_probe(
+                                self.legacy_btop_text_probe,
+                                LEGACY_BTOP_PROCESS_HEADER,
+                                byte,
+                            );
+                            self.legacy_btop_tree_probe = advance_byte_probe(
+                                self.legacy_btop_tree_probe,
+                                LEGACY_BTOP_TREE_HEADER,
+                                byte,
+                            );
+                            if self.legacy_btop_text_probe == LEGACY_BTOP_PROCESS_HEADER.len()
+                                || self.legacy_btop_tree_probe == LEGACY_BTOP_TREE_HEADER.len()
+                            {
+                                self.legacy_btop_compat = true;
+                                self.legacy_btop_text_probe = 0;
+                                self.legacy_btop_tree_probe = 0;
+                            }
+                        }
+                        if self.legacy_btop_compat
+                            && self.synchronized_output
+                            && self.sync_frame_has_hvp
+                            && byte == b'\r'
+                        {
+                            // Delay one byte so only the observed embedded CRLF
+                            // pattern is changed, including across SSH chunks.
+                            self.legacy_btop_pending_cr = true;
+                        } else {
+                            display.push(byte);
+                        }
                     }
                 }
                 CsiState::Esc => {
@@ -269,6 +397,20 @@ impl TermBuffer {
                         self.csi_state = CsiState::Csi;
                     } else {
                         display.extend(self.csi_pending.drain(..));
+                        if byte == b'c' {
+                            // RIS ends any application-specific compatibility
+                            // mode while the reset itself still reaches vt100.
+                            self.synchronized_output = false;
+                            self.synchronized_output_started_at = None;
+                            self.synchronized_output_timeout_scheduled = false;
+                            self.legacy_btop_probe = 0;
+                            self.legacy_btop_candidate = false;
+                            self.legacy_btop_text_probe = 0;
+                            self.legacy_btop_tree_probe = 0;
+                            self.legacy_btop_compat = false;
+                            self.sync_frame_has_hvp = false;
+                            self.legacy_btop_pending_cr = false;
+                        }
                         if byte == 0x1b {
                             self.csi_pending.push(byte);
                         } else {
@@ -278,8 +420,80 @@ impl TermBuffer {
                     }
                 }
                 CsiState::Csi => {
+                    if byte == 0x1b {
+                        // ESC cancels the unfinished CSI and begins a new
+                        // escape sequence. Preserve both for vt100 while
+                        // keeping this scanner aligned with the replacement.
+                        display.extend(self.csi_pending.drain(..));
+                        self.csi_pending.push(byte);
+                        self.csi_state = CsiState::Esc;
+                        self.legacy_btop_text_probe = 0;
+                        self.legacy_btop_tree_probe = 0;
+                        continue;
+                    }
+                    if matches!(byte, 0x18 | 0x1a) {
+                        // CAN and SUB cancel a CSI without starting another.
+                        display.extend(self.csi_pending.drain(..));
+                        display.push(byte);
+                        self.csi_state = CsiState::Normal;
+                        self.legacy_btop_text_probe = 0;
+                        self.legacy_btop_tree_probe = 0;
+                        continue;
+                    }
                     self.csi_pending.push(byte);
                     if (0x40..=0x7e).contains(&byte) {
+                        let starts_sync = self.csi_pending.as_slice() == b"\x1b[?2026h";
+                        let ends_sync = self.csi_pending.as_slice() == b"\x1b[?2026l";
+                        let leaves_alt_screen = self.csi_pending.as_slice() == b"\x1b[?1049l";
+
+                        if self.legacy_btop_candidate && !self.legacy_btop_compat {
+                            // A header signature may not span an escape or a
+                            // cursor move, much less two synchronized frames.
+                            self.legacy_btop_text_probe = 0;
+                            self.legacy_btop_tree_probe = 0;
+                        }
+                        if !self.legacy_btop_candidate && !self.legacy_btop_compat {
+                            self.legacy_btop_probe = advance_legacy_btop_probe(
+                                self.legacy_btop_probe,
+                                &self.csi_pending,
+                            );
+                            if self.legacy_btop_probe == LEGACY_BTOP_STARTUP.len() {
+                                self.legacy_btop_candidate = true;
+                                self.legacy_btop_probe = 0;
+                            }
+                        }
+                        if starts_sync {
+                            self.synchronized_output = true;
+                            self.synchronized_output_started_at = Some(std::time::Instant::now());
+                            self.synchronized_output_timeout_scheduled = false;
+                            self.sync_frame_has_hvp = false;
+                            self.legacy_btop_text_probe = 0;
+                            self.legacy_btop_tree_probe = 0;
+                        } else if ends_sync {
+                            self.synchronized_output = false;
+                            self.synchronized_output_started_at = None;
+                            self.synchronized_output_timeout_scheduled = false;
+                            self.sync_frame_has_hvp = false;
+                            self.legacy_btop_text_probe = 0;
+                            self.legacy_btop_tree_probe = 0;
+                        } else if leaves_alt_screen {
+                            self.synchronized_output = false;
+                            self.synchronized_output_started_at = None;
+                            self.synchronized_output_timeout_scheduled = false;
+                            self.legacy_btop_probe = 0;
+                            self.legacy_btop_candidate = false;
+                            self.legacy_btop_text_probe = 0;
+                            self.legacy_btop_tree_probe = 0;
+                            self.legacy_btop_compat = false;
+                            self.sync_frame_has_hvp = false;
+                            self.legacy_btop_pending_cr = false;
+                        }
+                        if byte == b'f'
+                            && (self.legacy_btop_candidate || self.legacy_btop_compat)
+                            && self.synchronized_output
+                        {
+                            self.sync_frame_has_hvp = true;
+                        }
                         if let Some(kind) = terminal_query(&self.csi_pending) {
                             self.ingest_display_bytes(&display);
                             display.clear();
@@ -301,11 +515,22 @@ impl TermBuffer {
                                 }
                             }
                         } else {
-                            // Rewrite HVP (`CSI … f`) to CUP (`CSI … H`) because
-                            // vt100 implements only the latter.
-                            if byte == b'f' {
-                                if let Some(final_byte) = self.csi_pending.last_mut() {
-                                    *final_byte = b'H';
+                            // vt100 does not implement ANSI.SYS SCP/RCP (`CSI
+                            // s/u`). Map them to its DEC save/restore support;
+                            // btop uses these sequences in its message boxes.
+                            if self.csi_pending.as_slice() == b"\x1b[s" {
+                                display.extend_from_slice(b"\x1b7");
+                                self.csi_pending.clear();
+                            } else if self.csi_pending.as_slice() == b"\x1b[u" {
+                                display.extend_from_slice(b"\x1b8");
+                                self.csi_pending.clear();
+                            } else {
+                                // Rewrite HVP (`CSI … f`) to CUP (`CSI … H`)
+                                // because vt100 implements only the latter.
+                                if byte == b'f' {
+                                    if let Some(final_byte) = self.csi_pending.last_mut() {
+                                        *final_byte = b'H';
+                                    }
                                 }
                             }
                             display.extend(self.csi_pending.drain(..));

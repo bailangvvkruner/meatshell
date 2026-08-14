@@ -79,7 +79,8 @@ impl TerminalMetadata {
     }
 }
 
-type ScreenReader = Arc<dyn Fn(&str, usize) -> Option<Vec<String>> + Send + Sync + 'static>;
+type ScreenReader =
+    Arc<dyn Fn(&str, usize) -> Option<TerminalScreenSnapshot> + Send + Sync + 'static>;
 type PointerEncoder =
     Arc<dyn Fn(&str, DebugPointerEvent) -> Option<Vec<u8>> + Send + Sync + 'static>;
 type ScreenshotRequester = Arc<
@@ -134,6 +135,27 @@ pub(crate) struct ScreenshotFrame {
     pub(crate) pixels: slint::SharedPixelBuffer<slint::Rgba8Pixel>,
 }
 
+/// A bounded text snapshot plus the exact vt100 grid that produced it.
+/// Keeping the dimensions beside the text avoids inferring terminal geometry
+/// from trailing spaces or wide glyphs in diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TerminalScreenSnapshot {
+    pub(crate) lines: Vec<String>,
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) ui_rows: u32,
+    pub(crate) ui_cols: u32,
+    pub(crate) requested_pty_rows: u32,
+    pub(crate) requested_pty_cols: u32,
+    pub(crate) cell_width_logical_px: f32,
+    pub(crate) cell_height_logical_px: f32,
+    pub(crate) alternate_screen: bool,
+    pub(crate) synchronized_output: bool,
+    pub(crate) legacy_btop_compat: bool,
+    pub(crate) sanitized_btop_control_bytes: usize,
+    pub(crate) parse_errors: usize,
+}
+
 #[derive(Clone)]
 struct InputTarget {
     generation: u64,
@@ -161,8 +183,9 @@ struct DebugApiStateInner {
 /// Thread-safe state shared by the UI/session layer and the HTTP handlers.
 ///
 /// The screen callback receives a terminal id and a maximum number of lines.
-/// It should return the newest lines in display order. Handlers apply their own
-/// line and byte caps as a second line of defence.
+/// It should return the newest lines in display order together with the exact
+/// parser grid. Handlers apply their own line and byte caps as a second line of
+/// defence.
 #[derive(Clone)]
 pub struct DebugApiState {
     inner: Arc<DebugApiStateInner>,
@@ -171,7 +194,7 @@ pub struct DebugApiState {
 impl DebugApiState {
     pub fn new<F>(screen_reader: F) -> Self
     where
-        F: Fn(&str, usize) -> Option<Vec<String>> + Send + Sync + 'static,
+        F: Fn(&str, usize) -> Option<TerminalScreenSnapshot> + Send + Sync + 'static,
     {
         Self {
             inner: Arc::new(DebugApiStateInner {
@@ -1037,6 +1060,19 @@ struct ScreenQuery {
 #[derive(Serialize)]
 struct ScreenResponse {
     terminal_id: String,
+    rows: u16,
+    cols: u16,
+    ui_rows: u32,
+    ui_cols: u32,
+    requested_pty_rows: u32,
+    requested_pty_cols: u32,
+    cell_width_logical_px: f32,
+    cell_height_logical_px: f32,
+    alternate_screen: bool,
+    synchronized_output: bool,
+    legacy_btop_compat: bool,
+    sanitized_btop_control_bytes: usize,
+    parse_errors: usize,
     line_count: usize,
     truncated: bool,
     text: String,
@@ -1056,16 +1092,29 @@ async fn screen(
         .unwrap_or(DEFAULT_MAX_SCREEN_LINES)
         .clamp(1, MAX_SCREEN_LINES);
     let provider_limit = max_lines.saturating_add(1);
-    let Some(lines) = (context.state.inner.screen_reader)(&id, provider_limit) else {
+    let Some(snapshot) = (context.state.inner.screen_reader)(&id, provider_limit) else {
         return api_error(
             StatusCode::NOT_FOUND,
             "screen_unavailable",
             "terminal screen is unavailable",
         );
     };
-    let (text, line_count, truncated) = cap_screen(lines, max_lines);
+    let (text, line_count, truncated) = cap_screen(snapshot.lines, max_lines);
     Json(ScreenResponse {
         terminal_id: id,
+        rows: snapshot.rows,
+        cols: snapshot.cols,
+        ui_rows: snapshot.ui_rows,
+        ui_cols: snapshot.ui_cols,
+        requested_pty_rows: snapshot.requested_pty_rows,
+        requested_pty_cols: snapshot.requested_pty_cols,
+        cell_width_logical_px: snapshot.cell_width_logical_px,
+        cell_height_logical_px: snapshot.cell_height_logical_px,
+        alternate_screen: snapshot.alternate_screen,
+        synchronized_output: snapshot.synchronized_output,
+        legacy_btop_compat: snapshot.legacy_btop_compat,
+        sanitized_btop_control_bytes: snapshot.sanitized_btop_control_bytes,
+        parse_errors: snapshot.parse_errors,
         line_count,
         truncated,
         text,
@@ -1431,6 +1480,25 @@ mod tests {
         ScreenshotFrame { pixels }
     }
 
+    fn terminal_screen(lines: Vec<String>) -> TerminalScreenSnapshot {
+        TerminalScreenSnapshot {
+            rows: lines.len() as u16,
+            cols: 80,
+            ui_rows: 24,
+            ui_cols: 81,
+            requested_pty_rows: 23,
+            requested_pty_cols: 79,
+            cell_width_logical_px: 8.25,
+            cell_height_logical_px: 16.5,
+            alternate_screen: true,
+            synchronized_output: false,
+            legacy_btop_compat: true,
+            sanitized_btop_control_bytes: 4,
+            parse_errors: 2,
+            lines,
+        }
+    }
+
     #[test]
     fn generated_token_is_256_bit_url_safe_value() {
         let first = generate_token();
@@ -1561,7 +1629,7 @@ mod tests {
     fn live_server_authenticates_and_routes_terminal_io() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let state = DebugApiState::new(|id, _max_lines| {
-            (id == "term-1").then(|| vec!["old".into(), "??".into()])
+            (id == "term-1").then(|| terminal_screen(vec!["old".into(), "??".into()]))
         });
         state.set_pointer_encoder(|id, event| {
             if id != "term-1" {
@@ -1656,6 +1724,19 @@ mod tests {
         );
         assert!(screen.starts_with("HTTP/1.1 200"));
         assert!(screen.contains("content-type: application/json; charset=utf-8"));
+        assert!(screen.contains("\"rows\":2"));
+        assert!(screen.contains("\"cols\":80"));
+        assert!(screen.contains("\"ui_rows\":24"));
+        assert!(screen.contains("\"ui_cols\":81"));
+        assert!(screen.contains("\"requested_pty_rows\":23"));
+        assert!(screen.contains("\"requested_pty_cols\":79"));
+        assert!(screen.contains("\"cell_width_logical_px\":8.25"));
+        assert!(screen.contains("\"cell_height_logical_px\":16.5"));
+        assert!(screen.contains("\"alternate_screen\":true"));
+        assert!(screen.contains("\"synchronized_output\":false"));
+        assert!(screen.contains("\"legacy_btop_compat\":true"));
+        assert!(screen.contains("\"sanitized_btop_control_bytes\":4"));
+        assert!(screen.contains("\"parse_errors\":2"));
         assert!(screen.contains("\"text\":\"??\""));
 
         let screenshot = request_bytes(
@@ -1727,7 +1808,8 @@ mod tests {
     #[test]
     fn live_server_protects_every_route_and_rejects_oversized_input() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let state = DebugApiState::new(|id, _| (id == "term-1").then(Vec::new));
+        let state =
+            DebugApiState::new(|id, _| (id == "term-1").then(|| terminal_screen(Vec::new())));
         state.upsert_terminal(TerminalMetadata::new(
             "term-1",
             "server",

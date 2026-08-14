@@ -25,7 +25,7 @@ decoded correctly by Windows PowerShell 5 as well as modern clients.
 | `GET` | `/v1/health` | Build, renderer, ANGLE, process-memory, and idle-trim diagnostics |
 | `GET` | `/v1/screenshot?max_width=2048&max_height=2048` | Current rendered window as PNG without focusing it |
 | `GET` | `/v1/terminals` | Public metadata for open terminals |
-| `GET` | `/v1/terminals/{id}/screen?max_lines=200` | Newest visible terminal text |
+| `GET` | `/v1/terminals/{id}/screen?max_lines=200` | Newest visible terminal text and grid diagnostics |
 | `POST` | `/v1/terminals/{id}/input` | Send UTF-8 text and an optional terminal Enter |
 | `POST` | `/v1/terminals/{id}/pointer` | Send an xterm mouse event when tracking is enabled |
 
@@ -34,6 +34,19 @@ decoded correctly by Windows PowerShell 5 as well as modern clients.
 Terminal metadata contains only `id`, `title`, `host`, and connection `state`.
 The API does not enumerate saved sessions and never returns passwords, private
 keys, key passphrases, or WebDAV credentials.
+
+The screen response includes exact parser `rows` and `cols`, the latest
+`ui_rows` and `ui_cols` reported by the visible terminal, and the last
+`requested_pty_rows` and `requested_pty_cols` sent to the transport. The PTY
+fields are requests, not remote acknowledgements. It also reports logical cell
+dimensions, alternate-screen and synchronized-output state, and the vt100
+`parse_errors` count so a layout, transport, parser, or raster mismatch can be
+identified without inferring geometry from terminal text. The
+`legacy_btop_compat` flag and `sanitized_btop_control_bytes` counter report when
+the narrowly fingerprinted btop <= 1.4.1 compatibility guard is active and has
+replaced CR/LF bytes from embedded process-argument line breaks. `parse_errors`
+does not count syntactically valid CSI commands that the vt100 crate does not
+implement.
 
 The health response includes:
 

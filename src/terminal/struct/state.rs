@@ -13,6 +13,13 @@ pub(crate) enum CtrlKeySide {
 /// Per-terminal state used by normal and alternate-screen rendering.
 pub(crate) struct TermBuffer {
     pub(crate) parser: vt100::Parser,
+    /// Latest whole-cell grid reported by the visible TerminalView.
+    pub(crate) ui_cols: u32,
+    pub(crate) ui_rows: u32,
+    /// Latest size requested from the PTY transport. This is a request, not a
+    /// remote acknowledgement, and is exposed under that name by the Debug API.
+    pub(crate) requested_pty_cols: u32,
+    pub(crate) requested_pty_rows: u32,
     /// Logical cell dimensions measured by Slint's active terminal font probe.
     pub(crate) raster_cell_width: f32,
     pub(crate) raster_cell_height: f32,
@@ -27,6 +34,23 @@ pub(crate) struct TermBuffer {
     pub(crate) prev: Vec<Line>,
     pub(crate) view_offset: usize,
     pub(crate) displayed_text: Vec<String>,
+    /// DEC synchronized-output mode (`CSI ? 2026 h/l`). The parser may keep
+    /// ingesting a frame while presentation remains on the last complete one.
+    pub(crate) synchronized_output: bool,
+    pub(crate) synchronized_output_started_at: Option<std::time::Instant>,
+    pub(crate) synchronized_output_timeout_scheduled: bool,
+    /// Streaming probe for btop's startup control-sequence signature. The
+    /// compatibility behavior itself targets upstream issue #1080.
+    pub(crate) legacy_btop_probe: usize,
+    pub(crate) legacy_btop_candidate: bool,
+    pub(crate) legacy_btop_text_probe: usize,
+    pub(crate) legacy_btop_tree_probe: usize,
+    /// Restricts the old-btop argv control-byte workaround to a positively
+    /// identified btop alternate-screen session.
+    pub(crate) legacy_btop_compat: bool,
+    pub(crate) sync_frame_has_hvp: bool,
+    pub(crate) legacy_btop_pending_cr: bool,
+    pub(crate) sanitized_btop_control_bytes: usize,
     pub(crate) csi_state: CsiState,
     pub(crate) csi_pending: Vec<u8>,
     pub(crate) raw: VecDeque<u8>,

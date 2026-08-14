@@ -151,11 +151,17 @@ pub(super) fn apply_terminal_resize(
     rows: u32,
 ) {
     *last_term_size.lock().unwrap() = (cols, rows);
-    if let Some(handle) = handles.borrow().get(tab_id) {
-        handle.resize(cols, rows);
-    }
+    let transport_exists = handles.borrow().contains_key(tab_id);
+    let mut resize_transport = transport_exists;
     if let Some(h) = term_buf(bufs, tab_id) {
         let mut buf = h.lock().unwrap();
+        buf.ui_cols = cols;
+        buf.ui_rows = rows;
+        if transport_exists {
+            resize_transport = (buf.requested_pty_cols, buf.requested_pty_rows) != (cols, rows);
+            buf.requested_pty_cols = cols;
+            buf.requested_pty_rows = rows;
+        }
         let (old_rows, old_cols) = buf.parser.screen().size();
         let (new_rows, new_cols) = (rows as u16, cols as u16);
         if (new_rows, new_cols) != (old_rows, old_cols) {
@@ -171,6 +177,14 @@ pub(super) fn apply_terminal_resize(
             // The pre/post-resize screens differ; drop the scroll-detection
             // snapshot so the next output isn't mis-read as a scroll.
             buf.prev.clear();
+        }
+    }
+    // Resize the parser before queueing the transport request. Once the remote
+    // receives SIGWINCH it can emit a full frame immediately; that frame must
+    // never race ahead of the local grid change and be decoded at the old size.
+    if resize_transport {
+        if let Some(handle) = handles.borrow().get(tab_id) {
+            handle.resize(cols, rows);
         }
     }
 }
@@ -630,12 +644,28 @@ fn submit_terminal_raster(
 }
 
 pub(super) fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
+    let mut synchronized_retry = None;
     let data = with_term_buf(bufs, tab_id, |buf| {
+        if buf.synchronized_output {
+            let started_at = buf.synchronized_output_started_at;
+            let elapsed = started_at
+                .map(|started| started.elapsed())
+                .unwrap_or(SYNCHRONIZED_OUTPUT_TIMEOUT);
+            if elapsed < SYNCHRONIZED_OUTPUT_TIMEOUT {
+                if !buf.synchronized_output_timeout_scheduled {
+                    buf.synchronized_output_timeout_scheduled = true;
+                    synchronized_retry =
+                        started_at.map(|started| (SYNCHRONIZED_OUTPUT_TIMEOUT - elapsed, started));
+                }
+                return None;
+            }
+            buf.abort_synchronized_output();
+        }
         let (rows, cols) = buf.parser.screen().size();
         let b = buf.render(); // also refreshes buf.displayed_text
         let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
         let sel = buf.selection_rects_visible(cols);
-        (
+        Some((
             b,
             matches,
             sel,
@@ -643,8 +673,25 @@ pub(super) fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &
             cols,
             buf.raster_cell_width,
             buf.raster_cell_height,
-        )
-    });
+        ))
+    })
+    .flatten();
+    if let Some((delay, frame_started_at)) = synchronized_retry {
+        let weak = win.as_weak();
+        let bufs = bufs.clone();
+        let tab_id = tab_id.to_string();
+        slint::Timer::single_shot(delay, move || {
+            let _ = with_term_buf(&bufs, &tab_id, |buf| {
+                if buf.synchronized_output_started_at == Some(frame_started_at) {
+                    buf.synchronized_output_timeout_scheduled = false;
+                }
+            });
+            if let Some(win) = weak.upgrade() {
+                rebuild_tab_display(&win, &bufs, &tab_id);
+            }
+        });
+        return;
+    }
     let Some((b, matches, sel, rows, cols, cell_width, cell_height)) = data else {
         return;
     };

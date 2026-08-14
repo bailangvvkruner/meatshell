@@ -60,6 +60,24 @@ const PACED_QUEUE_EVENT_LIMIT: usize = 256;
 /// Max UI renders per second for a tab under sustained output (#209).
 const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
+/// Fail open if an application never closes a synchronized-output frame.
+const SYNCHRONIZED_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A new TerminalView can report several grids while Slint settles the docked
+/// panels. Starting the PTY between those reports lets a full-screen program
+/// paint at one width while the parser is already moving to another.
+const INITIAL_GRID_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+const INITIAL_GRID_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_millis(750);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingInitialTermSize {
+    cols: u32,
+    rows: u32,
+    revision: u64,
+}
+
+type PendingInitialTermSizes = Rc<RefCell<HashMap<String, PendingInitialTermSize>>>;
+
 pub(crate) fn active_renderer_name() -> &'static str {
     window::active_renderer_name()
 }
@@ -74,6 +92,95 @@ pub(crate) fn active_terminal_render_interval_ms() -> u64 {
 
 fn term_buf(bufs: &TermBuffers, tab_id: &str) -> Option<TermBufferHandle> {
     bufs.lock().unwrap().get(tab_id).cloned()
+}
+
+fn record_pending_initial_term_size(
+    pending: &PendingInitialTermSizes,
+    tab_id: &str,
+    cols: u32,
+    rows: u32,
+) -> u64 {
+    let mut pending = pending.borrow_mut();
+    let revision = pending
+        .get(tab_id)
+        .map(|previous| {
+            if (previous.cols, previous.rows) == (cols, rows) {
+                previous.revision
+            } else {
+                previous.revision.wrapping_add(1).max(1)
+            }
+        })
+        .unwrap_or(1);
+    pending.insert(
+        tab_id.to_string(),
+        PendingInitialTermSize {
+            cols,
+            rows,
+            revision,
+        },
+    );
+    revision
+}
+
+fn initial_terminal_grid_is_stable(
+    observed_revision: Option<u64>,
+    current: Option<PendingInitialTermSize>,
+    timed_out: bool,
+) -> bool {
+    timed_out || current.is_some_and(|size| observed_revision == Some(size.revision))
+}
+
+fn start_session_after_terminal_grid_settles(
+    tab_id: String,
+    session: Session,
+    ctx: ConnectCtx,
+    last_term_size: Arc<Mutex<(u32, u32)>>,
+    pending_sizes: PendingInitialTermSizes,
+    observed_revision: Option<u64>,
+    deadline: std::time::Instant,
+) {
+    slint::Timer::single_shot(INITIAL_GRID_SETTLE_DELAY, move || {
+        if term_buf(&ctx.bufs, &tab_id).is_none() {
+            return;
+        }
+
+        let current = pending_sizes.borrow().get(&tab_id).copied();
+        let timed_out = std::time::Instant::now() >= deadline;
+        if !initial_terminal_grid_is_stable(observed_revision, current, timed_out) {
+            start_session_after_terminal_grid_settles(
+                tab_id,
+                session,
+                ctx,
+                last_term_size,
+                pending_sizes,
+                current.map(|size| size.revision),
+                deadline,
+            );
+            return;
+        }
+
+        let settled_size = pending_sizes.borrow_mut().remove(&tab_id);
+        let parser_size = term_buf(&ctx.bufs, &tab_id).map(|buffer| {
+            let buffer = buffer.lock().unwrap();
+            buffer.parser.screen().size()
+        });
+        let (rows, cols) = settled_size
+            .map(|size| (size.rows, size.cols))
+            .or_else(|| parser_size.map(|(rows, cols)| (rows as u32, cols as u32)))
+            .unwrap_or_else(|| *last_term_size.lock().unwrap());
+
+        if let Some(buffer) = term_buf(&ctx.bufs, &tab_id) {
+            let mut buffer = buffer.lock().unwrap();
+            let (new_rows, new_cols) = (
+                rows.clamp(1, u16::MAX as u32) as u16,
+                cols.clamp(1, u16::MAX as u32) as u16,
+            );
+            if buffer.parser.screen().size() != (new_rows, new_cols) {
+                buffer.parser.set_size(new_rows, new_cols);
+            }
+        }
+        start_session_in_tab(&tab_id, session, &ctx, cols, rows);
+    });
 }
 
 fn with_term_buf<R>(
@@ -125,6 +232,42 @@ fn event_requires_immediate_ui(event: &SessionEvent) -> bool {
 #[path = "../tests/app/terminal_ingest/mod.rs"]
 mod ingest_frame_tests;
 
+#[cfg(test)]
+mod initial_grid_tests {
+    use super::*;
+
+    #[test]
+    fn session_start_waits_for_one_stable_grid_interval() {
+        let pending: PendingInitialTermSizes = Rc::new(RefCell::new(HashMap::new()));
+        assert!(!initial_terminal_grid_is_stable(None, None, false));
+
+        let first = record_pending_initial_term_size(&pending, "tab", 120, 30);
+        let first_size = pending.borrow().get("tab").copied();
+        assert!(!initial_terminal_grid_is_stable(None, first_size, false));
+        assert!(initial_terminal_grid_is_stable(
+            Some(first),
+            first_size,
+            false
+        ));
+
+        let repeated = record_pending_initial_term_size(&pending, "tab", 120, 30);
+        assert_eq!(repeated, first);
+        let changed = record_pending_initial_term_size(&pending, "tab", 121, 30);
+        assert_ne!(changed, first);
+        let changed_size = pending.borrow().get("tab").copied();
+        assert!(!initial_terminal_grid_is_stable(
+            Some(first),
+            changed_size,
+            false
+        ));
+        assert!(initial_terminal_grid_is_stable(
+            Some(first),
+            changed_size,
+            true
+        ));
+    }
+}
+
 use anyhow::{Context, Result};
 use i_slint_backend_winit::WinitWindowAccessor;
 use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
@@ -137,7 +280,7 @@ use crate::config::{
 use crate::debug_api::{
     DebugApiController, DebugApiState, DebugPointerEvent, DebugPointerEventKind,
     MemoryTrimDiagnostics as DebugMemoryTrimDiagnostics, RuntimeDiagnostics, ScreenshotFrame,
-    TerminalMetadata, DEFAULT_PORT as DEBUG_API_PORT,
+    TerminalMetadata, TerminalScreenSnapshot, DEFAULT_PORT as DEBUG_API_PORT,
 };
 use crate::i18n::t;
 use crate::layout::{LogicalRect, TerminalWheelHit};
@@ -155,13 +298,12 @@ use crate::ssh::{
 #[cfg(windows)]
 use crate::terminal::c0_letter_key_down;
 use crate::terminal::{
-    bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
+    bare_ctrl_marker_workaround_enabled, cell_prefix, clear_pixel_pool, compile_output_rules,
     encode_command_bar_input, encode_pasted_text, encode_terminal_mouse_event, key_to_pty_bytes,
-    paste_requires_large_review, should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste,
-    clear_pixel_pool, recycle_pixel_buffer, CsiState, OutputHighlightPreset, RasterCompletion,
-    RasterConfig, RasterJob, RasterResult, RasterResultState, RasterSpan, RenderGates,
-    TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers, TerminalMouseEventKind,
-    TerminalRasterizer,
+    paste_requires_large_review, recycle_pixel_buffer, should_drop_bare_ctrl_marker,
+    terminal_uses_bracketed_paste, CsiState, OutputHighlightPreset, RasterCompletion, RasterConfig,
+    RasterJob, RasterResult, RasterResultState, RasterSpan, RenderGates, TabRenderGate, TermBuffer,
+    TermBufferHandle, TermBuffers, TerminalMouseEventKind, TerminalRasterizer,
 };
 #[cfg(test)]
 use crate::terminal::{
@@ -472,8 +614,27 @@ pub fn run() -> Result<()> {
             let mut buffer = handle
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _ = buffer.render();
-            Some(debug_screen_lines(&buffer.displayed_text, max_lines))
+            if !buffer.synchronized_output {
+                let _ = buffer.render();
+            }
+            let screen = buffer.parser.screen();
+            let (rows, cols) = screen.size();
+            Some(TerminalScreenSnapshot {
+                lines: debug_screen_lines(&buffer.displayed_text, max_lines),
+                rows,
+                cols,
+                ui_rows: buffer.ui_rows,
+                ui_cols: buffer.ui_cols,
+                requested_pty_rows: buffer.requested_pty_rows,
+                requested_pty_cols: buffer.requested_pty_cols,
+                cell_width_logical_px: buffer.raster_cell_width,
+                cell_height_logical_px: buffer.raster_cell_height,
+                alternate_screen: screen.alternate_screen(),
+                synchronized_output: buffer.synchronized_output,
+                legacy_btop_compat: buffer.legacy_btop_compat,
+                sanitized_btop_control_bytes: buffer.sanitized_btop_control_bytes,
+                parse_errors: screen.errors(),
+            })
         })
     };
     {
@@ -526,12 +687,10 @@ pub fn run() -> Result<()> {
     // size to spawn_session before the first resize callback fires.
     // Default: 80 cols × 24 rows (SSH spec minimum).
     let last_term_size: Arc<Mutex<(u32, u32)>> = Arc::new(Mutex::new((80, 24)));
-    // A new terminal can emit its first real grid size while Slint is still
-    // constructing the model row, before its TermBuffer/SessionHandle exists.
-    // Keep that size per tab so the delayed session start cannot fall back to
-    // the parser's old 80x24 dimensions (#btop-wrap).
-    let pending_initial_term_sizes: Rc<RefCell<HashMap<String, (u32, u32)>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    // Track each new tab's grid revisions while Slint constructs and lays out
+    // its TerminalView. The PTY starts only after one quiet interval, so a
+    // full-screen first frame cannot race a second layout size (#btop-wrap).
+    let pending_initial_term_sizes: PendingInitialTermSizes = Rc::new(RefCell::new(HashMap::new()));
 
     // --- Build window + models ------------------------------------------
     // Set the Wayland app_id / X11 WM_CLASS *before* the window is created so
@@ -3231,7 +3390,7 @@ fn wire_session_callbacks(
     render_gates: RenderGates,
     runtime: Arc<Runtime>,
     last_term_size: Arc<Mutex<(u32, u32)>>,
-    pending_initial_term_sizes: Rc<RefCell<HashMap<String, (u32, u32)>>>,
+    pending_initial_term_sizes: PendingInitialTermSizes,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
     tab_statuses: TabStatuses,
@@ -4129,6 +4288,66 @@ fn wire_session_callbacks(
                 },
             );
 
+            // Register the parser before publishing the terminal model row.
+            // Slint can synchronously emit the first resize while constructing
+            // that row, and the callback must always find this tab's buffer.
+            let is_dark_now = weak.upgrade().map(|w| w.get_dark_mode()).unwrap_or(true);
+            let (output_highlight, custom_highlight_rules) = {
+                let settings = store.borrow();
+                (
+                    OutputHighlightPreset::from_settings(
+                        settings.output_highlight_enabled(),
+                        settings.output_highlight_preset(),
+                    ),
+                    compile_output_rules(settings.output_highlight_rules()),
+                )
+            };
+            bufs.lock().unwrap().insert(
+                tab_id.clone(),
+                Arc::new(Mutex::new(TermBuffer {
+                    parser: vt100::Parser::new(
+                        initial_rows.clamp(1, u16::MAX as u32) as u16,
+                        initial_cols.clamp(1, u16::MAX as u32) as u16,
+                        5000,
+                    ),
+                    ui_cols: initial_cols,
+                    ui_rows: initial_rows,
+                    requested_pty_cols: 0,
+                    requested_pty_rows: 0,
+                    raster_cell_width: 8.0,
+                    raster_cell_height: 16.0,
+                    find_query: String::new(),
+                    is_dark: is_dark_now,
+                    output_highlight,
+                    custom_highlight_rules,
+                    sel_anchor: None,
+                    sel_focus: None,
+                    sel_ranges: Vec::new(),
+                    history: VecDeque::new(),
+                    prev: Vec::new(),
+                    view_offset: 0,
+                    displayed_text: Vec::new(),
+                    synchronized_output: false,
+                    synchronized_output_started_at: None,
+                    synchronized_output_timeout_scheduled: false,
+                    legacy_btop_probe: 0,
+                    legacy_btop_candidate: false,
+                    legacy_btop_text_probe: 0,
+                    legacy_btop_tree_probe: 0,
+                    legacy_btop_compat: false,
+                    sync_frame_has_hvp: false,
+                    legacy_btop_pending_cr: false,
+                    sanitized_btop_control_bytes: 0,
+                    csi_state: CsiState::Normal,
+                    csi_pending: Vec::new(),
+                    raw: std::collections::VecDeque::new(),
+                })),
+            );
+            render_gates.lock().unwrap().insert(
+                tab_id.clone(),
+                Arc::new(TabRenderGate::new(RENDER_MIN_INTERVAL)),
+            );
+
             // Register tab + terminal state (SFTP fields start empty/loading).
             tabs_model.push(TabInfo {
                 id: tab_id.clone().into(),
@@ -4193,50 +4412,6 @@ fn wire_session_callbacks(
                 sftp_panel_width: sftp_w_default,
                 sftp_saved_height: sftp_h_default,
             });
-            // Create vt100 parser with the same initial grid requested from the
-            // transport. The first terminal-resize callback is debounced, so
-            // decoding a full-screen btop frame at another width wraps it.
-            let is_dark_now = weak.upgrade().map(|w| w.get_dark_mode()).unwrap_or(true);
-            let (output_highlight, custom_highlight_rules) = {
-                let settings = store.borrow();
-                (
-                    OutputHighlightPreset::from_settings(
-                        settings.output_highlight_enabled(),
-                        settings.output_highlight_preset(),
-                    ),
-                    compile_output_rules(settings.output_highlight_rules()),
-                )
-            };
-            bufs.lock().unwrap().insert(
-                tab_id.clone(),
-                Arc::new(Mutex::new(TermBuffer {
-                    parser: vt100::Parser::new(
-                        initial_rows.clamp(1, u16::MAX as u32) as u16,
-                        initial_cols.clamp(1, u16::MAX as u32) as u16,
-                        5000,
-                    ),
-                    raster_cell_width: 8.0,
-                    raster_cell_height: 16.0,
-                    find_query: String::new(),
-                    is_dark: is_dark_now,
-                    output_highlight,
-                    custom_highlight_rules,
-                    sel_anchor: None,
-                    sel_focus: None,
-                    sel_ranges: Vec::new(),
-                    history: VecDeque::new(),
-                    prev: Vec::new(),
-                    view_offset: 0,
-                    displayed_text: Vec::new(),
-                    csi_state: CsiState::Normal,
-                    csi_pending: Vec::new(),
-                    raw: std::collections::VecDeque::new(),
-                })),
-            );
-            render_gates.lock().unwrap().insert(
-                tab_id.clone(),
-                Arc::new(TabRenderGate::new(RENDER_MIN_INTERVAL)),
-            );
             // No followed-cwd yet: the first OSC 7 always triggers a follow.
             sftp_last_cwd.lock().unwrap().remove(&tab_id);
             // Add the new tab to the focused pane and re-flatten (this also sets
@@ -4253,10 +4428,9 @@ fn wire_session_callbacks(
                 );
             }
 
-            // Start the shell (+ SFTP) workers on the next event-loop turn.
-            // TerminalView emits its first real grid size while this model
-            // update is being laid out; delaying the transport lets that size
-            // reach the parser and the initial PTY request before btop paints.
+            // Start the shell (+ SFTP) workers only after TerminalView's grid
+            // has remained unchanged for one settle interval. A fixed one-frame
+            // delay can expire before docked panels finish their layout.
             let ctx = ConnectCtx {
                 weak: weak.clone(),
                 runtime: runtime.clone(),
@@ -4274,43 +4448,19 @@ fn wire_session_callbacks(
                 debug_api: debug_api.clone(),
                 runtime_sessions: runtime_sessions.clone(),
             };
-            let tab_for_start = tab_id.clone();
-            let bufs_for_start = bufs.clone();
-            let last_size_for_start = last_term_size.clone();
-            let pending_size_for_start = pending_initial_term_sizes.clone();
-            // Let the model/layout pass deliver the first real TerminalView
-            // resize before starting the transport. A zero-delay timer can run
-            // before that callback on the winit event loop.
-            slint::Timer::single_shot(std::time::Duration::from_millis(16), move || {
-                if term_buf(&bufs_for_start, &tab_for_start).is_none() {
-                    return;
-                }
-                // The first resize may arrive while Slint is constructing the
-                // model row, before this tab has a buffer. Prefer that saved
-                // per-tab size over the parser's initial 80x24 dimensions.
-                let pending_size = pending_size_for_start
-                    .borrow_mut()
-                    .remove(&tab_for_start);
-                let parser_size = term_buf(&bufs_for_start, &tab_for_start).map(|buffer| {
-                    let buffer = buffer.lock().unwrap();
-                    buffer.parser.screen().size()
-                });
-                let (rows, cols) = pending_size
-                    .map(|(cols, rows)| (rows, cols))
-                    .or_else(|| parser_size.map(|(rows, cols)| (rows as u32, cols as u32)))
-                    .unwrap_or_else(|| *last_size_for_start.lock().unwrap());
-                if let Some(buffer) = term_buf(&bufs_for_start, &tab_for_start) {
-                    let mut buffer = buffer.lock().unwrap();
-                    let (new_rows, new_cols) = (
-                        rows.clamp(1, u16::MAX as u32) as u16,
-                        cols.clamp(1, u16::MAX as u32) as u16,
-                    );
-                    if buffer.parser.screen().size() != (new_rows, new_cols) {
-                        buffer.parser.set_size(new_rows, new_cols);
-                    }
-                }
-                start_session_in_tab(&tab_for_start, session, &ctx, cols, rows);
-            });
+            let observed_revision = pending_initial_term_sizes
+                .borrow()
+                .get(&tab_id)
+                .map(|size| size.revision);
+            start_session_after_terminal_grid_settles(
+                tab_id,
+                session,
+                ctx,
+                last_term_size.clone(),
+                pending_initial_term_sizes.clone(),
+                observed_revision,
+                std::time::Instant::now() + INITIAL_GRID_WAIT_LIMIT,
+            );
         });
     }
 
@@ -4591,7 +4741,7 @@ fn wire_key_input(
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
     last_term_size: Arc<Mutex<(u32, u32)>>,
-    pending_initial_term_sizes: Rc<RefCell<HashMap<String, (u32, u32)>>>,
+    pending_initial_term_sizes: PendingInitialTermSizes,
     store: Rc<RefCell<ConfigStore>>,
     ctx: ConnectCtx,
 ) {
@@ -5009,7 +5159,7 @@ fn wire_key_input(
                         if let Some(h) = term_buf(&ctx.bufs, tab_id.as_str()) {
                             let mut b = h.lock().unwrap();
                             let (rows, cols) = b.parser.screen().size();
-                            b.parser = vt100::Parser::new(rows, cols, 5000);
+                            b.reset_parser(rows, cols);
                             b.history.clear();
                             b.prev.clear();
                             b.displayed_text.clear();
@@ -5296,73 +5446,94 @@ fn wire_key_input(
         let pending_size: Rc<RefCell<HashMap<String, (u32, u32)>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let resize_debounce = Rc::new(slint::Timer::default());
-        window.on_terminal_resize(move |tab_id: SharedString,
-                                        cols_f: f32,
-                                        rows_f: f32,
-                                        cell_width: f32,
-                                        cell_height: f32| {
-            // A hidden terminal (inactive tab, or a split sibling not currently
-            // shown) reports 0 width/height. Ignore those: flooring 0 to the 10-col
-            // minimum and applying it would shrink that tab's PTY *and* poison
-            // `last_term_size`, so the next connection (e.g. "Duplicate connection")
-            // would start at 10 cols and wrap its first output to ~10 chars (#v0.5).
-            // Only genuine, visible sizes drive a resize.
-            if cols_f < 1.0 || rows_f < 1.0 {
-                return;
-            }
-            if let Some(buffer) = term_buf(&bufs_resize, tab_id.as_str()) {
-                let mut buffer = buffer.lock().unwrap();
-                buffer.raster_cell_width = cell_width.max(1.0);
-                buffer.raster_cell_height = cell_height.max(1.0);
-            }
-            let cols = (cols_f as u32).max(10);
-            let rows = (rows_f as u32).max(5);
-            // A newly-created tab has no transport handle yet. Apply its first
-            // real grid immediately so the parser can be paired with the PTY
-            // before the first btop frame arrives; the 150 ms debounce below is
-            // still used for every already-running session during layout drag.
-            if !handles.borrow().contains_key(tab_id.as_str()) {
-                pending_initial_term_sizes_resize
+        window.on_terminal_resize(
+            move |tab_id: SharedString,
+                  cols_f: f32,
+                  rows_f: f32,
+                  cell_width: f32,
+                  cell_height: f32| {
+                // A hidden terminal (inactive tab, or a split sibling not currently
+                // shown) reports 0 width/height. Ignore those: flooring 0 to the 10-col
+                // minimum and applying it would shrink that tab's PTY *and* poison
+                // `last_term_size`, so the next connection (e.g. "Duplicate connection")
+                // would start at 10 cols and wrap its first output to ~10 chars (#v0.5).
+                // Only genuine, visible sizes drive a resize.
+                if cols_f < 1.0 || rows_f < 1.0 {
+                    return;
+                }
+                let cols = (cols_f as u32).max(10);
+                let rows = (rows_f as u32).max(5);
+                if let Some(buffer) = term_buf(&bufs_resize, tab_id.as_str()) {
+                    let mut buffer = buffer.lock().unwrap();
+                    buffer.ui_cols = cols;
+                    buffer.ui_rows = rows;
+                    buffer.raster_cell_width = cell_width.max(1.0);
+                    buffer.raster_cell_height = cell_height.max(1.0);
+                }
+                // A newly-created tab has no transport handle yet. Apply its first
+                // real grid immediately so the parser can be paired with the PTY
+                // before the first btop frame arrives; the 150 ms debounce below is
+                // still used for every already-running session during layout drag.
+                if !handles.borrow().contains_key(tab_id.as_str()) {
+                    record_pending_initial_term_size(
+                        &pending_initial_term_sizes_resize,
+                        tab_id.as_str(),
+                        cols,
+                        rows,
+                    );
+                    apply_terminal_resize(
+                        &handles,
+                        &bufs_resize,
+                        &last_term_size,
+                        tab_id.as_str(),
+                        cols,
+                        rows,
+                    );
+                    return;
+                }
+                pending_size
                     .borrow_mut()
                     .insert(tab_id.to_string(), (cols, rows));
-                apply_terminal_resize(
-                    &handles,
-                    &bufs_resize,
-                    &last_term_size,
-                    tab_id.as_str(),
-                    cols,
-                    rows,
-                );
-                return;
-            }
-            pending_size
-                .borrow_mut()
-                .insert(tab_id.to_string(), (cols, rows));
-            let pending = pending_size.clone();
-            let handles = handles.clone();
-            let bufs = bufs_resize.clone();
-            let last = last_term_size.clone();
-            let weak = weak_resize.clone();
-            // (Re)arm the single-shot timer; rapid changes keep resetting it so
-            // only the final, settled size is applied.
-            resize_debounce.start(
-                slint::TimerMode::SingleShot,
-                std::time::Duration::from_millis(150),
-                move || {
-                    let settled: Vec<(String, (u32, u32))> = pending.borrow_mut().drain().collect();
-                    for (tab, (cols, rows)) in settled {
-                        tracing::debug!("terminal_resize tab={} cols={} rows={}", tab, cols, rows);
-                        forget_terminal_raster(&tab);
-                        apply_terminal_resize(&handles, &bufs, &last, &tab, cols, rows);
-                        // Re-render so the reflowed (or resized) grid shows at once
-                        // instead of waiting for the next remote output (#169).
-                        if let Some(win) = weak.upgrade() {
+                let pending = pending_size.clone();
+                let handles = handles.clone();
+                let bufs = bufs_resize.clone();
+                let last = last_term_size.clone();
+                let weak = weak_resize.clone();
+                // (Re)arm the single-shot timer; rapid changes keep resetting it so
+                // only the final, settled size is applied.
+                resize_debounce.start(
+                    slint::TimerMode::SingleShot,
+                    std::time::Duration::from_millis(150),
+                    move || {
+                        let settled: Vec<(String, (u32, u32))> =
+                            pending.borrow_mut().drain().collect();
+                        let Some(win) = weak.upgrade() else {
+                            return;
+                        };
+                        let visible = visible_tab_ids(&win);
+                        for (tab, (cols, rows)) in settled {
+                            // A tab can be hidden or closed while its debounce is
+                            // pending. Discard that stale geometry; becoming visible
+                            // emits a fresh size for the current layout.
+                            if !visible.contains(&tab) {
+                                continue;
+                            }
+                            tracing::debug!(
+                                "terminal_resize tab={} cols={} rows={}",
+                                tab,
+                                cols,
+                                rows
+                            );
+                            forget_terminal_raster(&tab);
+                            apply_terminal_resize(&handles, &bufs, &last, &tab, cols, rows);
+                            // Re-render so the reflowed (or resized) grid shows at once
+                            // instead of waiting for the next remote output (#169).
                             rebuild_tab_display(&win, &bufs, &tab);
                         }
-                    }
-                },
-            );
-        });
+                    },
+                );
+            },
+        );
     }
 
     // Ctrl+Shift+C: copy current terminal screen to clipboard.
@@ -5471,7 +5642,7 @@ fn wire_key_input(
             if let Some(h) = term_buf(&bufs_clear, &tid) {
                 let mut buf = h.lock().unwrap();
                 let (rows, cols) = buf.parser.screen().size();
-                buf.parser = vt100::Parser::new(rows, cols, 5000);
+                buf.reset_parser(rows, cols);
                 buf.find_query.clear();
                 buf.history = VecDeque::new(); // recycle the session scrollback
                 buf.prev = Vec::new();
