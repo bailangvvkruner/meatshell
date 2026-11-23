@@ -627,3 +627,100 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-remote.') }}
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true
+
+  # ── Rolling Windows x64 nightly ──────────────────────────────────────────
+  # 每次 push 到 main 都刷新 `nightly` 预发布（zip + 尽力而为的 msi）。
+  # 打标签的正式发布由上面各 job 负责，这里不碰任何版本化 release。
+  nightly-windows:
+    name: windows-x86_64-nightly
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: check-version
+    runs-on: windows-latest
+    concurrency:
+      group: nightly-windows
+      cancel-in-progress: true
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      ASSET: meatshell-nightly-windows-x86_64.zip
+      MSI: meatshell-nightly-windows-x86_64.msi
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}-nightly
+
+      - name: Build (release)
+        run: cargo build --locked --release --target ${{ env.TARGET }}
+
+      - name: Package nightly zip
+        shell: bash
+        run: |
+          set -eu
+          STAGE="meatshell-nightly-windows-x86_64"
+          mkdir "$STAGE"
+          cp "target/$TARGET/release/meatshell.exe" "$STAGE/"
+          cp README.md README.en.md CHANGELOG.md THIRD_PARTY_NOTICES.md "$STAGE/" 2>/dev/null || true
+          mkdir -p "$STAGE/docs"
+          cp docs/REMOTE_MCP.md docs/upstream-sync.md "$STAGE/docs/" 2>/dev/null || true
+          7z a "$ASSET" "$STAGE" >/dev/null
+          test -f "$ASSET"
+
+      # 尽力而为：WiX/cargo-wix 出问题不能拖垮 nightly 的 zip。
+      - name: Build MSI installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install wixtoolset -y --no-progress
+          $candle = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*\bin\candle.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($candle) { $env:PATH = "$($candle.DirectoryName);$env:PATH" }
+          cargo install cargo-wix --locked
+          cargo wix --no-build --nocapture --target $env:TARGET --output $env:MSI
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -eu
+          FILES="$ASSET"
+          if [ -f "$MSI" ]; then FILES="$FILES"$'\n'"$MSI"; fi
+          { echo 'RELEASE_FILES<<EOF'; echo "$FILES"; echo 'EOF'; } >> "$GITHUB_ENV"
+
+      - name: Upload nightly zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-nightly
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+      - name: Upload nightly MSI artifact
+        if: ${{ hashFiles(env.MSI) != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-nightly-msi
+          path: ${{ env.MSI }}
+          if-no-files-found: warn
+
+      # 用 GITHUB_TOKEN 推标签不会再次触发本 workflow。
+      - name: Move rolling nightly tag
+        shell: bash
+        run: |
+          set -eu
+          git tag --force nightly "$GITHUB_SHA"
+          git push origin refs/tags/nightly --force
+
+      - name: Publish rolling Windows x64 nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Windows x64 nightly
+          prerelease: true
+          make_latest: false
+          files: ${{ env.RELEASE_FILES }}
+          fail_on_unmatched_files: true
