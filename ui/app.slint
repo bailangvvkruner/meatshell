@@ -964,6 +964,14 @@ export component AppWindow inherits Window {
     in-out property <string> hostkey-confirm-label; // trust-button text (from Rust, bilingual)
     callback hostkey-accept();                     // trust (and remember) the key
     callback hostkey-reject();                      // abort the connection
+    // Clipboard quick connect. A copied `ssh user@host` offers a one-click,
+    // passwordless, runtime-only connection. Rust only opens this after the
+    // clipboard parses exactly as such a target, and never saves the session.
+    in-out property <bool> clipboard-connect-open: false;
+    in-out property <string> clipboard-connect-user;
+    in-out property <string> clipboard-connect-host;
+    callback clipboard-connect-confirmed();
+    callback clipboard-connect-cancelled();
     // Connect-time credential prompt (#110). Rust opens this when a session is
     // missing its username and/or password; the answer flows back via accept.
     in-out property <bool> cred-prompt-open: false;
@@ -1284,6 +1292,7 @@ export component AppWindow inherits Window {
         root.mfa-prompt-open ? ModalKind.mfa :
         root.cred-prompt-open ? ModalKind.credentials :
         root.hostkey-prompt-open ? ModalKind.host-key :
+        root.clipboard-connect-open ? ModalKind.clipboard-connect :
         root.confirm-delete-open ? ModalKind.delete-confirm :
         root.paste-confirm-open ? ModalKind.paste-confirm :
         root.qcg-open ? ModalKind.command-group :
@@ -5151,6 +5160,26 @@ export component AppWindow inherits Window {
         secondary => { session-editor.submit-current(); }
         confirm => { root.hostkey-accept(); }
         cancel => { root.hostkey-reject(); }
+    }
+
+    // Clipboard quick connect: a copied `ssh user@host` is only a suggestion,
+    // so require an explicit confirmation before opening the temporary,
+    // passwordless connection. Backdrop clicks cancel like any other prompt.
+    ConfirmDialog {
+        width: parent.width;
+        height: parent.height;
+        is-open <=> root.clipboard-connect-open;
+        is-mac: root.is-mac;
+        covered: root.active-modal != ModalKind.clipboard-connect;
+        confirm-on-enter: true;
+        title: root.lang-en ? "Temporary SSH connection?" : "是否临时连接 SSH？";
+        message: root.lang-en
+            ? "Connect without a password, using the local SSH agent or your default keys? The session is not saved."
+            : "是否使用本机 SSH Agent 或默认密钥免密连接？该会话不会被保存。";
+        detail: root.clipboard-connect-user + "@" + root.clipboard-connect-host;
+        confirm-label: root.lang-en ? "Connect" : "连接";
+        confirm => { root.clipboard-connect-confirmed(); }
+        cancel => { root.clipboard-connect-cancelled(); }
     }
 
     // Batch-import connections from pasted text (#150).

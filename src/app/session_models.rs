@@ -733,6 +733,9 @@ pub(super) fn session_from_draft(
         rdp_clipboard: draft.rdp_clipboard,
         rdp_gfx: draft.rdp_gfx,
         rdp_extra_args: draft.rdp_extra_args.to_string(),
+        // Editing a saved session always produces a normal, prompting session;
+        // only clipboard quick connect sets this flag at runtime.
+        runtime_passwordless: false,
     }
 }
 

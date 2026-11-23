@@ -8,6 +8,9 @@ pub(super) fn install_window_event_hook(
     dock_stacks: &Rc<RefCell<DockStacks>>,
     activity: &Rc<Cell<WinActivity>>,
     exit_confirmed: &Rc<Cell<bool>>,
+    // Last clipboard value we already offered, so refocusing the window does
+    // not re-prompt for the same `ssh user@host`.
+    clipboard_prompted: &Arc<Mutex<Option<String>>>,
 ) {
     let WinCtx {
         core,
@@ -42,6 +45,7 @@ pub(super) fn install_window_event_hook(
         let ev_store = store.clone();
         let ev_activity = activity.clone();
         let ev_exit_confirmed = exit_confirmed.clone();
+    let ev_clipboard_prompted = clipboard_prompted.clone();
         let ev_registry = registry.clone();
         let ev_core = core.clone();
         let ev_ds = dock_stacks.clone();
@@ -242,6 +246,7 @@ pub(super) fn install_window_event_hook(
                         }
                     }
                     WEvent::Focused(f) => {
+                        let became_focused = *f && !focused;
                         focused = *f;
                         apply_activity(focused, minimized, occluded);
                         if *f {
@@ -281,6 +286,11 @@ pub(super) fn install_window_event_hook(
                                 }
                             }
                             refresh_revealed_main_window(weak.clone());
+                            // A copied `ssh user@host` is offered once per value,
+                            // and only while no other modal owns the window.
+                            if became_focused {
+                                queue_clipboard_connect_prompt(&weak, &ev_clipboard_prompted);
+                            }
                         }
                     }
                     WEvent::Occluded(o) => {

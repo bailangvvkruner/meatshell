@@ -486,6 +486,9 @@ pub(super) fn open_window(
     // Per-tab connection status + remote resources, the latest local sample,
     // and the local machine's network history (bottom sparkline).
     let tab_statuses: TabStatuses = Arc::new(Mutex::new(HashMap::new()));
+    // Runtime-only sessions created by clipboard quick connect. They never
+    // enter the config store, so closing their tab (or the window) drops them.
+    let runtime_sessions: RuntimeSessions = Rc::new(RefCell::new(HashMap::new()));
     let local_snap: LocalSnap = Arc::new(Mutex::new(SystemSnapshot::default()));
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
 
@@ -635,6 +638,7 @@ pub(super) fn open_window(
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
         tab_statuses.clone(),
+        runtime_sessions.clone(),
         local_snap.clone(),
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
@@ -760,9 +764,16 @@ pub(super) fn open_window(
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
             store: store.clone(),
+            runtime_sessions: runtime_sessions.clone(),
             tab_routes: core.tab_routes.clone(),
         },
     );
+
+    // Clipboard quick connect: a copied `ssh user@host` offers a one-click,
+    // passwordless, runtime-only connection. Prompted when the window regains
+    // focus (see window_events.rs) and only ever after an explicit confirm.
+    let clipboard_prompted: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    wire_clipboard_connect(&window, runtime_sessions.clone());
 
     // --- Window activity, for idle-CPU throttling (#127) ----------------
     // Idle terminals shouldn't burn CPU: pause the sampler when the window is
@@ -831,7 +842,13 @@ pub(super) fn open_window(
     window_timers.borrow_mut().push(timer);
 
     // OS file drag-and-drop → upload to the active session's SFTP directory,
-    install_window_event_hook(&ctx, &dock_stacks, &activity, &exit_confirmed);
+    install_window_event_hook(
+        &ctx,
+        &dock_stacks,
+        &activity,
+        &exit_confirmed,
+        &clipboard_prompted,
+    );
     wire_window_controls(&ctx, &dock_stacks, &exit_confirmed);
 
     // Position once shown (size is only known after the first frame). The

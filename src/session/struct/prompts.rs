@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
 
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, Session};
 use crate::resource::{LocalSnap, NetHist, TabStatuses};
 use crate::sftp::{SftpHandles, SftpLastCwd};
 use crate::ssh::SessionHandle;
@@ -34,6 +34,9 @@ pub(crate) struct ConnectCtx {
     pub(crate) last_term_size: Arc<Mutex<(u32, u32)>>,
     pub(crate) sftp_follow_cd: Arc<AtomicBool>,
     pub(crate) store: Rc<RefCell<ConfigStore>>,
+    /// Runtime-only sessions (clipboard quick connect) that are not in the
+    /// config store. Looked up before the store when a tab is started.
+    pub(crate) runtime_sessions: Rc<RefCell<HashMap<String, Session>>>,
     /// Process-wide tab delivery routes. Starting a session registers its
     /// route here so a later detach/merge can retarget the running pumps
     /// at another window without respawning them (#tab-detach).

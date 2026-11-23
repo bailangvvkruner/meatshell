@@ -8,6 +8,7 @@
 mod agents;
 mod auth_dialogs;
 mod aux_windows;
+mod clipboard_connect;
 mod color_theme;
 mod credentials;
 mod terminal_scheme;
@@ -67,6 +68,7 @@ mod window_events;
 
 use self::auth_dialogs::*;
 use self::aux_windows::*;
+use self::clipboard_connect::*;
 use self::dock_stacks::*;
 use self::editor_host::*;
 use self::editor_tabs::*;

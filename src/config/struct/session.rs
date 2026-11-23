@@ -376,6 +376,11 @@ pub struct Session {
     /// (B站 suggestion)
     #[serde(default)]
     pub note: String,
+    /// Runtime-only session created by clipboard quick connect: try the local
+    /// SSH agent, default keys and `none` auth instead of prompting for a
+    /// password. Never serialized, so it can never reach the config file.
+    #[serde(skip)]
+    pub runtime_passwordless: bool,
 }
 
 /// One SSH tunnel (#56). `kind` is "local" (-L), "remote" (-R) or
@@ -605,6 +610,7 @@ impl Session {
             sftp_mode: String::new(),
             sftp_command: String::new(),
             note: String::new(),
+            runtime_passwordless: false,
         }
     }
 }

@@ -1351,6 +1351,22 @@ pub(crate) async fn authenticate_session(
     config: Arc<client::Config>,
     events: &UnboundedSender<SessionEvent>,
 ) -> Result<AuthResult> {
+    // Clipboard quick connect creates runtime-only sessions: never prompt for a
+    // password, just try what `ssh user@host` would try and report the result.
+    if session.runtime_passwordless {
+        return passwordless_auth(
+            handle,
+            jump_handle,
+            remote_forwards,
+            x11_state,
+            session,
+            jump,
+            config,
+            events,
+        )
+        .await;
+    }
+
     let (user, password) = match resolve_credentials(session, events).await {
         Some(c) => c,
         None => return Ok(AuthResult::Cancelled),
@@ -1451,6 +1467,169 @@ pub(crate) async fn agent_auth<H: Handler>(
     super::agent::login(handle, user, &mut agent)
         .await
         .with_context(|| format!("SSH agent authentication at {}:{}", session.host, session.port))
+}
+
+/// Try every non-interactive method a fresh `ssh user@host` would use: keys held
+/// by the local SSH agent, the usual unencrypted `~/.ssh/id_*` keys, then SSH
+/// `none` auth. Clipboard quick connect sessions never prompt, so an encrypted
+/// key, a missing agent or a rejected key simply falls through to the next
+/// method and the connection either works or fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn passwordless_auth(
+    handle: &mut Handle<ClientHandler>,
+    jump_handle: &mut Vec<Handle<ClientHandler>>,
+    remote_forwards: &mut RemoteForwardMap,
+    x11_state: &mut X11RuntimeState,
+    session: &Session,
+    jump: &[Session],
+    config: Arc<client::Config>,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<AuthResult> {
+    let user = session.user.trim().to_string();
+    if user.is_empty() {
+        return Ok(AuthResult::Failed);
+    }
+
+    // Any attempt that reaches the server consumes an auth try and leaves the
+    // handle unusable for another method (russh hangs instead of reporting it),
+    // so every further attempt starts from a fresh connection.
+    let mut handle_used = false;
+
+    // 1. Keys held by the user's agent (OpenSSH, Pageant, Bitwarden, 1Password).
+    match super::agent::Agent::connect().await {
+        Ok(mut agent) => {
+            let _ = events.send(SessionEvent::Status(format!(
+                "{} {}@{}:{}",
+                t(
+                    "正在通过 SSH Agent 免密登录（如 Bitwarden 弹出确认，请批准）",
+                    "Passwordless login with the SSH agent (approve the login if Bitwarden asks)"
+                ),
+                user,
+                session.host,
+                session.port
+            )));
+            match super::agent::login(handle, &user, &mut agent).await {
+                Ok(true) => return Ok(AuthResult::Success),
+                Ok(false) => handle_used = true,
+                // An agent that refuses to sign is not fatal here: the default
+                // key files below may still work.
+                Err(error) => {
+                    handle_used = true;
+                    tracing::debug!("clipboard quick connect: SSH agent failed: {error:#}");
+                }
+            }
+        }
+        Err(error) => tracing::debug!("clipboard quick connect: no SSH agent: {error:#}"),
+    }
+
+    // 2. The usual unencrypted OpenSSH keys. Encrypted keys are skipped on
+    // purpose: this path must never ask for a passphrase.
+    for path in passwordless_identity_paths(session) {
+        let mut candidate = session.clone();
+        candidate.private_key_path = path.to_string_lossy().replace('\\', "/");
+        candidate.private_key_inline = Secret::default();
+        let Ok(keypair) = load_session_private_key(&candidate, "") else {
+            continue;
+        };
+        if handle_used {
+            reconnect_passwordless(
+                handle,
+                jump_handle,
+                remote_forwards,
+                x11_state,
+                session,
+                jump,
+                config.clone(),
+                events,
+            )
+            .await?;
+        }
+        handle_used = true;
+        let hash = rsa_hash(handle, keypair.algorithm().is_rsa()).await;
+        let key = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash);
+        let ok = network_stage(
+            &format!(
+                "public-key authentication at {}:{}",
+                session.host, session.port
+            ),
+            handle.authenticate_publickey(&user, key),
+        )
+        .await?
+        .success();
+        if ok {
+            return Ok(AuthResult::Success);
+        }
+    }
+
+    // 3. SSH `none`, for servers that explicitly allow passwordless accounts.
+    if handle_used {
+        reconnect_passwordless(
+            handle,
+            jump_handle,
+            remote_forwards,
+            x11_state,
+            session,
+            jump,
+            config,
+            events,
+        )
+        .await?;
+    }
+    let ok = network_stage(
+        &format!("none authentication at {}:{}", session.host, session.port),
+        handle.authenticate_none(&user),
+    )
+    .await?
+    .success();
+    Ok(if ok {
+        AuthResult::Success
+    } else {
+        AuthResult::Failed
+    })
+}
+
+/// Identity files the quick-connect path offers, most specific first: the ones
+/// `~/.ssh/config` names for this host, then the default OpenSSH key names.
+fn passwordless_identity_paths(session: &Session) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for host in crate::ssh::ssh_config::parse_default() {
+        if (host.alias == session.host || host.hostname == session.host)
+            && !host.identity_file.trim().is_empty()
+        {
+            paths.push(PathBuf::from(host.identity_file));
+        }
+    }
+    if let Some(home) = crate::ssh::ssh_config::home_dir() {
+        let ssh = home.join(".ssh");
+        for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+            paths.push(ssh.join(name));
+        }
+    }
+    paths.dedup();
+    paths
+}
+
+/// Replace an auth-exhausted handle with a fresh connection, so the next
+/// passwordless attempt starts clean. Mirrors the keyboard-interactive fallback
+/// in `authenticate_session`.
+#[allow(clippy::too_many_arguments)]
+async fn reconnect_passwordless(
+    handle: &mut Handle<ClientHandler>,
+    jump_handle: &mut Vec<Handle<ClientHandler>>,
+    remote_forwards: &mut RemoteForwardMap,
+    x11_state: &mut X11RuntimeState,
+    session: &Session,
+    jump: &[Session],
+    config: Arc<client::Config>,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<()> {
+    disconnect_ssh(handle, "passwordless authentication fallback").await;
+    let (h, jh, targets, x11) = Box::pin(connect_ssh(session, jump, config, events)).await?;
+    *handle = h;
+    *jump_handle = jh;
+    *remote_forwards = targets;
+    *x11_state = x11;
+    Ok(())
 }
 
 /// Connect + authenticate a jump/bastion session, open a `direct-tcpip` channel

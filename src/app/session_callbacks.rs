@@ -98,6 +98,7 @@ pub(super) fn wire_session_callbacks(
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
     tab_statuses: TabStatuses,
+    runtime_sessions: RuntimeSessions,
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
@@ -1270,6 +1271,7 @@ pub(super) fn wire_session_callbacks(
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
         let tab_statuses = tab_statuses.clone();
+        let runtime_sessions = runtime_sessions.clone();
         let local_snap = local_snap.clone();
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
@@ -1305,15 +1307,26 @@ pub(super) fn wire_session_callbacks(
                     }
                 }
             } else {
-                match store.borrow().get(&id).cloned() {
+                // Clipboard quick connect creates runtime-only sessions that
+                // deliberately stay out of the config store.
+                match runtime_sessions
+                    .borrow()
+                    .get(&id)
+                    .cloned()
+                    .or_else(|| store.borrow().get(&id).cloned())
+                {
                     Some(s) => s,
                     None => return,
                 }
             };
             // Recent connections (welcome page / empty main area). RDP counts
             // too: it is a connection, just in the system client's window.
-            if let Some(w) = weak.upgrade() {
-                super::recents::record(&w, &store, &id);
+            // Runtime-only (clipboard quick connect) sessions have no store
+            // entry, so a recent row for them would dangle.
+            if !session.runtime_passwordless {
+                if let Some(w) = weak.upgrade() {
+                    super::recents::record(&w, &store, &id);
+                }
             }
             // ── RDP: hand the saved account to the system client, open no tab ──
             // FinalShell does the same thing: meatshell stores host / port /
