@@ -46,7 +46,8 @@ identified without inferring geometry from terminal text. The
 the narrowly fingerprinted btop <= 1.4.1 compatibility guard is active and has
 replaced CR/LF bytes from embedded process-argument line breaks. `parse_errors`
 does not count syntactically valid CSI commands that the vt100 crate does not
-implement.
+implement. vt100 0.18 does not expose a parser error counter at all, so this
+build always reports `0` there.
 
 The health response includes:
 

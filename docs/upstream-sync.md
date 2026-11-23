@@ -31,10 +31,23 @@ D:/aaa/git/github/meatshell-sync   sync/v0.8.4（基于 upstream/main，跟踪 u
 
 | 序号 | 功能 | 源提交（main） | 目标落点（v0.8.4 结构） | 状态 |
 | --- | --- | --- | --- | --- |
-| 1 | Windows x64 夜间构建 + 滚动 `nightly` 预发布 | `945ed26` | `.github/workflows/release.yml`（新增 `nightly-windows` job） | 进行中 |
-| 2 | 资源监控刷新频率可配置 | `94fe429`、`551c660` | `src/config/struct/config_file.rs`、`src/resource/*`、`src/app/resource_ui.rs`、`ui/interface_panel.slint` | 待做 |
-| 3 | 剪贴板免密 SSH 快速连接 | `979f83c` | `src/app/clipboard_connect.rs`（新增）、`src/app/tab_callbacks.rs`、`src/ssh/impls/ssh.rs`、`ui/app.slint` | 待做 |
-| 4 | Debug HTTP API（127.0.0.1:24817，Bearer token） | `ed462f0`（部分） | `src/debug_api.rs`（新增，1745 行）、`src/main.rs`、`src/app.rs`、配置项、`ui/app.slint` 设置页、`docs/debug-api.md` | 待做 |
+| 1 | Windows x64 夜间构建 + 滚动 `nightly` 预发布 | `945ed26` | `.github/workflows/release.yml`（新增 `nightly-windows` job） | 已完成 |
+| 2 | 资源监控刷新频率可配置 | `94fe429`、`551c660` | `src/config/*`、`src/ssh/impls/ssh.rs`、`src/app/open_window.rs`、`src/app/settings_callbacks.rs`、`ui/interface_panel.slint` | 已完成 |
+| 3 | 剪贴板免密 SSH 快速连接 | `979f83c` | `src/app/clipboard_connect.rs`（新增）、`src/app/session_callbacks.rs`、`src/config/struct/session.rs`、`ui/app.slint` | 已完成 |
+| 4 | Debug HTTP API（127.0.0.1:24817，Bearer token） | `ed462f0`（部分） | `src/debug_api.rs`（新增）、`src/main.rs`、`src/app.rs`、`src/app/open_window.rs`、`src/session/struct/prompts.rs`、配置项、`ui/*.slint`、`docs/debug-api.md` | 已完成 |
+
+### 3.1 与 `main` 实现方式的差异（有意为之）
+
+- **资源刷新频率**：`main` 用 `tokio::sync::watch` 贯穿 `ConnectCtx`；这里改用与上游
+  `KEEPALIVE` 同款进程级 `AtomicU32`（`ssh::REMOTE_MONITOR_INTERVAL`），开监控通道时读取并
+  烘焙进远端 shell 循环，因此不改 `ConnectCtx` 签名、也不会打断已运行的监控。代价：远程
+  间隔只对新建连接生效（设置页已注明）。本地采样仍由 UI timer 按设置间隔取数。
+- **Debug API**：`TerminalScreenSnapshot` 里依赖 `main` 专有渲染/btop 补偿逻辑的字段
+  （`cell_width/height_logical_px`、`synchronized_output`、`legacy_btop_compat`、
+  `sanitized_btop_control_bytes`）在本分支报告为常量，`docs/debug-api.md` 末尾已写明。
+  状态改为窗口作用域（每个窗口一份），输入通道仍只在传输层 `Connected` 之后才发布。
+- **剪贴板免密**：复用上游 `agent::Agent` + `passwordless_identity_paths`，运行时会话标
+  `runtime_passwordless`（`serde(skip)`），不写入 `sessions.json` / 最近列表。
 
 ## 4. 丢弃清单（上游已有等价实现）
 
@@ -73,3 +86,34 @@ git switch main                       # 回到主分支，worktree 保留
 git worktree remove --force D:/aaa/git/github/meatshell-sync
 git branch -D sync/v0.8.4
 ```
+
+## 8. Windows 本机构建验证（2026-11-23）
+
+本机无管理员权限、无 VS Build Tools / Windows SDK，因此使用
+`x86_64-pc-windows-gnu` 工具链；但 rustup 的 GNU 目标只自带自包含
+import lib，缺 `dlltool.exe`（`windows-sys` / `getrandom` / `windows-result`
+构建时会报 `error calling dlltool 'dlltool.exe': program not found`）。
+解决方式：把完整 MinGW-w64 解压到 D 盘并前置进 PATH（不写 C 盘）：
+
+```text
+D:\rust\mingw64      # gcc 16.2.0 + binutils 2.47（niXman mingw-builds, msvcrt 运行时）
+D:\rust\cargo        # CARGO_HOME
+D:\rust\rustup       # RUSTUP_HOME
+D:\rust\temp         # TEMP/TMP 与构建日志
+```
+
+`D:\rust\temp\build-sync.ps1` 一键设置上述变量并跑 `cargo build` + `cargo test --no-run`。
+
+为让该分支在 GNU 工具链下真正编译、测试，这条分支相对上游 v0.8.4 额外补了 4 处
+移植缺口（都是「自己的功能」在基线里的残留依赖）：
+
+| 文件 | 改动 | 原因 |
+| --- | --- | --- |
+| `src/ssh/struct/command.rs` + `src/ssh/impls/ssh.rs` + `src/terminal/impls/{local,serial,telnet}.rs` | 新增 `SessionCommand::DebugInput { bytes, ack }`，四条传输层都在写入后回 ack（失败则回 `Err` 并关闭会话） | Debug API 的 `/input` 依赖 ack 语义；基线里只有 `RawInput` |
+| `src/app/window.rs` + `src/app.rs` | 记录 Slint 实际请求的渲染器（`ACTIVE_RENDERER` / `OnceLock`），导出 `active_renderer_name()` / `active_renderer_uses_gpu()` | `open_window.rs` 的 Debug API 诊断需要这两个值 |
+| `src/app/open_window.rs` | vt100 0.18 的 `Screen::size()` 返回 `NonZeroU16`，改用 `.get()`；`parse_errors` 固定为 0（该版本无解析错误计数） | 基线的快照代码按更高版本 vt100 写 |
+| `tests/app/modal_layers.rs` | `wire_session_callbacks` 补齐第 27 个参数（`debug_api`） | 基线新增了 Debug API 控制器 |
+| `tests/ui_session_editor.rs` | “Add trigger”点击坐标改为按渲染像素定位（蓝色按钮行扫描） | 上游该测试的固定坐标 (505, 456) 在 X11 转发区块加入后已失效，任何平台都会点到 DISPLAY 输入框 |
+
+结果：`cargo build`（debug）通过；`cargo test --no-fail-fast` 全绿
+（838 个单测 + 9 个 UI 集成测试 + 其余 UI 测试用例）。
