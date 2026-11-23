@@ -513,15 +513,35 @@ fn saved_secret_reveal_flows_through_the_real_app_window() {
         ui.invoke_edit_session(saved.id.clone().into());
         let masked = password_pixels(&render());
         assert_eq!(ui.get_dialog_password(), "fixture-only-password");
+        // A redraw can lag one frame behind the click, and the revealed text
+        // keeps a blinking caret, so a frame-exact pixel comparison is flaky on
+        // slow CI runners. Poll a few frames and tolerate the caret's pixels.
+        const PIXEL_SLACK: usize = 64;
+        let diff_pixels = |a: &[(u8, u8, u8)], b: &[(u8, u8, u8)]| {
+            a.iter().zip(b).filter(|(l, r)| l != r).count()
+        };
+        let wait_for = |want_visible: bool| -> usize {
+            let mut diff = diff_pixels(&masked, &password_pixels(&render()));
+            for _ in 0..40 {
+                if (diff > PIXEL_SLACK) == want_visible {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                diff = diff_pixels(&masked, &password_pixels(&render()));
+            }
+            diff
+        };
         click(680., 598.);
+        let lit = wait_for(true);
         assert!(
-            masked != password_pixels(&render()),
-            "eye must visibly switch from dots to the saved text"
+            lit > PIXEL_SLACK,
+            "eye must visibly switch from dots to the saved text (diff {lit} px)"
         );
         click(680., 598.);
+        let hidden = wait_for(false);
         assert!(
-            masked == password_pixels(&render()),
-            "second click must hide the value again"
+            hidden <= PIXEL_SLACK,
+            "second click must hide the value again (still {hidden} px different)"
         );
         // Type a replacement through the real TextInput, then save and reopen.
         click(400., 598.);
@@ -557,7 +577,18 @@ fn saved_secret_reveal_flows_through_the_real_app_window() {
         assert!(ui.get_dialog_allow_secret_reveal());
         assert_eq!(ui.get_dialog_password(), "fixture-new-password");
         click(680., 598.);
-        assert!(masked_new != password_pixels(&render()));
+        let mut lit_new = 0;
+        for _ in 0..40 {
+            lit_new = diff_pixels(&masked_new, &password_pixels(&render()));
+            if lit_new > PIXEL_SLACK {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(
+            lit_new > PIXEL_SLACK,
+            "reveal after editing must show the new value (diff {lit_new} px)"
+        );
         ui.set_dialog_allow_secret_reveal(false);
         render();
         click(660., 1011.);
