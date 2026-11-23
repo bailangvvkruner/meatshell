@@ -8,6 +8,8 @@
 //! asks for a password — the connection either succeeds with the local SSH
 //! agent / default keys / `none` auth, or it fails.
 
+use super::*;
+
 /// Runtime-only sessions, keyed by session id. Populated by clipboard quick
 /// connect and looked up by the normal connect path before the config store.
 pub(super) type RuntimeSessions = Rc<RefCell<HashMap<String, Session>>>;

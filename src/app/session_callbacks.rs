@@ -1632,6 +1632,7 @@ pub(super) fn wire_session_callbacks(
                 sftp_follow_cd: sftp_follow_cd.clone(),
                 store: store.clone(),
                 tab_routes: tab_routes.clone(),
+                runtime_sessions: runtime_sessions.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
