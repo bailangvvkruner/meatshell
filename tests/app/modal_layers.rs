@@ -190,17 +190,15 @@ fn every_app_modal_cancels_after_keyboard_navigation() {
             for _ in 0..32 {
                 key(&window, Key::Backtab);
             }
-            let command = if cfg!(target_os = "macos") {
-                Key::Meta
-            } else {
-                Key::Control
-            };
+            // Slint maps macOS Command to the logical control modifier, so the
+            // mock window must hold Control on every platform; sending Meta
+            // leaves `event.modifiers.control` false and the modal stays open.
             window.dispatch_event(WindowEvent::KeyPressed {
-                text: command.into(),
+                text: Key::Control.into(),
             });
             key(&window, ".");
             window.dispatch_event(WindowEvent::KeyReleased {
-                text: command.into(),
+                text: Key::Control.into(),
             });
             ui.set_is_mac(false);
             settle(&window);

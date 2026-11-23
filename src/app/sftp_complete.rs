@@ -143,7 +143,13 @@ pub(super) fn split_local_path(text: &str, current: &str) -> PathEdit {
         .strip_prefix("~/")
         .or_else(|| prefix.strip_prefix("~\\"))
     {
-        display_path(&home_dir().join(rest))
+        // `join("")` would keep a trailing separator that the pane's own home
+        // path does not have, so list the home folder by its display form.
+        if rest.is_empty() {
+            home_display()
+        } else {
+            display_path(&home_dir().join(rest))
+        }
     } else if Path::new(prefix).is_absolute() || is_drive(prefix.trim_end_matches(|c| is_sep(c))) {
         prefix.to_string()
     } else if current.is_empty() {

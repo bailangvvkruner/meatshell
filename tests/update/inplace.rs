@@ -92,11 +92,21 @@ fn aur_installs_update_through_the_aur_helper() {
 fn install_script_copy_in_usr_local_updates_with_one_password_prompt() {
     let exe = Path::new(linux::SYSTEM_BINARY);
     let pkexec = linux::Probe { pkexec: true, ..none() };
-    assert_eq!(
-        classify("linux", "x86_64", exe, None, &pkexec),
+    // install-linux.sh's copy is root-owned, but some images (GitHub's Ubuntu
+    // runner chowns /usr/local to the build user) leave the folder writable and
+    // then the tarball path legitimately replaces it in place.
+    let expected = if dir_is_writable(Path::new("/usr/local/bin")) {
+        Method::InPlace(Target::LinuxTarball { exe: exe.into() })
+    } else {
         Method::InPlace(Target::SystemBinary { exe: exe.into() })
-    );
-    assert_eq!(classify("linux", "x86_64", exe, None, &none()), Method::Manual);
+    };
+    assert_eq!(classify("linux", "x86_64", exe, None, &pkexec), expected);
+    let expected = if dir_is_writable(Path::new("/usr/local/bin")) {
+        Method::InPlace(Target::LinuxTarball { exe: exe.into() })
+    } else {
+        Method::Manual
+    };
+    assert_eq!(classify("linux", "x86_64", exe, None, &none()), expected);
     // Some other root-owned folder is not ours to replace.
     assert_eq!(
         classify("linux", "x86_64", Path::new("/opt/meatshell/meatshell"), None, &pkexec),
@@ -220,10 +230,16 @@ fn classifies_appimage_and_package_manager_installs() {
         Method::PackageManager
     );
     // install-linux.sh's root-owned copy is not a package; without pkexec it
-    // needs the release page.
+    // needs the release page. (A writable /usr/local/bin is replaced in place
+    // instead; see install_script_copy_in_usr_local_updates_with_one_password_prompt.)
+    let expected = if dir_is_writable(Path::new("/usr/local/bin")) {
+        Method::InPlace(Target::LinuxTarball { exe: "/usr/local/bin/meatshell".into() })
+    } else {
+        Method::Manual
+    };
     assert_eq!(
         classify("linux", "x86_64", Path::new("/usr/local/bin/meatshell"), None, &none()),
-        Method::Manual
+        expected
     );
     assert_eq!(
         classify("linux", "x86_64", &dir.0.join("meatshell"), None, &flatpak(None)),

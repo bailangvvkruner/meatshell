@@ -117,3 +117,20 @@ D:\rust\temp         # TEMP/TMP 与构建日志
 
 结果：`cargo build`（debug）通过；`cargo test --no-fail-fast` 全绿
 （838 个单测 + 9 个 UI 集成测试 + 其余 UI 测试用例）。
+
+## 9. CI 矩阵修复（2026-11-23）
+
+`sync-check.yml` 在 ubuntu / windows / macos 上跑 `cargo check --locked --all-targets`
++ `cargo test --locked`。首轮：三个平台**编译全部通过**，windows 测试全绿，
+ubuntu 4 个、macos 9 个测试失败——都是上游从未在这两个平台跑过的测试，
+断言直接依赖宿主机路径或权限：
+
+| 测试 | 失败现象 | 修法 |
+| --- | --- | --- |
+| `local_shells::custom_shell_starts_its_program_directly_with_split_args` | unix 上 `host` 得到整个 `C:\msys64\usr\bin\zsh`：`Path::file_stem` 只认宿主分隔符 | `program_stem` 先按 `/` 与 `\` 切出文件名，再取 stem（配置文件跨平台复用） |
+| `sftp_complete::local_unix_paths_split_at_the_last_slash` | `~/Do` 的列表目录多一个尾斜杠（`Path::join("")` 保留分隔符） | `~` 之后为空时用 `home_display()`，与面板自身的 home 文本一致 |
+| `update::inplace::{install_script_copy…, classifies_appimage…}` | GitHub 的 ubuntu runner 把 `/usr/local` chown 给构建用户，`/usr/local/bin` 可写，分类器正确地走了 `LinuxTarball` 而非 `SystemBinary`/`Manual` | 断言按 `dir_is_writable("/usr/local/bin")` 取期望值，不再假设 root 所有 |
+| `modal_layers_tests::every_app_modal_cancels_after_keyboard_navigation`（仅 macos） | Slint 把 macOS Command 映射成逻辑 control 修饰键，测试却在 mac 上发送 `Key::Meta`，模态收不到取消 | 统一发送 `Key::Control`（真实 Cmd 到达时就是该逻辑修饰键） |
+| `single_instance::*`（仅 macos） | `Error { kind: InvalidInput, message: "path must be shorter than SUN_LEN" }`：macOS 临时目录本身就很长，测试又把整个测试名塞进 socket 文件名 | 文件名改为测试名哈希（`ipc-<hash>.sock`），macOS 上约 84 字节 < 104 |
+
+这些都是测试侧（含两处小的显示名/路径文本修正），不改变已发布行为。

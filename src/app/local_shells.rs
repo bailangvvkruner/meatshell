@@ -189,10 +189,14 @@ fn detected_args(key: &str) -> Vec<String> {
 }
 
 fn program_stem(program: &str) -> String {
-    Path::new(program)
+    // Config files travel between platforms, so split on both separators before
+    // dropping the suffix: `Path` only knows the host's separator, which would
+    // return the whole `C:\msys64\usr\bin\zsh` unchanged on unix.
+    let leaf = program.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(program);
+    Path::new(leaf)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.to_string())
+        .unwrap_or_else(|| leaf.to_string())
 }
 
 fn shell_session(id: &str, name: &str, program: String, args: Vec<String>) -> Session {

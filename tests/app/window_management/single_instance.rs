@@ -7,11 +7,18 @@ use std::sync::mpsc;
 /// deterministic. The pre-remove also guards against a stale file from an
 /// earlier run under a reused pid. This is a unix-socket path on unix and a
 /// TCP port-file path on Windows (see `single_instance` module docs).
+///
+/// The filename is a hash of the test name, not the name itself: unix socket
+/// paths are capped at `SUN_LEN` (~104 bytes on macOS) and CI temp dirs alone
+/// are long enough to overflow it with a descriptive name.
 fn temp_socket_path(test_name: &str) -> std::path::PathBuf {
     let n = std::process::id();
     let dir = std::env::temp_dir().join(format!("meatshell-si-{n}"));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("ipc-{test_name}.sock"));
+    let hash = test_name
+        .bytes()
+        .fold(0u32, |acc, byte| acc.wrapping_mul(31).wrapping_add(byte as u32));
+    let path = dir.join(format!("ipc-{hash:08x}.sock"));
     let _ = std::fs::remove_file(&path);
     path
 }
