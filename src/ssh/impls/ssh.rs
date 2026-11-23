@@ -359,7 +359,7 @@ where
 
 async fn open_auxiliary_channel(
     handle: &Arc<tokio::sync::Mutex<Handle<ClientHandler>>>,
-    command: &'static [u8],
+    command: &[u8],
     label: &'static str,
 ) -> Option<Channel<Msg>> {
     let operation = async {
@@ -1821,6 +1821,49 @@ pub fn apply_keepalive(config: &mut client::Config) {
     config.keepalive_max = max;
 }
 
+/// Default seconds between two remote resource-monitor samples.
+pub const MONITOR_INTERVAL_DEFAULT: u32 = 2;
+/// Settings range for the remote sampling interval, in seconds.
+pub const MONITOR_INTERVAL_RANGE: (u32, u32) = (1, 60);
+
+/// Process-wide remote sampling interval (Settings › Sidebars › Resource
+/// monitor). A global rather than a `Session` field because it is a client-wide
+/// preference read when a session opens its monitor channels; `ConfigStore`
+/// pushes it here on load and whenever it changes.
+static REMOTE_MONITOR_INTERVAL: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(MONITOR_INTERVAL_DEFAULT);
+
+/// Set the remote sampling interval used by monitors opened from now on.
+pub fn set_remote_monitor_interval(secs: u32) {
+    let (lo, hi) = MONITOR_INTERVAL_RANGE;
+    REMOTE_MONITOR_INTERVAL.store(secs.clamp(lo, hi), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn remote_monitor_interval_secs() -> u32 {
+    let (lo, hi) = MONITOR_INTERVAL_RANGE;
+    REMOTE_MONITOR_INTERVAL
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .clamp(lo, hi)
+}
+
+/// Remote sidebar sampler: one `/proc` + `df` block per sampling interval.
+///
+/// The interval is baked into the remote shell loop, so changing the setting
+/// affects monitors opened afterwards and never disturbs a running one.
+const MON_CMD_TEMPLATE: &str = "PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __MSTICK__; sleep {INTERVAL}; done\n";
+
+/// Process sampler for the detached process monitor (#23): top-40 by CPU,
+/// columns pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant
+/// command line can't bloat the stream.
+const PROC_CMD_TEMPLATE: &str = "PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do echo __ME__; id -un 2>/dev/null; echo __PS__; ps -eo pid,user:32,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __PSTICK__; sleep {INTERVAL}; done\n";
+
+/// Fill `{INTERVAL}` in a sampler template.
+fn monitor_command(template: &str, interval_secs: u32) -> Vec<u8> {
+    template
+        .replace("{INTERVAL}", &interval_secs.to_string())
+        .into_bytes()
+}
+
 fn ssh_client_config() -> Arc<client::Config> {
     let mut config = client::Config {
         // Match the normal terminal connection exactly, including compatibility
@@ -2766,7 +2809,10 @@ async fn run_session(
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __MSTICK__; sleep 2; done\n";
+    // The interval comes from Settings › Sidebars › Resource monitor; it is
+    // baked into the remote loop, so a running monitor keeps its rate.
+    let monitor_secs = remote_monitor_interval_secs();
+    let mon_cmd = monitor_command(MON_CMD_TEMPLATE, monitor_secs);
     // Detailed system information is intentionally one-shot and last priority.
     // It includes commands such as lspci/hostname that may be slow on some hosts
     // and must never delay either the terminal or the lightweight sidebar sample.
@@ -2785,7 +2831,7 @@ async fn run_session(
     // Process sampling has its own channel. The broader resource command above
     // includes probes such as `df` which can block indefinitely on a stale NFS
     // mount; that must not leave dead PIDs frozen in the process window.
-    const PROC_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do echo __ME__; id -un 2>/dev/null; echo __PS__; ps -eo pid,user:32,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __PSTICK__; sleep 2; done\n";
+    let proc_cmd = monitor_command(PROC_CMD_TEMPLATE, monitor_secs);
     let mut proc_channel: Option<Channel<Msg>> = None;
     let mut sys_channel: Option<Channel<Msg>> = None;
     let mut proc_buf = String::new();
@@ -2901,10 +2947,10 @@ async fn run_session(
                 if let Some(kind) = auxiliary_startup.begin() {
                     let auxiliary_channel = match kind {
                         AuxiliaryChannelKind::Resources if resource_monitoring => {
-                            open_auxiliary_channel(&handle, MON_CMD, "monitor").await
+                            open_auxiliary_channel(&handle, &mon_cmd, "monitor").await
                         }
                         AuxiliaryChannelKind::Processes if resource_monitoring => {
-                            open_auxiliary_channel(&handle, PROC_CMD, "process monitor").await
+                            open_auxiliary_channel(&handle, &proc_cmd, "process monitor").await
                         }
                         AuxiliaryChannelKind::SystemInfo => {
                             open_auxiliary_channel(&handle, SYS_CMD, "system-info").await
@@ -2979,7 +3025,7 @@ async fn run_session(
                         } else {
                             match handle.lock().await.channel_open_session().await {
                                 Ok(monitor) => {
-                                    if monitor.exec(true, MON_CMD).await.is_ok() {
+                                    if monitor.exec(true, &mon_cmd).await.is_ok() {
                                         mon_channel = Some(monitor);
                                     }
                                 }
@@ -2987,7 +3033,7 @@ async fn run_session(
                             }
                             match handle.lock().await.channel_open_session().await {
                                 Ok(processes) => {
-                                    if processes.exec(true, PROC_CMD).await.is_ok() {
+                                    if processes.exec(true, &proc_cmd).await.is_ok() {
                                         proc_channel = Some(processes);
                                     }
                                 }
@@ -5785,5 +5831,31 @@ mod compat_mac_tests {
         handshake_with_server_macs(&[russh::mac::HMAC_SHA1_ETM])
             .await
             .expect("a server offering only hmac-sha1-etm must still be reachable");
+    }
+}
+
+#[cfg(test)]
+mod monitor_interval_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_command_uses_the_configured_interval() {
+        let monitor = String::from_utf8(monitor_command(MON_CMD_TEMPLATE, 7)).unwrap();
+        assert!(monitor.contains("sleep 7; done"), "{monitor}");
+        assert!(!monitor.contains("{INTERVAL}"), "{monitor}");
+        let processes = String::from_utf8(monitor_command(PROC_CMD_TEMPLATE, 5)).unwrap();
+        assert!(processes.contains("sleep 5; done"), "{processes}");
+        assert!(!processes.contains("{INTERVAL}"), "{processes}");
+    }
+
+    #[test]
+    fn remote_interval_is_clamped() {
+        let (lo, hi) = MONITOR_INTERVAL_RANGE;
+        set_remote_monitor_interval(0);
+        assert_eq!(remote_monitor_interval_secs(), lo);
+        set_remote_monitor_interval(9999);
+        assert_eq!(remote_monitor_interval_secs(), hi);
+        set_remote_monitor_interval(MONITOR_INTERVAL_DEFAULT);
+        assert_eq!(remote_monitor_interval_secs(), MONITOR_INTERVAL_DEFAULT);
     }
 }

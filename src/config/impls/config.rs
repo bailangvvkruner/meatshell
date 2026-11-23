@@ -588,6 +588,7 @@ impl ConfigStore {
         };
         drop(load_lock);
         store.apply_ssh_keepalive();
+        store.apply_remote_resource_refresh();
         store.apply_external_editor();
         // Persist the migration so it runs exactly once (and so a later opt-out —
         // e.g. turning the welcome sidebar back off — isn't reverted next launch).
@@ -1447,6 +1448,43 @@ impl ConfigStore {
 
     pub fn set_collapse_sidebar_default(&mut self, v: bool) {
         self.cache.collapse_sidebar_default = v;
+    }
+
+    /// Local resource sampling interval in seconds (Settings › Sidebars ›
+    /// Resource monitor). 0 on disk means "use the default"; the returned value
+    /// is always clamped to the range the settings control offers.
+    pub fn local_resource_refresh_secs(&self) -> u32 {
+        match self.cache.local_resource_refresh_secs {
+            0 => 1,
+            v => v.clamp(1, 30),
+        }
+    }
+
+    pub fn set_local_resource_refresh_secs(&mut self, seconds: u32) {
+        self.cache.local_resource_refresh_secs = seconds.clamp(1, 30);
+    }
+
+    /// Remote (over SSH) resource sampling interval in seconds. Applies to the
+    /// monitors of sessions opened from now on; a running monitor keeps the
+    /// interval it was started with.
+    pub fn remote_resource_refresh_secs(&self) -> u32 {
+        let (lo, hi) = crate::ssh::MONITOR_INTERVAL_RANGE;
+        match self.cache.remote_resource_refresh_secs {
+            0 => crate::ssh::MONITOR_INTERVAL_DEFAULT,
+            v => v.clamp(lo, hi),
+        }
+    }
+
+    pub fn set_remote_resource_refresh_secs(&mut self, seconds: u32) {
+        let (lo, hi) = crate::ssh::MONITOR_INTERVAL_RANGE;
+        self.cache.remote_resource_refresh_secs = seconds.clamp(lo, hi);
+        self.apply_remote_resource_refresh();
+    }
+
+    /// Push the saved interval into the SSH layer. Called on load so the GUI,
+    /// `meatshell mcp serve` and automation all sample at the saved rate.
+    pub fn apply_remote_resource_refresh(&self) {
+        crate::ssh::set_remote_monitor_interval(self.remote_resource_refresh_secs());
     }
 
     /// Persisted sidebar width in logical px. Falls back to the default when the
@@ -3239,6 +3277,31 @@ mod tests {
 
         // The setter also updates the process-wide SSH setting; put it back.
         store.set_ssh_keepalive(true, 30, 3);
+    }
+
+    #[test]
+    fn resource_refresh_intervals_default_and_clamp() {
+        let mut store = temp_store();
+        store.cache = serde_json::from_str("{}").unwrap();
+        // Unset (0 on disk) falls back to the product defaults.
+        assert_eq!(store.local_resource_refresh_secs(), 1);
+        assert_eq!(store.remote_resource_refresh_secs(), 2);
+
+        store.set_local_resource_refresh_secs(0);
+        assert_eq!(store.local_resource_refresh_secs(), 1);
+        store.set_local_resource_refresh_secs(600);
+        assert_eq!(store.local_resource_refresh_secs(), 30);
+        store.set_local_resource_refresh_secs(5);
+        assert_eq!(store.local_resource_refresh_secs(), 5);
+
+        store.set_remote_resource_refresh_secs(0);
+        assert_eq!(store.remote_resource_refresh_secs(), 1);
+        store.set_remote_resource_refresh_secs(9_999);
+        assert_eq!(store.remote_resource_refresh_secs(), 60);
+
+        // The setter pushes the interval into the SSH layer; restore it.
+        store.set_remote_resource_refresh_secs(2);
+        assert_eq!(store.remote_resource_refresh_secs(), 2);
     }
 
     #[test]

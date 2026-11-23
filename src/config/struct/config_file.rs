@@ -269,6 +269,13 @@ pub struct ConfigFile {
     /// `collapse_sidebar_default` for older configs.
     #[serde(default)]
     pub sidebar_collapsed: Option<bool>,
+    /// Local resource sampling interval in seconds. 0 = default (1 second).
+    #[serde(default)]
+    pub local_resource_refresh_secs: u32,
+    /// Remote (over SSH) resource sampling interval in seconds. 0 = default
+    /// (2 seconds).
+    #[serde(default)]
+    pub remote_resource_refresh_secs: u32,
     /// User-adjustable width of the left resource sidebar, in logical pixels.
     /// Persisted across restarts so the drag-resized width sticks.
     #[serde(default = "default_sidebar_width")]

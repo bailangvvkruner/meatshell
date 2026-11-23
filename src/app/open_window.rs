@@ -797,6 +797,13 @@ pub(super) fn open_window(
     let tick_net = local_net_hist.clone();
     let tick_activity = activity.clone();
     let mut bg_tick = 0u32;
+    // Sampling rate is a user setting (Settings › Sidebars › Resource monitor):
+    // the timer keeps ticking at ~1 Hz so a change takes effect immediately,
+    // but the (non-trivial) sysinfo refresh is skipped until the configured
+    // interval has elapsed. 100 ms of slack keeps a 1 s setting at 1 Hz despite
+    // timer jitter.
+    let tick_store = ctx.store.clone();
+    let mut last_sample: Option<std::time::Instant> = None;
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
@@ -804,6 +811,15 @@ pub(super) fn open_window(
         move || {
             let Some(window) = weak.upgrade() else { return };
             if window.get_sidebar_collapsed() || window.get_zen_mode() {
+                return;
+            }
+            let interval = std::time::Duration::from_secs(
+                tick_store.borrow().local_resource_refresh_secs() as u64,
+            );
+            let now = std::time::Instant::now();
+            if last_sample
+                .is_some_and(|at| now.duration_since(at) + std::time::Duration::from_millis(100) < interval)
+            {
                 return;
             }
             // Skip the (non-trivial) sysinfo refresh + sidebar repaint when no one
@@ -822,6 +838,7 @@ pub(super) fn open_window(
                 let mut s = tick_sampler.lock().expect("sampler poisoned");
                 s.sample()
             };
+            last_sample = Some(now);
             // Append the raw local throughput to the bottom-graph ring buffer
             // (normalisation happens at display time so the graph auto-scales).
             push_ring(&mut tick_net.lock().unwrap(), snap.net_bytes_per_sec as f32);

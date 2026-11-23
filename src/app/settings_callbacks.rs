@@ -367,6 +367,40 @@ pub(super) fn wire_session_log_settings(ctx: &WinCtx) {
             registry.broadcast_config_changed();
         });
     }
+    // Resource-monitor sampling rate (Settings › Sidebars). The remote value is
+    // pushed into the SSH layer by the store, so sessions opened from now on
+    // sample at that rate; a running monitor keeps the interval it started with.
+    window.set_local_resource_refresh_secs(store.borrow().local_resource_refresh_secs() as i32);
+    window.set_remote_resource_refresh_secs(store.borrow().remote_resource_refresh_secs() as i32);
+    {
+        let store = store.clone();
+        let weak = window.as_weak();
+        let registry = ctx.registry.clone();
+        window.on_set_local_resource_refresh_secs(move |secs| {
+            let mut s = store.borrow_mut();
+            s.set_local_resource_refresh_secs(secs.max(0) as u32);
+            let _ = s.save();
+            // Show the clamped value the store kept.
+            if let Some(w) = weak.upgrade() {
+                w.set_local_resource_refresh_secs(s.local_resource_refresh_secs() as i32);
+            }
+            registry.broadcast_config_changed();
+        });
+    }
+    {
+        let store = store.clone();
+        let weak = window.as_weak();
+        let registry = ctx.registry.clone();
+        window.on_set_remote_resource_refresh_secs(move |secs| {
+            let mut s = store.borrow_mut();
+            s.set_remote_resource_refresh_secs(secs.max(0) as u32);
+            let _ = s.save();
+            if let Some(w) = weak.upgrade() {
+                w.set_remote_resource_refresh_secs(s.remote_resource_refresh_secs() as i32);
+            }
+            registry.broadcast_config_changed();
+        });
+    }
     {
         let store = store.clone();
         let handles = handles.clone();

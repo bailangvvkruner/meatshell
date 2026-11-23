@@ -800,6 +800,9 @@ export component InterfacePanel inherits Rectangle {
     in-out property <bool> ssh-keepalive-enabled: true;
     in-out property <int> ssh-keepalive-interval: 30;
     in-out property <int> ssh-keepalive-max: 3;
+    // Resource-monitor sampling rate (Settings › Sidebars).
+    in-out property <int> local-resource-refresh-secs: 1;
+    in-out property <int> remote-resource-refresh-secs: 2;
     in-out property <bool> zen-mode: false;
     in-out property <bool> welcome-as-sidebar;
     in-out property <bool> quick-commands-as-sidebar;
@@ -934,6 +937,8 @@ export component InterfacePanel inherits Rectangle {
     callback set-right-click-copy(bool);
     callback set-extra-paste-shortcuts-enabled(bool);
     callback set-ssh-keepalive(bool /* enabled */, int /* interval s */, int /* max missed */);
+    callback set-local-resource-refresh-secs(int);
+    callback set-remote-resource-refresh-secs(int);
     callback set-zen-mode(bool);
     callback set-welcome-as-sidebar(bool);
     callback set-quick-commands-as-sidebar(bool);
@@ -2630,6 +2635,35 @@ export component InterfacePanel inherits Rectangle {
                         toggled(v) => {
                             root.quick-commands-as-sidebar = v;
                             root.set-quick-commands-as-sidebar(v);
+                        }
+                    }
+                }
+                Rectangle { height: 6px; }
+                SectionHeader { text: root.lang-en ? "RESOURCE MONITOR" : "资源监控"; height: 24px; }
+                SettingRow {
+                    label: root.lang-en ? "Local refresh interval" : "本地刷新间隔";
+                    desc: root.lang-en
+                        ? "How often the sidebar samples this machine's CPU, memory, disk and network."
+                        : "侧栏采样本机 CPU、内存、磁盘与网络的频率。";
+                    Stepper {
+                        value: root.local-resource-refresh-secs; minimum: 1; maximum: 30; step: 1; unit: "s";
+                        changed(v) => {
+                            root.local-resource-refresh-secs = v;
+                            root.set-local-resource-refresh-secs(v);
+                        }
+                    }
+                }
+                SettingRow {
+                    label: root.lang-en ? "Remote refresh interval" : "远程刷新间隔";
+                    desc: root.lang-en
+                        ? "How often a connected server's resources are sampled over SSH. Higher values cut both local CPU and remote load; applies to new connections."
+                        : "通过 SSH 采样已连接服务器资源的频率。调高可同时降低本机 CPU 占用与远端负载;对新建连接生效。";
+                    show-divider: false;
+                    Stepper {
+                        value: root.remote-resource-refresh-secs; minimum: 1; maximum: 60; step: 1; unit: "s";
+                        changed(v) => {
+                            root.remote-resource-refresh-secs = v;
+                            root.set-remote-resource-refresh-secs(v);
                         }
                     }
                 }

@@ -870,6 +870,11 @@ export component AppWindow inherits Window {
     in-out property <int> ssh-keepalive-interval: 30;
     in-out property <int> ssh-keepalive-max: 3;
     callback set-ssh-keepalive(bool, int, int);
+    // Resource-monitor sampling rate (Settings › Sidebars).
+    in-out property <int> local-resource-refresh-secs: 1;
+    in-out property <int> remote-resource-refresh-secs: 2;
+    callback set-local-resource-refresh-secs(int);
+    callback set-remote-resource-refresh-secs(int);
     in-out property <bool> zen-mode: false;
     callback set-zen-mode(bool);
     // Zen empties/restores the whole dock stack without resizing the frame, so
@@ -5570,6 +5575,8 @@ export component AppWindow inherits Window {
                     ssh-keepalive-enabled <=> root.ssh-keepalive-enabled;
                     ssh-keepalive-interval <=> root.ssh-keepalive-interval;
                     ssh-keepalive-max <=> root.ssh-keepalive-max;
+                    local-resource-refresh-secs <=> root.local-resource-refresh-secs;
+                    remote-resource-refresh-secs <=> root.remote-resource-refresh-secs;
                     zen-mode <=> root.zen-mode;
                     welcome-as-sidebar <=> root.welcome-as-sidebar;
                     quick-commands-as-sidebar <=> root.quick-commands-as-sidebar;
@@ -5691,6 +5698,8 @@ export component AppWindow inherits Window {
                     set-right-click-copy(v) => { root.set-right-click-copy(v); }
                     set-extra-paste-shortcuts-enabled(v) => { root.set-extra-paste-shortcuts-enabled(v); }
                     set-ssh-keepalive(on, interval, max) => { root.set-ssh-keepalive(on, interval, max); }
+                    set-local-resource-refresh-secs(v) => { root.set-local-resource-refresh-secs(v); }
+                    set-remote-resource-refresh-secs(v) => { root.set-remote-resource-refresh-secs(v); }
                     set-zen-mode(v) => { root.set-zen-mode(v); }
                     set-welcome-as-sidebar(v) => { root.set-welcome-as-sidebar(v); }
                     set-quick-commands-as-sidebar(v) => {
