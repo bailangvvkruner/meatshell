@@ -370,7 +370,7 @@ async fn open_auxiliary_channel(
             .await
             .with_context(|| format!("{label} channel open"))?;
         channel
-            .exec(true, command)
+            .exec(true, command.to_vec())
             .await
             .with_context(|| format!("{label} exec"))?;
         Ok::<Channel<Msg>, anyhow::Error>(channel)
@@ -3025,7 +3025,7 @@ async fn run_session(
                         } else {
                             match handle.lock().await.channel_open_session().await {
                                 Ok(monitor) => {
-                                    if monitor.exec(true, &mon_cmd).await.is_ok() {
+                                    if monitor.exec(true, mon_cmd.clone()).await.is_ok() {
                                         mon_channel = Some(monitor);
                                     }
                                 }
@@ -3033,7 +3033,7 @@ async fn run_session(
                             }
                             match handle.lock().await.channel_open_session().await {
                                 Ok(processes) => {
-                                    if processes.exec(true, &proc_cmd).await.is_ok() {
+                                    if processes.exec(true, proc_cmd.clone()).await.is_ok() {
                                         proc_channel = Some(processes);
                                     }
                                 }

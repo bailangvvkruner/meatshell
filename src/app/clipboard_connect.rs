@@ -167,7 +167,6 @@ pub(super) fn wire_clipboard_connect(window: &AppWindow, runtime_sessions: Runti
             let id = session.id.clone();
             runtime_sessions.borrow_mut().insert(id.clone(), session);
             win.invoke_connect_session(id.into());
-            win.set_terminal_focus_sequence(win.get_terminal_focus_sequence() + 1);
         });
     }
     {
@@ -175,7 +174,6 @@ pub(super) fn wire_clipboard_connect(window: &AppWindow, runtime_sessions: Runti
         window.on_clipboard_connect_cancelled(move || {
             if let Some(win) = weak.upgrade() {
                 win.set_clipboard_connect_open(false);
-                win.set_terminal_focus_sequence(win.get_terminal_focus_sequence() + 1);
             }
         });
     }
