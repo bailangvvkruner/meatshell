@@ -151,3 +151,7 @@ ubuntu 4 个、macos 9 个测试失败——都是上游从未在这两个平台
 
 分支上的验证则用本机 GNU 工具链做 `cargo build --release`（产物同样可运行，只是 CRT 为
 msvcrt、非 MSVC 链接）。
+
+已知不稳定：`modal_layers_tests::saved_secret_reveal_flows_through_the_real_app_window`
+在 MSVC runner 上偶发（“second click must hide the value again”），本机 GNU 连跑 10 次全过，
+同一次 commit 重跑即绿——像素/焦点时序敏感，与分支功能无关。
