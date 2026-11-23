@@ -142,7 +142,12 @@ ubuntu 4 个、macos 9 个测试失败——都是上游从未在这两个平台
 `sync-check.yml` 的矩阵收窄为 `windows-latest`（只跑 `cargo check --all-targets`
 + `cargo test`）；需要时把 os 条目加回矩阵即可。
 
-另新增 `.github/workflows/windows-release.yml`（仅 `workflow_dispatch`）：
-在任意分支（包括 `sync/**`）手动构建 `x86_64-pc-windows-msvc` 发行版，
-产物布局与 `release.yml` 的 Windows job 一致（`meatshell-v<ver>-windows-x86_64.zip`
-+ 尽力而为的 MSI），不创建 GitHub Release、不动 `main`。
+另：`workflow_dispatch` 只认**默认分支**上的 workflow 文件，所以 Windows 专用
+发布工作流不能只放在 `sync/**` 分支上（GitHub 的 Actions 列表里根本看不到它）；
+本分支已加入的 `windows-release.yml` 因此被撤销。要拿到 MSVC 发行版，仍是两条路：
+
+- 把 `sync/**` 合入 `main` 后 push：`release.yml` 的 `nightly-windows` job（zip + 尽力而为的 MSI）自动跑；
+- 打 `v*` tag：`release.yml` 全平台构建并附带 GitHub Release。
+
+分支上的验证则用本机 GNU 工具链做 `cargo build --release`（产物同样可运行，只是 CRT 为
+msvcrt、非 MSVC 链接）。
