@@ -27,6 +27,8 @@ pub(super) struct WinCtx {
     pub(super) window_id: u64,
     pub(super) pending_window_size_restore: Rc<Cell<Option<(f32, f32)>>>,
     pub(super) window_size_tracking_ready: Rc<Cell<bool>>,
+    /// Opt-in loopback debug/AI API (#debug-api); window-scoped.
+    pub(super) debug_api: Rc<RefCell<DebugApiController>>,
 }
 
 /// Build and wire one application window. Called for the first window by
@@ -130,6 +132,96 @@ pub(super) fn open_window(
     editor_win.set_custom_titlebar(cfg!(not(target_os = "macos")));
     editor_win.set_is_mac(cfg!(target_os = "macos"));
     sync_editor_theme(&window, &editor_win);
+    // --- Opt-in loopback debug/AI API (#debug-api) ---------------------------
+    // Window-scoped: reads rendered text from this window's parsers and injects
+    // input only into this window's sessions, so a second window is never
+    // reachable through the first one's token.
+    let debug_api_state = {
+        let screen_bufs = bufs.clone();
+        let size_grid = last_term_size.clone();
+        DebugApiState::new(move |tab_id, max_lines| {
+            let handle = term_buf(&screen_bufs, tab_id)?;
+            let mut buffer = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = buffer.render(); // also refreshes displayed_text
+            let screen = buffer.parser.screen();
+            let (rows, cols) = screen.size();
+            let (ui_cols, ui_rows) = *size_grid.lock().unwrap_or_else(|p| p.into_inner());
+            Some(TerminalScreenSnapshot {
+                lines: debug_screen_lines(&buffer.displayed_text, max_lines),
+                rows,
+                cols,
+                ui_rows,
+                ui_cols,
+                requested_pty_rows: ui_rows,
+                requested_pty_cols: ui_cols,
+                cell_width_logical_px: 0.0,
+                cell_height_logical_px: 0.0,
+                alternate_screen: screen.alternate_screen(),
+                synchronized_output: false,
+                legacy_btop_compat: false,
+                sanitized_btop_control_bytes: 0,
+                parse_errors: screen.errors(),
+            })
+        })
+    };
+    {
+        let pointer_bufs = bufs.clone();
+        debug_api_state.set_pointer_encoder(move |tab_id, event: DebugPointerEvent| {
+            let handle = term_buf(&pointer_bufs, tab_id)?;
+            let buffer = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let screen = buffer.parser.screen();
+            // Injection is impossible while the app has mouse tracking off; a
+            // silently dropped press would otherwise land in the shell prompt.
+            if screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None {
+                return None;
+            }
+            let encoding = screen.mouse_protocol_encoding();
+            let (rows, cols) = screen.size();
+            let (button, release) = match event.kind {
+                DebugPointerEventKind::Press => match event.button {
+                    3 => (64, false), // wheel up
+                    4 => (65, false), // wheel down
+                    other => (other as u8, false),
+                },
+                DebugPointerEventKind::Release => (event.button as u8, true),
+                DebugPointerEventKind::Motion => (32 + event.button as u8, false),
+            };
+            Some(encode_mouse_event(
+                button, release, event.col, event.row, cols, rows, encoding,
+            ))
+        });
+    }
+    debug_api_state.set_runtime_diagnostics_reader(|| RuntimeDiagnostics {
+        renderer: active_renderer_name().to_string(),
+        hardware_accelerated: active_renderer_uses_gpu(),
+        terminal_render_interval_ms: 0,
+        memory_trim: Default::default(),
+    });
+    // Renderer readback must happen on Slint's event loop; PNG encoding and
+    // scaling continue off-thread in the HTTP service.
+    {
+        let weak = window.as_weak();
+        debug_api_state.set_screenshot_requester(move |reply| {
+            weak.upgrade_in_event_loop(move |win| {
+                let frame = win
+                    .window()
+                    .take_snapshot()
+                    .map(|pixels| ScreenshotFrame { pixels })
+                    .map_err(|error| error.to_string());
+                let _ = reply.send(frame);
+            })
+            .map_err(|error| error.to_string())
+        });
+    }
+    let debug_api = Rc::new(RefCell::new(DebugApiController::new(
+        runtime.handle().clone(),
+        debug_api_state.clone(),
+    )));
+
     // Every fallible construction has now succeeded — register the window.
     // (cascade_origin above was captured before this point, as required.)
     let window_id = registry.register(window.as_weak());
@@ -147,6 +239,7 @@ pub(super) fn open_window(
         window_id,
         pending_window_size_restore: pending_window_size_restore.clone(),
         window_size_tracking_ready: window_size_tracking_ready.clone(),
+        debug_api: debug_api.clone(),
     };
     sys_win.set_custom_titlebar(cfg!(not(target_os = "macos")));
     sys_win.set_is_mac(cfg!(target_os = "macos"));
@@ -172,6 +265,7 @@ pub(super) fn open_window(
         store.borrow().sftp_follow_cd(),
     ));
     wire_interface_toggles(&ctx, &sftp_follow_cd);
+    wire_debug_api(&ctx);
     super::shortcuts::wire_shortcuts(&ctx);
     wire_session_log_settings(&ctx);
 
@@ -517,6 +611,7 @@ pub(super) fn open_window(
             local_snap: local_snap.clone(),
             net_hist: local_net_hist.clone(),
             follow_cd: sftp_follow_cd.clone(),
+            debug_api: debug_api.borrow().state(),
             layout: layout.clone(),
             dock_stacks: dock_stacks.clone(),
             tabs_model: tabs_model.clone(),
@@ -766,6 +861,7 @@ pub(super) fn open_window(
             store: store.clone(),
             runtime_sessions: runtime_sessions.clone(),
             tab_routes: core.tab_routes.clone(),
+            debug_api: debug_api.borrow().state(),
         },
     );
 

@@ -105,6 +105,7 @@ pub(super) fn wire_session_callbacks(
     tab_routes: TabRoutes,
     tab_titles: Rc<RefCell<HashMap<String, String>>>,
     editor_win: Rc<EditorWindow>,
+    debug_api: Rc<RefCell<DebugApiController>>,
 ) {
     window.global::<crate::ui::JumpSearch>().on_matches(|label, query| {
         super::jump_picker::matches(label.as_str(), query.as_str())
@@ -1276,6 +1277,7 @@ pub(super) fn wire_session_callbacks(
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
         let tab_routes = tab_routes.clone();
+        let debug_api = debug_api.clone();
         let repeat_guard = RefCell::new(DoubleClickGuard::default());
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
@@ -1366,6 +1368,18 @@ pub(super) fn wire_session_callbacks(
                 // early return above); this label only exists for completeness.
                 SessionKind::Rdp => format!("rdp {}:{}", session.host, session.port),
             };
+            // Opt-in Debug API: publish the tab as soon as it exists so a
+            // client sees "connecting" instead of a missing terminal.
+            debug_api.borrow().state().upsert_terminal(TerminalMetadata::new(
+                tab_id.clone(),
+                if tab_title.trim().is_empty() {
+                    conn_label.clone()
+                } else {
+                    tab_title.clone()
+                },
+                conn_label.clone(),
+                "connecting",
+            ));
             // Compatibility mode also suppresses the SFTP side-channel so
             // bastions that only permit one proxied PTY connection stay alive.
             let has_sftp = should_start_sftp(&session);
@@ -1633,6 +1647,7 @@ pub(super) fn wire_session_callbacks(
                 store: store.clone(),
                 tab_routes: tab_routes.clone(),
                 runtime_sessions: runtime_sessions.clone(),
+                debug_api: debug_api.borrow().state(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });

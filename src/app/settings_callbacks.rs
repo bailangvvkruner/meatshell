@@ -999,3 +999,66 @@ pub(super) fn wire_ui_scale_and_wallpaper(ctx: &WinCtx) {
         });
     }
 }
+
+/// Settings › MCP: opt-in, loopback-only debug/AI API (#debug-api).
+///
+/// The bearer token is generated on first run and persisted encrypted like a
+/// password, so switching the API on is a single click and the token survives
+/// restarts (an AI client keeps working without re-reading the settings).
+pub(super) fn wire_debug_api(ctx: &WinCtx) {
+    let window = ctx.window.clone();
+    let store = ctx.store.clone();
+    let controller = ctx.debug_api.clone();
+
+    let enabled = store.borrow().debug_api_enabled();
+    let mut token = store.borrow().debug_api_token().to_string();
+    if token.is_empty() {
+        token = crate::debug_api::generate_token();
+        let mut settings = store.borrow_mut();
+        settings.set_debug_api_token(token.clone());
+        if let Err(error) = settings.save() {
+            tracing::warn!("failed to persist the Debug API token: {error:#}");
+        }
+    }
+    window.set_debug_api_token(token.as_str().into());
+    window.set_debug_api_enabled(enabled);
+    configure_debug_api(&window, &controller, enabled, &token);
+
+    {
+        let w = window.clone();
+        let store = store.clone();
+        let controller = controller.clone();
+        window.on_set_debug_api_enabled(move |enabled| {
+            w.set_debug_api_enabled(enabled);
+            {
+                let mut settings = store.borrow_mut();
+                settings.set_debug_api_enabled(enabled);
+                if let Err(error) = settings.save() {
+                    tracing::warn!("failed to persist the Debug API switch: {error:#}");
+                }
+            }
+            let token = store.borrow().debug_api_token().to_string();
+            configure_debug_api(&w, &controller, enabled, &token);
+        });
+    }
+
+    {
+        let w = window.clone();
+        let store = store.clone();
+        let controller = controller.clone();
+        window.on_regenerate_debug_api_token(move || {
+            let token = crate::debug_api::generate_token();
+            let enabled = {
+                let mut settings = store.borrow_mut();
+                settings.set_debug_api_token(token.clone());
+                if let Err(error) = settings.save() {
+                    tracing::warn!("failed to persist the Debug API token: {error:#}");
+                }
+                settings.debug_api_enabled()
+            };
+            w.set_debug_api_token(token.as_str().into());
+            // Restart the listener so the previous token stops working at once.
+            configure_debug_api(&w, &controller, enabled, &token);
+        });
+    }
+}

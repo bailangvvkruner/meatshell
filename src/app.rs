@@ -122,6 +122,10 @@ use crate::config::{
     is_reserved_session_group, named_display_groups, AuthMethod, ConfigStore, OutputHighlightRule,
     Secret, Session, SessionKind, SessionLogMode,
 };
+use crate::debug_api::{
+    DebugApiController, DebugApiState, DebugPointerEvent, DebugPointerEventKind, RuntimeDiagnostics,
+    ScreenshotFrame, TerminalMetadata, TerminalScreenSnapshot, DEFAULT_PORT as DEBUG_API_PORT,
+};
 use crate::i18n::t;
 use crate::layout::{LogicalRect, TerminalWheelHit};
 use crate::resource::system::{format_bytes_per_sec, format_mem};
@@ -154,6 +158,47 @@ use crate::terminal::{
 use crate::terminal::{windows_process_ctrl_release, CtrlKeySide};
 use crate::ui::*;
 use crate::webdav::WebDavAcceptAnyCertVerifier;
+
+/// Newest `max_lines` lines of a rendered screen, trailing blank rows dropped.
+fn debug_screen_lines(displayed_text: &[String], max_lines: usize) -> Vec<String> {
+    let end = displayed_text
+        .iter()
+        .rposition(|line| !line.is_empty())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let start = end.saturating_sub(max_lines);
+    displayed_text[start..end].to_vec()
+}
+
+/// Apply the saved Debug API settings to the running window: start listening,
+/// stop, or report why it could not bind.
+fn configure_debug_api(
+    window: &AppWindow,
+    controller: &Rc<RefCell<DebugApiController>>,
+    enabled: bool,
+    token: &str,
+) {
+    window.set_debug_api_address(format!("http://127.0.0.1:{DEBUG_API_PORT}").into());
+    if !enabled {
+        controller.borrow_mut().stop();
+        window.set_debug_api_status(t("已禁用", "Disabled").into());
+        return;
+    }
+
+    match controller.borrow_mut().start(DEBUG_API_PORT, token) {
+        Ok(address) => {
+            let url = format!("http://{address}");
+            window.set_debug_api_address(url.clone().into());
+            window.set_debug_api_status(format!("{}: {url}", t("监听中", "Listening")).into());
+        }
+        Err(error) => {
+            tracing::warn!("failed to start Debug API: {error:#}");
+            window.set_debug_api_status(
+                format!("{}: {error:#}", t("启动失败", "Failed to start")).into(),
+            );
+        }
+    }
+}
 
 fn tab_title_len(title: &str) -> i32 {
     title

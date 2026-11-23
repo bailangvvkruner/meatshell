@@ -40,6 +40,9 @@ pub struct TabRoute {
     pub sftp_handles: SftpHandles,
     pub sftp_last_cwd: SftpLastCwd,
     pub follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    /// Debug/AI API state of the window this tab currently delivers to, so
+    /// input bridges follow a detached tab to its new window (#debug-api).
+    pub debug_api: crate::debug_api::DebugApiState,
 }
 
 /// Tab id → its current delivery route. Shared with the pump threads.
@@ -62,6 +65,9 @@ pub struct WindowState {
     pub local_snap: LocalSnap,
     pub net_hist: NetHist,
     pub follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    /// Debug/AI API state of this window (#debug-api); a tab transferred in
+    /// re-points its input bridge here.
+    pub debug_api: crate::debug_api::DebugApiState,
     pub layout: Rc<RefCell<crate::layout::Layout>>,
     /// Per-edge stacks of simultaneously-expanded docked panels (#dock-stack).
     pub dock_stacks: Rc<RefCell<DockStacks>>,

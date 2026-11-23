@@ -27,6 +27,22 @@ pub(super) fn should_start_sftp(session: &Session) -> bool {
 /// already-registered tab. Used by the initial connect and by in-place
 /// reconnect (#79); the tab/terminal/parser must already exist.
 pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
+    // Publish the tab to the Debug/AI API before the transport starts, so a
+    // client sees "connecting" and never a missing terminal (#debug-api).
+    let host_label = match session.kind {
+        SessionKind::Local => format!("local {}", session.name),
+        SessionKind::Telnet => format!("telnet {}:{}", session.host, session.port),
+        SessionKind::Serial => format!("{} @{}", session.serial_port, session.baud_rate),
+        _ => format!("{}@{}", session.user, session.host),
+    };
+    let title = if session.name.trim().is_empty() {
+        host_label.clone()
+    } else {
+        session.name.clone()
+    };
+    ctx.debug_api
+        .upsert_terminal(TerminalMetadata::new(tab_id, title, host_label, "connecting"));
+
     let has_sftp = should_start_sftp(&session);
     let (initial_cols, initial_rows) = *ctx.last_term_size.lock().unwrap();
     // Resolve every ancestor on the UI thread before starting any worker.
@@ -82,6 +98,12 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
         }
     };
     let terminal_reply_tx = handle.commands.clone();
+    // Debug/AI API input bridge (#debug-api). The queue is published only after
+    // the transport reports Connected, so a request that arrives during
+    // authentication (or a host-key/MFA prompt) cannot be replayed as shell
+    // input later. The generation identifies this session instance.
+    let debug_input_sender = handle.commands.clone();
+    let debug_input_generation = ctx.debug_api.begin_input_session(tab_id.to_string());
     let monitoring_enabled = ctx
         .weak
         .upgrade()
@@ -105,6 +127,7 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
         sftp_handles: ctx.sftp_handles.clone(),
         sftp_last_cwd: ctx.sftp_last_cwd.clone(),
         follow_cd: ctx.sftp_follow_cd.clone(),
+        debug_api: ctx.debug_api.clone(),
     }));
     if let Ok(mut routes) = ctx.tab_routes.lock() {
         routes.insert(tab_id.to_string(), route.clone());
@@ -155,6 +178,7 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut sftp_ready_tx = sftp_ready_tx;
+            let mut debug_input_generation = debug_input_generation;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
             // Reusable scratch so a fast firehose doesn't reallocate every batch.
             let mut drained: Vec<SessionEvent> = Vec::new();
@@ -192,6 +216,10 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                 // in the unbounded channel. Handle it before ingesting anything
                 // from this batch.
                 if let Some(closed) = take_closed_event(&mut drained) {
+                    if let Some(generation) = debug_input_generation.take() {
+                        rt.debug_api
+                            .disconnect_input_session(&tab_id_pump, generation);
+                    }
                     let rt_evt = rt.clone();
                     let tid = tab_id_pump.clone();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -224,6 +252,13 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                         SessionEvent::Connected => {
                             if let Some(ready) = sftp_ready_tx.take() {
                                 let _ = ready.send(());
+                            }
+                            if let Some(generation) = debug_input_generation {
+                                rt.debug_api.connect_input_sender(
+                                    &tab_id_pump,
+                                    generation,
+                                    debug_input_sender.clone(),
+                                );
                             }
                             ui_batch.push(SessionEvent::Connected);
                         }

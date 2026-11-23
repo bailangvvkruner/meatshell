@@ -837,6 +837,13 @@ export component InterfacePanel inherits Rectangle {
     in property <string> mcp-config-json;
     callback copy-text(string);
     property <bool> mcp-json-copied: false;
+    // Opt-in loopback debug/AI API (#debug-api).
+    in-out property <bool> debug-api-enabled: false;
+    in-out property <string> debug-api-address;
+    in-out property <string> debug-api-token;
+    in property <string> debug-api-status;
+    callback set-debug-api-enabled(bool);
+    callback regenerate-debug-api-token();
     in-out property <float> wallpaper-overlay;   // frosted-panel opacity 0.30-1.00
     // Active wallpaper id: "" / "builtin:light" / "builtin:dark" / a file path.
     in property <string> current-wallpaper;
@@ -2984,6 +2991,79 @@ export component InterfacePanel inherits Rectangle {
                         running: root.mcp-json-copied;
                         triggered => { root.mcp-json-copied = false; }
                     }
+                }
+                Rectangle { height: 18px; }
+                SectionHeader { text: root.lang-en ? "DEBUG / AI API" : "调试 / AI API"; height: 24px; }
+                SettingRow {
+                    label: root.lang-en ? "Enable local HTTP API" : "启用本地 HTTP API";
+                    desc: root.lang-en
+                        ? "Loopback only (127.0.0.1). Lets scripts and AI agents read terminal text, send input, click and take screenshots. Requires the bearer token below."
+                        : "仅监听 127.0.0.1。允许脚本与 AI 代理读取终端文本、输入、点击与截图，请求需携带下方令牌。";
+                    Switch {
+                        on: root.debug-api-enabled;
+                        toggled(v) => {
+                            root.debug-api-enabled = v;
+                            root.set-debug-api-enabled(v);
+                        }
+                    }
+                }
+                Text {
+                    text: root.debug-api-status;
+                    color: Theme.text-muted;
+                    font-size: 11px * Theme.panel-font;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 8px; }
+                Text {
+                    text: root.debug-api-address;
+                    color: Theme.text-secondary;
+                    font-family: Theme.term-font-family;
+                    font-size: 11px * Theme.panel-font;
+                    wrap: char-wrap;
+                }
+                Rectangle { height: 6px; }
+                // Bearer token, with copy / regenerate actions beside it.
+                Rectangle {
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                    background: Theme.bg-elevated;
+                    height: 40px;
+                    api-token-text := Text {
+                        x: 12px;
+                        y: 12px;
+                        width: parent.width - 12px - 200px;
+                        text: root.debug-api-token;
+                        color: Theme.text-primary;
+                        font-family: Theme.term-font-family;
+                        font-size: 12px * Theme.panel-font;
+                        wrap: no-wrap;
+                        overflow: elide;
+                        vertical-alignment: center;
+                        height: 16px;
+                    }
+                    HorizontalLayout {
+                        x: parent.width - self.width - 10px;
+                        y: 7px;
+                        spacing: 6px;
+                        GhostButton {
+                            text: root.lang-en ? "Copy" : "复制";
+                            clicked => { root.copy-text(root.debug-api-token); }
+                        }
+                        GhostButton {
+                            text: root.lang-en ? "Regenerate" : "重新生成";
+                            clicked => { root.regenerate-debug-api-token(); }
+                        }
+                    }
+                }
+                Rectangle { height: 8px; }
+                Text {
+                    text: root.lang-en
+                        ? "Send the token as an Authorization: Bearer header. Only reachable from this machine."
+                        : "请求时以 Authorization: Bearer 携带该令牌。仅本机可访问。";
+                    color: Theme.text-muted;
+                    font-size: 11px * Theme.panel-font;
+                    wrap: word-wrap;
                 }
             }
 

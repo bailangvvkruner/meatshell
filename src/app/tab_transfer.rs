@@ -440,6 +440,7 @@ pub(super) fn move_tab_between_windows(
                     sftp_handles: dst.sftp_handles.clone(),
                     sftp_last_cwd: dst.sftp_last_cwd.clone(),
                     follow_cd: dst.follow_cd.clone(),
+                    debug_api: dst.debug_api.clone(),
                 };
             }
         }

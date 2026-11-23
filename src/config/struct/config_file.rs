@@ -276,6 +276,12 @@ pub struct ConfigFile {
     /// (2 seconds).
     #[serde(default)]
     pub remote_resource_refresh_secs: u32,
+    /// Opt-in, loopback-only debug/AI API (#debug-api).
+    #[serde(default)]
+    pub debug_api_enabled: bool,
+    /// Bearer token for that API. Encrypted at rest like a password.
+    #[serde(default)]
+    pub debug_api_token: Secret,
     /// User-adjustable width of the left resource sidebar, in logical pixels.
     /// Persisted across restarts so the drag-resized width sticks.
     #[serde(default = "default_sidebar_width")]

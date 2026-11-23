@@ -163,7 +163,12 @@ pub(super) fn wire_tab_callbacks(
             }
             bufs.lock().unwrap().remove(&id);
             if let Ok(mut routes) = tab_routes.lock() {
-                routes.remove(&id);
+                // Drop the tab from the Debug/AI API list too (#debug-api).
+                if let Some(route) = routes.remove(&id) {
+                    if let Ok(route) = route.lock() {
+                        route.debug_api.remove_terminal(&id);
+                    }
+                }
             }
 
             // Remove from tabs + terminals models.

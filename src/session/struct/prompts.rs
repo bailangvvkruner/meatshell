@@ -41,6 +41,9 @@ pub(crate) struct ConnectCtx {
     /// route here so a later detach/merge can retarget the running pumps
     /// at another window without respawning them (#tab-detach).
     pub(crate) tab_routes: crate::app::core::TabRoutes,
+    /// Debug/AI API state of the owning window (#debug-api). Input queued
+    /// through the API is registered against a tab only after it connects.
+    pub(crate) debug_api: crate::debug_api::DebugApiState,
 }
 
 pub(crate) use super::pending_prompts::{PendingCred, PendingHostKey, PendingMfa};

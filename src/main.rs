@@ -12,6 +12,8 @@ mod app;
 mod automation;
 mod cli;
 mod config;
+#[cfg(not(feature = "headless"))]
+mod debug_api;
 mod i18n;
 #[cfg(not(feature = "headless"))]
 mod layout;

@@ -464,6 +464,9 @@ impl ConfigStore {
         if let Some(plain) = Self::try_decrypt(key, cfg.webdav_password.as_str()) {
             cfg.webdav_password = Secret::new(plain);
         }
+        if let Some(plain) = Self::try_decrypt(key, cfg.debug_api_token.as_str()) {
+            cfg.debug_api_token = Secret::new(plain);
+        }
     }
 
     /// Fill every linked session's login from its saved credential (#526).
@@ -1487,6 +1490,23 @@ impl ConfigStore {
         crate::ssh::set_remote_monitor_interval(self.remote_resource_refresh_secs());
     }
 
+    /// Opt-in, loopback-only debug/AI API (#debug-api). Off by default.
+    pub fn debug_api_enabled(&self) -> bool {
+        self.cache.debug_api_enabled
+    }
+
+    pub fn set_debug_api_enabled(&mut self, enabled: bool) {
+        self.cache.debug_api_enabled = enabled;
+    }
+
+    pub fn debug_api_token(&self) -> &str {
+        self.cache.debug_api_token.as_str()
+    }
+
+    pub fn set_debug_api_token(&mut self, token: String) {
+        self.cache.debug_api_token = Secret::new(token);
+    }
+
     /// Persisted sidebar width in logical px. Falls back to the default when the
     /// stored value is unset/zero (e.g. a config created via `Default`).
     pub fn sidebar_width(&self) -> f32 {
@@ -2222,6 +2242,10 @@ impl ConfigStore {
         {
             let enc = Self::encrypt(&self.key, disk.webdav_password.as_str())?;
             disk.webdav_password = Secret::new(enc);
+        }
+        if !disk.debug_api_token.is_empty() && !disk.debug_api_token.is_local_ciphertext() {
+            let enc = Self::encrypt(&self.key, disk.debug_api_token.as_str())?;
+            disk.debug_api_token = Secret::new(enc);
         }
         let raw = serde_json::to_string_pretty(&disk)?;
         // Write to a sibling temp file then rename — cheap atomicity.

@@ -916,6 +916,13 @@ export component AppWindow inherits Window {
     // MCP client config snippet shown in Settings › MCP (set by Rust).
     in property <string> mcp-config-json;
     callback set-mcp-permissions(bool, bool, bool, bool);
+    // Opt-in loopback debug/AI API (#debug-api).
+    in-out property <bool> debug-api-enabled: false;
+    in-out property <string> debug-api-address;
+    in-out property <string> debug-api-token;
+    in property <string> debug-api-status;
+    callback set-debug-api-enabled(bool);
+    callback regenerate-debug-api-token();
     callback add-wsl-profile(string, string, string);
     callback remove-wsl-profile(string);
     callback pick-wsl-directory();
@@ -5608,6 +5615,12 @@ export component AppWindow inherits Window {
                     mcp-allow-file-transfers <=> root.mcp-allow-file-transfers;
                     mcp-config-json: root.mcp-config-json;
                     copy-text(t) => { root.copy-text(t); }
+                    debug-api-enabled <=> root.debug-api-enabled;
+                    debug-api-address: root.debug-api-address;
+                    debug-api-token: root.debug-api-token;
+                    debug-api-status: root.debug-api-status;
+                    set-debug-api-enabled(v) => { root.set-debug-api-enabled(v); }
+                    regenerate-debug-api-token => { root.regenerate-debug-api-token(); }
                     wallpaper-overlay <=> root.wallpaper-overlay;
                     current-wallpaper: root.current-wallpaper;
                     custom-wallpaper-name: root.custom-wallpaper-name;
