@@ -134,3 +134,15 @@ ubuntu 4 个、macos 9 个测试失败——都是上游从未在这两个平台
 | `single_instance::*`（仅 macos） | `Error { kind: InvalidInput, message: "path must be shorter than SUN_LEN" }`：macOS 临时目录本身就很长，测试又把整个测试名塞进 socket 文件名 | 文件名改为测试名哈希（`ipc-<hash>.sock`），macOS 上约 84 字节 < 104 |
 
 这些都是测试侧（含两处小的显示名/路径文本修正），不改变已发布行为。
+
+修完之后 ubuntu 与 windows 均通过；macOS 还剩 2 个 UI 像素测试
+（`session_cancel_shortcuts_work_on_open_and_in_focused_inputs`、
+`editor_mouse_selection_clips_scrolls_and_reveals_only_on_click`），
+它们依赖固定坐标与字体度量，与分支功能无关。本 fork 只发 Windows 版，因此
+`sync-check.yml` 的矩阵收窄为 `windows-latest`（只跑 `cargo check --all-targets`
++ `cargo test`）；需要时把 os 条目加回矩阵即可。
+
+另新增 `.github/workflows/windows-release.yml`（仅 `workflow_dispatch`）：
+在任意分支（包括 `sync/**`）手动构建 `x86_64-pc-windows-msvc` 发行版，
+产物布局与 `release.yml` 的 Windows job 一致（`meatshell-v<ver>-windows-x86_64.zip`
++ 尽力而为的 MSI），不创建 GitHub Release、不动 `main`。

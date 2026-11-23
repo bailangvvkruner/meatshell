@@ -1,0 +1,70 @@
+name: Windows release
+
+# Windows-only release build for branches that must not touch `main`
+# (e.g. `sync/**`). Run it by hand from the Actions tab; it uploads the same
+# portable .zip layout that `release.yml` attaches to a tag, plus the MSI when
+# WiX cooperates. No GitHub Release is created.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+
+      - name: Build (release)
+        run: cargo build --locked --release --target ${{ env.TARGET }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -eu
+          VERSION="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          STAGE="meatshell-v${VERSION}-windows-x86_64"
+          mkdir "$STAGE"
+          cp "target/${{ env.TARGET }}/release/meatshell.exe" "$STAGE/"
+          cp README.md README.en.md CHANGELOG.md THIRD_PARTY_NOTICES.md "$STAGE/" 2>/dev/null || true
+          mkdir -p "$STAGE/docs"
+          cp docs/REMOTE_MCP.md "$STAGE/docs/" 2>/dev/null || true
+          7z a "${STAGE}.zip" "$STAGE" >/dev/null
+          echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
+
+      # Best-effort, exactly like `release.yml`: a WiX hiccup must not lose the
+      # portable .zip.
+      - name: Build MSI installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install wixtoolset -y --no-progress
+          $candle = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*\bin\candle.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($candle) { $env:PATH = "$($candle.DirectoryName);$env:PATH" }
+          cargo install cargo-wix --locked
+          cargo wix --no-build --nocapture --target $env:TARGET --output "meatshell-dev-windows-x86_64.msi"
+          echo "MSI=meatshell-dev-windows-x86_64.msi" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-release
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.MSI }}
+          if-no-files-found: warn
+          retention-days: 14

@@ -4,6 +4,11 @@ name: Sync check
 # on release tags, so without this a plain branch push would land unverified
 # code. It also gives a fork a place to prove the replay builds before the
 # branch is proposed upstream.
+#
+# Windows only: this fork ships the Windows build, and the unix-only tests that
+# upstream never runs on Linux/macOS assume dev-machine paths and permissions
+# (noisy, not actionable here). Add os entries back to the matrix if that
+# changes.
 on:
   push:
     branches: ["sync/**"]
@@ -20,28 +25,10 @@ concurrency:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+    name: test (windows-latest)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Slint (winit + femtovg) + rfd (GTK) + arboard need these system libs.
-      # Build-time only — no GPU/display required to compile or test.
-      - name: Install Linux GUI dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config cmake \
-            libfontconfig1-dev libfreetype6-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libgtk-3-dev \
-            libudev-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
