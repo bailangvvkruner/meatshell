@@ -177,6 +177,21 @@ async fn run_serial(
                     break; // I/O thread ended (and reported why).
                 }
             }
+            SessionCommand::DebugInput { bytes, ack } => {
+                tracing::debug!("serial debug input len={} bytes", bytes.len());
+                // Queued like keystrokes; the I/O thread reports failures on
+                // the event channel, so acknowledge the hand-off (there is no
+                // synchronous serial write to await here).
+                match write_tx.send(encoder.encode(&bytes)) {
+                    Ok(()) => {
+                        let _ = ack.send(Ok(()));
+                    }
+                    Err(_) => {
+                        let _ = ack.send(Err(t("写入失败", "write failed").into()));
+                        break; // I/O thread ended (and reported why).
+                    }
+                }
+            }
             // A serial line has no window size; nothing to propagate.
             SessionCommand::Resize(_, _) => {}
             SessionCommand::AddTunnel { .. }

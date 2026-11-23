@@ -3005,6 +3005,24 @@ async fn run_session(
                             break;
                         }
                     }
+                    Some(SessionCommand::DebugInput { bytes, ack }) => {
+                        // Debug API input: acknowledge only after the bytes
+                        // reached the PTY, so the HTTP caller never gets a
+                        // false OK (see docs/debug-api.md).
+                        tracing::debug!("ssh debug input len={} bytes", bytes.len());
+                        let bytes = terminal_encoder.encode(&bytes);
+                        match channel.data(&bytes[..]).await {
+                            Ok(()) => {
+                                let _ = ack.send(Ok(()));
+                            }
+                            Err(err) => {
+                                let reason = format!("{}: {err}", t("写入失败", "write failed"));
+                                let _ = ack.send(Err(reason.clone()));
+                                let _ = events.send(SessionEvent::Closed(reason));
+                                break;
+                            }
+                        }
+                    }
                     Some(SessionCommand::Resize(cols, rows)) => {
                         let _ = channel.window_change(cols, rows, 0, 0).await;
                     }

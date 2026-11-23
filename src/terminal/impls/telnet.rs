@@ -337,6 +337,24 @@ async fn run_telnet(
                         }
                         let _ = wr.flush().await;
                     }
+                    Some(SessionCommand::DebugInput { bytes, ack }) => {
+                        // Debug API input: acknowledge after the wire write and
+                        // flush, mirroring the SSH transport.
+                        tracing::debug!("telnet debug input len={} bytes", bytes.len());
+                        let out = wire_input(&encoder, &bytes);
+                        match wr.write_all(&out).await {
+                            Ok(()) => {
+                                let _ = wr.flush().await;
+                                let _ = ack.send(Ok(()));
+                            }
+                            Err(err) => {
+                                let reason = format!("{}: {err}", t("写入失败", "write failed"));
+                                let _ = ack.send(Err(reason.clone()));
+                                let _ = events.send(SessionEvent::Closed(reason));
+                                break;
+                            }
+                        }
+                    }
                     Some(SessionCommand::Resize(cols, rows)) => {
                         let _ = wr.write_all(&naws_subneg(cols, rows)).await;
                         let _ = wr.flush().await;

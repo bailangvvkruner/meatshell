@@ -20,6 +20,12 @@ fn server(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
                     Err(error) => panic!("{error}"),
                 }
             };
+            // Winsock hands the accepted socket the listener's non-blocking
+            // flag (unlike POSIX), which made `read` below fail with
+            // `WouldBlock` on Windows whenever the request had not arrived yet.
+            stream
+                .set_nonblocking(false)
+                .unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

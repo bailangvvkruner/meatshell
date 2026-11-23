@@ -150,8 +150,8 @@ pub(super) fn open_window(
             let (ui_cols, ui_rows) = *size_grid.lock().unwrap_or_else(|p| p.into_inner());
             Some(TerminalScreenSnapshot {
                 lines: debug_screen_lines(&buffer.displayed_text, max_lines),
-                rows,
-                cols,
+                rows: rows.get(),
+                cols: cols.get(),
                 ui_rows,
                 ui_cols,
                 requested_pty_rows: ui_rows,
@@ -162,7 +162,9 @@ pub(super) fn open_window(
                 synchronized_output: false,
                 legacy_btop_compat: false,
                 sanitized_btop_control_bytes: 0,
-                parse_errors: screen.errors(),
+                // vt100 0.18 does not expose a parse-error counter, so this
+                // branch always reports zero (see docs/debug-api.md).
+                parse_errors: 0,
             })
         })
     };
@@ -181,6 +183,7 @@ pub(super) fn open_window(
             }
             let encoding = screen.mouse_protocol_encoding();
             let (rows, cols) = screen.size();
+            let (rows, cols) = (rows.get(), cols.get());
             let (button, release) = match event.kind {
                 DebugPointerEventKind::Press => match event.button {
                     3 => (64, false), // wheel up
@@ -740,6 +743,7 @@ pub(super) fn open_window(
         core.tab_routes.clone(),
         tab_titles.clone(),
         editor_win.clone(),
+        debug_api.clone(),
     );
     super::save_tab_session::wire(
         &window,

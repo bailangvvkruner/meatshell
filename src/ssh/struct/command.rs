@@ -3,6 +3,12 @@
 pub enum SessionCommand {
     /// Send raw bytes directly to the PTY (individual keystrokes, no modification).
     RawInput(Vec<u8>),
+    /// Debug API input that must be acknowledged after the transport has
+    /// accepted and flushed the bytes, rather than merely queueing them.
+    DebugInput {
+        bytes: Vec<u8>,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Notify the remote PTY of a terminal resize.
     Resize(u32, u32),
     /// Start or pause periodic local/remote resource monitoring for this session.

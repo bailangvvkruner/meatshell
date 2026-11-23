@@ -159,6 +159,16 @@ use crate::terminal::{windows_process_ctrl_release, CtrlKeySide};
 use crate::ui::*;
 use crate::webdav::WebDavAcceptAnyCertVerifier;
 
+/// Renderer actually in use, recorded while the Slint platform is set up.
+/// Reported by the Debug API health payload (#debug-api).
+pub(crate) fn active_renderer_name() -> &'static str {
+    window::active_renderer_name()
+}
+
+pub(crate) fn active_renderer_uses_gpu() -> bool {
+    window::active_renderer_uses_gpu()
+}
+
 /// Newest `max_lines` lines of a rendered screen, trailing blank rows dropped.
 fn debug_screen_lines(displayed_text: &[String], max_lines: usize) -> Vec<String> {
     let end = displayed_text

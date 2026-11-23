@@ -174,6 +174,68 @@ fn release(window: &MinimalSoftwareWindow, x: f32, y: f32) {
         button: PointerEventButton::Left,
     });
 }
+
+/// Window-space centre of the lowest accent-coloured, button-sized area in
+/// `y_from..y_to`. Pixel-coordinate clicks on a scrolling body otherwise break
+/// as soon as a font metric or a section added below the button shifts the
+/// layout — the exact reason the pinned "Add trigger" coordinate went stale
+/// when X11 forwarding was appended to the SSH advanced body.
+fn lowest_accent_button_center(
+    pixels: &[Rgb8Pixel],
+    width: usize,
+    y_from: usize,
+    y_to: usize,
+) -> (f32, f32) {
+    let is_accent = |p: &Rgb8Pixel| {
+        p.b > 140 && p.b as i32 > p.r as i32 + 40 && p.b as i32 > p.g as i32 + 20
+    };
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for y in y_from..y_to {
+        let has_accent = (0..width).any(|x| is_accent(&pixels[y * width + x]));
+        match (has_accent, run_start) {
+            (true, None) => run_start = Some(y),
+            (false, Some(start)) => {
+                runs.push((start, y));
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = run_start {
+        runs.push((start, y_to));
+    }
+    // Buttons are wide, so radio dots and focus rings are filtered out here.
+    let (y0, y1) = runs
+        .into_iter()
+        .filter(|(top, bottom)| {
+            let (mut min_x, mut max_x) = (usize::MAX, 0usize);
+            for y in *top..*bottom {
+                for x in 0..width {
+                    if is_accent(&pixels[y * width + x]) {
+                        min_x = min_x.min(x);
+                        max_x = max_x.max(x);
+                    }
+                }
+            }
+            max_x.saturating_sub(min_x) >= 60
+        })
+        .next_back()
+        .expect("no button-sized accent area in the scrolling body");
+    let (mut sum_x, mut count) = (0usize, 0usize);
+    for y in y0..y1 {
+        for x in 0..width {
+            if is_accent(&pixels[y * width + x]) {
+                sum_x += x;
+                count += 1;
+            }
+        }
+    }
+    (
+        sum_x as f32 / count as f32 + 0.5,
+        (y0 + y1) as f32 / 2.0,
+    )
+}
 fn copy(window: &MinimalSoftwareWindow) {
     use slint::platform::Key;
     let modifier = if cfg!(target_os = "macos") {
@@ -548,8 +610,12 @@ fn advanced_session_body_scrolls_to_bottom_trigger_button_without_occlusion() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/session-editor-short-bottom.png");
         image::save_buffer(path, &bytes, 700, 600, image::ColorType::Rgb8).unwrap();
 
-        press(&window, 505., 456.);
-        release(&window, 505., 456.);
+        // Click where the button actually is instead of a hard-coded row: the
+        // SSH advanced body gained the X11 block below this button, so the
+        // stale (505, 456) landed on the DISPLAY input on every platform.
+        let (button_x, button_y) = lowest_accent_button_center(&pixels, 700, 60, 520);
+        press(&window, button_x, button_y);
+        release(&window, button_x, button_y);
         render_short();
         assert_eq!(
             ui.get_add_trigger_count(),

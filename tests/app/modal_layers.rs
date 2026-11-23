@@ -429,7 +429,16 @@ fn saved_secret_reveal_flows_through_the_real_app_window() {
             Default::default(),
             Default::default(),
             Default::default(),
+            Default::default(),
             Rc::new(EditorWindow::new().unwrap()),
+            Rc::new(RefCell::new(DebugApiController::new(
+                Runtime::new().unwrap().handle().clone(),
+                DebugApiState::new(
+                    |_: &str, _: usize| -> Option<crate::debug_api::TerminalScreenSnapshot> {
+                        None
+                    },
+                ),
+            ))),
         );
         ui.invoke_edit_session(saved.id.clone().into());
         let render = || {

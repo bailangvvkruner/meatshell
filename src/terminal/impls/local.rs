@@ -280,6 +280,24 @@ async fn run_local(
                     break;
                 }
             }
+            SessionCommand::DebugInput { bytes, ack } => {
+                // Debug API input: acknowledge after the PTY accepted and
+                // flushed the bytes (see docs/debug-api.md).
+                tracing::debug!("local debug input len={} bytes", bytes.len());
+                let result = {
+                    let mut guard = writer.lock().unwrap();
+                    guard
+                        .write_all(&bytes)
+                        .and_then(|_| guard.flush())
+                        .map_err(|error| error.to_string())
+                };
+                let failed = result.is_err();
+                let _ = ack.send(result);
+                if failed {
+                    let _ = events.send(SessionEvent::Closed(t("写入失败", "write failed").into()));
+                    break;
+                }
+            }
             SessionCommand::Resize(cols, rows) => {
                 let _ = pair.master.resize(PtySize {
                     rows: rows.clamp(1, u16::MAX as u32) as u16,

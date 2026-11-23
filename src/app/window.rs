@@ -1,5 +1,29 @@
 use super::*;
 
+static ACTIVE_RENDERER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ACTIVE_RENDERER_USES_GPU: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Renderer name Slint was asked to build, or "auto" when the selection is
+/// left to Slint. Read by the Debug API health payload (#debug-api).
+pub(super) fn active_renderer_name() -> &'static str {
+    ACTIVE_RENDERER.get().map(String::as_str).unwrap_or("auto")
+}
+
+pub(super) fn active_renderer_uses_gpu() -> bool {
+    ACTIVE_RENDERER_USES_GPU.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Remember the renderer this process asked Slint for, so diagnostics can
+/// report it without re-deriving the environment/settings precedence.
+fn record_active_renderer(renderer: Option<&str>) {
+    let name = renderer.unwrap_or("auto");
+    let normalized = name.strip_prefix("winit-").unwrap_or(name);
+    let uses_gpu = matches!(normalized, "femtovg" | "skia" | "skia-d3d" | "wgpu");
+    let _ = ACTIVE_RENDERER.set(name.to_string());
+    ACTIVE_RENDERER_USES_GPU.store(uses_gpu, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn set_window_icon(window: &AppWindow) {
     use i_slint_backend_winit::winit::window::Icon;
@@ -81,6 +105,7 @@ pub(super) fn setup_windows_platform(renderer_mode: &str) {
     if let Some(renderer) = renderer.as_ref() {
         builder = builder.with_renderer_name(renderer.clone());
     }
+    record_active_renderer(renderer.as_deref());
     tracing::info!(
         renderer_mode,
         renderer = renderer.as_deref().unwrap_or("auto"),
@@ -148,6 +173,7 @@ pub(super) fn setup_linux_platform(renderer_mode: &str) {
             _ => None,
         },
     };
+    record_active_renderer(renderer.as_deref());
 
     tracing::info!(
         renderer_mode,
@@ -416,6 +442,7 @@ pub(super) fn setup_macos_platform(renderer_mode: &str) {
     if let Some(renderer) = renderer.as_ref() {
         builder = builder.with_renderer_name(renderer.clone());
     }
+    record_active_renderer(renderer.as_deref());
     tracing::info!(
         renderer_mode,
         renderer = renderer.as_deref().unwrap_or("auto"),
